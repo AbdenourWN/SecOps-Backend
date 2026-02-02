@@ -5,10 +5,10 @@ uvicorn[standard]==0.27.0 # The server that runs FastAPI
 # --- The Data ---
 pydantic==2.6.0          # Data validation (Ensures data is correct)
 pydantic-settings==2.1.0 # Manage configuration (API Keys)
-motor==3.3.2             # Async driver for MongoDB (The Database)
+motor==3.4.0             # Async driver for MongoDB (The Database)
+pymongo==4.7.2 
 
 # --- The Utilities ---
 paramiko==3.4.0          # SSH Client (To talk to Linux Servers)
 python-dotenv==1.0.1     # Reads .env files (For security)
 httpx==0.26.0            # For making web requests (if needed)
-python-dotenv
