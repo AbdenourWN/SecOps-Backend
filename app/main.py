@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app.core.database import connect_to_mongo, close_mongo_connection
+from app.modules.servers.router import router as servers_router
+
 
 # 1. Define the Lifespan (Startup & Shutdown logic)
 @asynccontextmanager
@@ -21,3 +23,5 @@ app = FastAPI(
 @app.get("/")
 async def health_check():
     return {"status": "ok", "message": "SecOps Backend is running"}
+
+app.include_router(servers_router, prefix="/api/servers", tags=["Servers"])

@@ -9,6 +9,6 @@ motor==3.4.0             # Async driver for MongoDB (The Database)
 pymongo==4.7.2 
 
 # --- The Utilities ---
-paramiko==3.4.0          # SSH Client (To talk to Linux Servers)
+paramiko==4.0.0          # SSH Client (To talk to Linux Servers)
 python-dotenv==1.0.1     # Reads .env files (For security)
 httpx==0.26.0            # For making web requests (if needed)
