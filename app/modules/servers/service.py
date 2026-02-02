@@ -1,5 +1,8 @@
 import paramiko
 import asyncio
+from app.core.database import get_database
+from app.modules.servers.schemas import ServerCreate, ServerInDB
+from app.core.security import encrypt_password
 
 class ServerService:
     async def run_command(self, ip: str, username: str, password: str, command: str):
@@ -39,3 +42,26 @@ class ServerService:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, _ssh_task)
         return result
+    async def create_server(self, server_data: ServerCreate) -> dict:
+        db = get_database()
+        
+        # Check if server with this IP already exists
+        if await db["servers"].find_one({"ip_address": server_data.ip_address}):
+            return {"status": "failed", "error": "Server with this IP already exists"}
+
+        # Encrypt the password before storing
+        encrypted_pass = encrypt_password(server_data.password)
+        
+        # Create the object we will store in the DB
+        server_in_db = ServerInDB(
+            hostname=server_data.hostname,
+            ip_address=server_data.ip_address,
+            os_type=server_data.os_type,
+            username=server_data.username,
+            encrypted_password=encrypted_pass
+        )
+
+        # Insert into MongoDB
+        result = await db["servers"].insert_one(server_in_db.model_dump(by_alias=True))
+        
+        return {"status": "success", "inserted_id": str(result.inserted_id)}

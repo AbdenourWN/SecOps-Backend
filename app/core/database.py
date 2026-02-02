@@ -1,13 +1,10 @@
-import os
 from motor.motor_asyncio import AsyncIOMotorClient
-from dotenv import load_dotenv
+from app.core.config import settings 
 
-# 1. Load environment variables
-load_dotenv()
 
-# 2. Get the connection string from .env
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME")
+# 2. Get the connection string
+MONGO_URI = settings.MONGO_URI
+DB_NAME = settings.DB_NAME
 
 # 3. Create the Client (But don't connect yet)
 class Database:
@@ -20,7 +17,8 @@ async def connect_to_mongo():
     Connects to MongoDB when the API starts.
     """
     try:
-        db.client = AsyncIOMotorClient(MONGO_URI)
+        # Create a CodecOptions object to specify how to handle UUIDs
+        db.client = AsyncIOMotorClient(MONGO_URI, uuidRepresentation="standard")
         # Send a ping to confirm connection
         await db.client.admin.command('ping')
         print(f"✅ Connected to MongoDB: {DB_NAME}")

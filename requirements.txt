@@ -12,3 +12,5 @@ pymongo==4.7.2
 paramiko==4.0.0          # SSH Client (To talk to Linux Servers)
 python-dotenv==1.0.1     # Reads .env files (For security)
 httpx==0.26.0            # For making web requests (if needed)
+
+cryptography==46.0.4
