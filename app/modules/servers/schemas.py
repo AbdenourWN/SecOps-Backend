@@ -58,6 +58,7 @@ class ServerBase(BaseModel):
     hostname: str
     ip_address: str
     os_type: OSType = OSType.LINUX
+    port: Optional[int] = None 
 
 class ServerCreate(ServerBase):
     credential: CredentialInput
@@ -84,6 +85,7 @@ class ServerUpdate(BaseModel):
     hostname: Optional[str] = None
     ip_address: Optional[str] = None
     os_type: Optional[OSType] = None
+    port: Optional[int] = None 
     
     # Allow updating the stored credential (e.g., changing the password)
     credential: Optional[CredentialUpdate] = None 

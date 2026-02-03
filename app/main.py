@@ -11,7 +11,7 @@ async def run_health_monitor():
     Runs continuously in the background.
     """
     service = ServerService()
-    while True:
+    while False:
         # 1. Wait a bit for DB to connect on startup
         await asyncio.sleep(5)
 

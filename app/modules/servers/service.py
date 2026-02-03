@@ -9,7 +9,7 @@ from datetime import datetime ,timezone
 
 
 class ServerService:
-    async def run_command(self, ip: str, username: str, password: str, command: str):
+    async def run_command(self, ip: str, username: str, password: str, command: str, port: int = 22):
         """
         Connects via SSH and runs a command on the remote server.
         """
@@ -22,7 +22,7 @@ class ServerService:
             try:
                 print(f"🔌 Connecting to {ip}...")
                 # 1. Connect
-                client.connect(hostname=ip, username=username, password=password, timeout=10)
+                client.connect(hostname=ip,port=port, username=username, password=password, timeout=10)
                 
                 # 2. Run Command
                 print(f"🚀 Executing: {command}")
@@ -113,9 +113,11 @@ class ServerService:
             async for server in cursor:
                 ip = server["ip_address"]
                 server_id = server["_id"]
+
+                target_port = server.get("port", 22) 
                 
                 # 2. Check status
-                is_online = await self.is_server_reachable(ip)
+                is_online = await self.is_server_reachable(ip, port=target_port)
                 
                 # Logic for future: 
                 # If (is_online) AND (cpu_usage > 90): status = WARNING
@@ -156,6 +158,15 @@ class ServerService:
         if server_data.credential.passphrase:
             encrypted_passphrase = encrypt_password(server_data.credential.passphrase)
 
+        # --- LOGIC: Handle Default Port ---
+        final_port = server_data.port
+        if final_port is None:
+            # Auto-assign based on OS
+            if server_data.os_type == "windows":
+                final_port = 5985
+            else:
+                final_port = 22
+
         # Prepare Credential Object
         cred_in_db = CredentialInDB(
             username=server_data.credential.username,
@@ -175,6 +186,7 @@ class ServerService:
             hostname=server_data.hostname,
             ip_address=server_data.ip_address,
             os_type=server_data.os_type,
+            port=final_port,
             credential_id=str(new_cred_id)
         )
 
@@ -227,6 +239,7 @@ class ServerService:
             if dup: return {"status": "failed", "error": "IP already taken"}
             server_updates["ip_address"] = update_data.ip_address
         if update_data.os_type: server_updates["os_type"] = update_data.os_type
+        if update_data.port: server_updates["port"] = update_data.port 
         
         # 3. Handle Credential Updates (If user wants to set a NEW password)
         if update_data.credential:
@@ -311,6 +324,10 @@ class ServerService:
             plain_secret = decrypt_password(credential["encrypted_secret"])
         except Exception:
             return {"status": "failed", "error": "Decryption failed"}
+        
+        
+        target_port = server.get("port", 22)
+        
 
         # 4. Execute
         # Note: We currently assume 'password' type. 
@@ -318,7 +335,8 @@ class ServerService:
             ip=server["ip_address"],
             username=credential["username"],
             password=plain_secret,
-            command=command
+            command=command,
+            port=target_port
         )
     
         # Logic for 'ssh_key' file handling will be added later.
