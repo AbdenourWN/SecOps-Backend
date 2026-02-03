@@ -18,7 +18,7 @@ async def connect_to_mongo():
     """
     try:
         # Create a CodecOptions object to specify how to handle UUIDs
-        db.client = AsyncIOMotorClient(MONGO_URI, uuidRepresentation="standard")
+        db.client = AsyncIOMotorClient(MONGO_URI)
         # Send a ping to confirm connection
         await db.client.admin.command('ping')
         print(f"✅ Connected to MongoDB: {DB_NAME}")
