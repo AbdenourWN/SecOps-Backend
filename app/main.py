@@ -12,7 +12,7 @@ async def lifespan(app: FastAPI):
     
     # Start the "Heartbeat" of the application
     
-    # start_scheduler()
+    start_scheduler()
 
     yield
     # -- Shutdown --
