@@ -9,13 +9,6 @@ from fastapi import APIRouter, HTTPException
 router = APIRouter()
 service = ServerService()
 
-# This defines the data we expect from the user
-class CommandRequest(BaseModel):
-    ip: str
-    username: str
-    password: str
-    command: str = "uptime"  # Default command
-
 
 class IDCommandRequest(BaseModel):
     command: str = "uptime"
@@ -46,27 +39,29 @@ async def execute_on_server(server_id: str, request: IDCommandRequest):
         raise HTTPException(status_code=400, detail=result.get("error"))
     return result
 
-@router.post("/execute")
-async def execute_command(request: CommandRequest):
-    result = await service.run_command(
-        request.ip, 
-        request.username, 
-        request.password, 
-        request.command
-    )
-    return result
+
+# 4. Add New Server (OnBoarding)
 @router.post("/", response_model=dict)
 async def add_server_to_db(server: ServerCreate):
     result = await service.create_server(server)
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=result.get("error"))
     return result
 
 
+# 5. Update Server
 @router.put("/{server_id}")
 async def update_server(server_id: str, update_data: ServerUpdate):
     result = await service.update_server(server_id, update_data)
-    # ... handle errors ...
+    
+    if result.get("status") == "failed":
+        if "Authentication Failed" in result.get("error", ""):
+            raise HTTPException(status_code=403, detail=result["error"])
+        raise HTTPException(status_code=400, detail=result["error"])
+        
     return result
 
+# 6. Delete Server
 @router.delete("/{server_id}")
 async def delete_server(server_id: str, delete_data: ServerDelete):
     """
@@ -75,9 +70,8 @@ async def delete_server(server_id: str, delete_data: ServerDelete):
     result = await service.delete_server(server_id, delete_data)
     
     if result.get("status") == "failed":
-        if "Authentication Failed" in result.get("error"):
-            # Return 403 Forbidden if password was wrong
-            raise HTTPException(status_code=403, detail=result.get("error"))
+        if "Authentication Failed" in result.get("error", ""):
+            raise HTTPException(status_code=403, detail=result["error"])
         raise HTTPException(status_code=404, detail="Server not found or other error")
         
     return result

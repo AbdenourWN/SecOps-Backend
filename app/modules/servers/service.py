@@ -1,53 +1,14 @@
-import paramiko
 import asyncio
 from app.core.database import get_database
 from app.modules.servers.schemas import ServerCreate, ServerInDB, CredentialInDB, ServerUpdate, ServerDelete, ServerStatus
 from app.core.security import encrypt_password, decrypt_password
 from bson import ObjectId
 from datetime import datetime ,timezone
+from app.core.executors import get_server_executor
 
 
 
 class ServerService:
-    async def run_command(self, ip: str, username: str, password: str, command: str, port: int = 22):
-        """
-        Connects via SSH and runs a command on the remote server.
-        """
-        def _ssh_task():
-            client = paramiko.SSHClient()
-            # ⚠️ SECURITY WARNING: This automatically trusts the server. 
-            # In production, we should verify the host key. For now, it's fine.
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            try:
-                print(f"🔌 Connecting to {ip}...")
-                # 1. Connect
-                client.connect(hostname=ip,port=port, username=username, password=password, timeout=10)
-                
-                # 2. Run Command
-                print(f"🚀 Executing: {command}")
-                stdin, stdout, stderr = client.exec_command(command)
-                
-                # 3. Read Output
-                result = stdout.read().decode().strip()
-                error = stderr.read().decode().strip()
-                
-                client.close()
-                
-                if error:
-                    return {"status": "error", "output": error}
-                return {"status": "success", "output": result}
-                
-            except Exception as e:
-                print(f"❌ Error: {str(e)}")
-                return {"status": "failed", "error": str(e)}
-
-        # Run the slow SSH connection in a separate thread so FastAPI doesn't freeze
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _ssh_task)
-        return result
-    
-
     async def _verify_ownership(self, db, server_id: ObjectId, input_secret: str) -> dict:
         """
         Private helper. Checks if the input_secret matches the stored credential.
@@ -78,55 +39,24 @@ class ServerService:
 
         return {"valid": True, "credential_id": cred_id, "server_data": server}
     
-
-
-    async def is_server_reachable(self, ip: str, port: int = 22) -> bool:
-        """
-        Checks if a TCP port is open. Fast and lightweight.
-        """
-        try:
-            # Try to open a connection with a 3-second timeout
-            # We don't send data, just check if the door opens.
-            future = asyncio.open_connection(ip, port)
-            reader, writer = await asyncio.wait_for(future, timeout=3)
-            
-            # If successful, close immediately
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-            return False
-
     async def update_all_server_statuses(self):
-            """
-            Scans ALL servers using a Cursor (Memory Safe).
-            """
             db = get_database()
-            
-            # 1. Use an async cursor instead of to_list()
-            # This allows handling 100,000+ servers without crashing RAM
             cursor = db["servers"].find()
-            
             print(f"🕵️  Starting Health Check Cycle...")
             
             count = 0
             async for server in cursor:
-                ip = server["ip_address"]
-                server_id = server["_id"]
-
-                target_port = server.get("port", 22) 
+                # FACTORY MAGIC: Ask for an executor for this server
+                # We don't need a password just to ping the port, so we pass ""
+                executor = get_server_executor(server, plain_password="")
                 
-                # 2. Check status
-                is_online = await self.is_server_reachable(ip, port=target_port)
+                # The executor handles the details (Linux vs Windows)
+                is_online = await executor.check_health()
                 
-                # Logic for future: 
-                # If (is_online) AND (cpu_usage > 90): status = WARNING
-                # For now, just Online/Offline
                 new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
                 
-                # 3. Update DB
                 await db["servers"].update_one(
-                    {"_id": server_id},
+                    {"_id": server["_id"]},
                     {
                         "$set": {
                             "status": new_status, 
@@ -326,17 +256,12 @@ class ServerService:
             return {"status": "failed", "error": "Decryption failed"}
         
         
-        target_port = server.get("port", 22)
+        executor = get_server_executor(server, plain_password=plain_secret)
         
+        # 4. Inject the username (since factory defaults to 'unknown')
+        executor.credential['username'] = credential['username']
 
-        # 4. Execute
-        # Note: We currently assume 'password' type. 
-        return await self.run_command(
-            ip=server["ip_address"],
-            username=credential["username"],
-            password=plain_secret,
-            command=command,
-            port=target_port
-        )
+        # 5. Run
+        return await executor.run_command(command)
     
         # Logic for 'ssh_key' file handling will be added later.
