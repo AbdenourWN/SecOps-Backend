@@ -2,6 +2,7 @@ import paramiko
 import asyncio
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
+import winrm
 
 # --- 1. The Blueprint (Abstract Base Class) ---
 class BaseExecutor(ABC):
@@ -77,11 +78,51 @@ class LinuxExecutor(BaseExecutor):
 
 # --- 3. The Windows Specialist (Future Proofing) ---
 class WindowsExecutor(BaseExecutor):
-    async def run_command(self, command: str) -> Dict[str, Any]:
-        return {"status": "failed", "error": "Windows WinRM not implemented yet"}
+    def __init__(self, ip: str, port: int, credential: dict):
+        super().__init__(ip, port, credential)
+        # Default WinRM HTTP port
+        if self.port == 22: 
+            self.port = 5985 
+
+    async def run_command(self, command: str) -> dict:
+        """
+        Executes a PowerShell command via WinRM (NTLM Encrypted).
+        """
+        def _winrm_task():
+            try:
+                # PRODUCTION SECURITY: NTLM
+                session = winrm.Session(
+                    f"http://{self.ip}:{self.port}/wsman", 
+                    auth=(self.credential.get('username'), self.credential.get('password')),
+                    transport='ntlm' # <--- Confirmed working in your test
+                )
+                
+                # Wrap command in PowerShell to avoid interactive hangs
+                # -NoProfile: Fast startup
+                # -NonInteractive: Don't wait for user input
+                ps_command = f"powershell -NoProfile -NonInteractive -Command \"{command}\""
+                
+                print(f"🪟 WinRM Connecting to {self.ip}...")
+                print(f"🚀 Executing: {ps_command}")
+                run_result = session.run_cmd(ps_command)
+                
+                std_out = run_result.std_out.decode('utf-8', errors='ignore').strip()
+                std_err = run_result.std_err.decode('utf-8', errors='ignore').strip()
+                
+                if std_err:
+                    # Windows often writes warnings to stderr, but we return it for debugging
+                    return {"status": "error", "output": std_out, "error": std_err}
+                
+                return {"status": "success", "output": std_out}
+
+            except Exception as e:
+                return {"status": "failed", "error": str(e)}
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _winrm_task)
 
     async def check_health(self) -> bool:
-        # Windows usually listens on 5985 for WinRM
+        """TCP Ping"""
         try:
             future = asyncio.open_connection(self.ip, self.port)
             reader, writer = await asyncio.wait_for(future, timeout=3)

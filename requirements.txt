@@ -16,3 +16,5 @@ httpx==0.26.0            # For making web requests (if needed)
 cryptography==46.0.4
 
 apscheduler==3.11.2
+
+pywinrm
