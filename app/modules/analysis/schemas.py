@@ -26,6 +26,16 @@ class ActionLevel(int, Enum):
     # Status stays 'OPEN' until a human closes it.
     ALERT_ONLY = 3
 
+
+
+class RuleOSType(str, Enum):
+    LINUX = "linux"
+    WINDOWS = "windows"
+    COMMON = "common" # For things like SQL Injection that can happen anywhere
+
+
+
+
 # --- 1. The Rule (Stored in DB) ---
 class DetectionRule(BaseModel):
     name: str = Field(..., description="e.g. 'SSH Failed Login'")
@@ -34,6 +44,9 @@ class DetectionRule(BaseModel):
     action_level: ActionLevel
     description: Optional[str] = None
     enabled: bool = True
+
+    os_type: RuleOSType = RuleOSType.LINUX
+    tags: List[str] = []
 
     remediation_script_id: Optional[str] = None
 

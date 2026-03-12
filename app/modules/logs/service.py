@@ -36,7 +36,8 @@ class LogService:
 
         # 3. ROUTING: Check OS (Future-Proofing)
         if server.get("os_type") == "windows":
-            return await self._collect_windows_logs(server, executor, db)
+            return 
+            # return await self._collect_windows_logs(server, executor, db)
         
         # 4. RUN LINUX COLLECTION
         return await self._collect_linux_logs(server, executor, db)

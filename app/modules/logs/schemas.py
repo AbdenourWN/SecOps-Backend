@@ -6,6 +6,39 @@ from enum import Enum
 def utc_now():
     return datetime.now(timezone.utc)
 
+class LogParserType(str, Enum):
+    RAW = "raw"
+    NGINX = "nginx"
+    APACHE = "apache"
+    JSON = "json"
+
+class LogSource(BaseModel):
+    server_id: str
+    name: str  # e.g. "Nginx Access"
+    file_path: str  # e.g. "/var/log/nginx/access.log"
+    parser_type: LogParserType = LogParserType.RAW
+    
+    # STATE TRACKING (The Bookmark)
+    last_offset: int = 0  # The byte number where we stopped last time
+    is_active: bool = True
+    last_inode: Optional[int] = None
+    last_header: Optional[str] = None 
+    error_count: int = 0
+
+    class Config:
+        populate_by_name = True
+
+class LogSourceCreate(BaseModel):
+    server_id: str
+    name: str
+    file_path: str
+    parser_type: LogParserType = LogParserType.RAW
+
+class LogSourceInDB(LogSource):
+    id: str = Field(alias="_id")
+
+
+
 class LogLevel(str, Enum):
     INFO = "INFO"
     WARNING = "WARNING"

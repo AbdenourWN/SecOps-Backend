@@ -1,10 +1,29 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.modules.servers.service import ServerService
 from app.modules.logs.service import LogService
-from app.modules.metrics.service import MetricService 
+from app.modules.metrics.service import MetricService
 from app.core.database import get_database
+from app.modules.logs.file_watcher import FileWatcherService
+
 
 scheduler = AsyncIOScheduler()
+
+
+async def job_file_watcher():
+    """Runs every 60 seconds to check file offsets"""
+    try:
+        service = FileWatcherService()
+        sources = await service.get_all_sources()
+        if not sources:
+            return
+
+        print(f"📂 Checking {len(sources)} file sources...")
+        for source in sources:
+            await service.process_file_source(source)
+
+    except Exception as e:
+        print(f"❌ File Watcher Failed: {e}")
+
 
 async def job_health_check():
     """Runs every 30 seconds"""
@@ -15,22 +34,24 @@ async def job_health_check():
     except Exception as e:
         print(f"❌ Health Check Failed: {e}")
 
+
 async def job_log_collection():
     """Runs every 60 seconds"""
     try:
         db = get_database()
         service = LogService()
-        
+
         # Fetch all servers
         servers = await db["servers"].find().to_list(length=1000)
-        
+
         print(f"📥 Running Auto-Log Collection for {len(servers)} servers...")
         for server in servers:
             # In Phase 4, we will parallelize this
             await service.collect_logs_from_server(str(server["_id"]))
-            
+
     except Exception as e:
         print(f"❌ Log Collection Failed: {e}")
+
 
 async def job_metric_collection():
     """Runs every 60 seconds"""
@@ -38,7 +59,7 @@ async def job_metric_collection():
         db = get_database()
         service = MetricService()
         servers = await db["servers"].find().to_list(length=1000)
-        
+
         # print(f"📊 Collecting Metrics for {len(servers)} servers...")
         for server in servers:
             await service.collect_metrics(str(server["_id"]))
@@ -48,14 +69,16 @@ async def job_metric_collection():
 
 def start_scheduler():
     # Add Health Check (30s)
-    scheduler.add_job(job_health_check, 'interval', seconds=30)
-    
+    scheduler.add_job(job_health_check, "interval", seconds=30)
+
     # Add Log Collection (60s)
-    scheduler.add_job(job_log_collection, 'interval', seconds=60)
+    scheduler.add_job(job_log_collection, "interval", seconds=60)
 
     # Add Metric Collection (60s)
-    scheduler.add_job(job_metric_collection, 'interval', seconds=60)
+    scheduler.add_job(job_metric_collection, "interval", seconds=60)
 
-    
+    # Add File Watcher (60s)
+    scheduler.add_job(job_file_watcher, "interval", seconds=60)
+
     scheduler.start()
     print("⏰ Background Scheduler Started")
