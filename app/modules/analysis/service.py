@@ -136,10 +136,15 @@ class AnalysisService:
         """
         Creates basic rules so the system isn't empty.
         Run this once on startup.
+        Dynamically links scripts by name (scripts must be seeded first).
         """
         db = get_database()
         if await db["rules"].count_documents({}) > 0:
             return
+
+        # --- Build a name→id lookup from seeded scripts ---
+        scripts = await db["scripts"].find().to_list(length=100)
+        script_lookup = {s["name"]: str(s["_id"]) for s in scripts}
 
         default_rules = [
             # ==============================
@@ -152,7 +157,8 @@ class AnalysisService:
                 "action_level": 2,
                 "enabled": True,
                 "os_type": "linux",
-                "tags": ["security", "auth", "ssh"]
+                "tags": ["security", "auth", "ssh"],
+                "remediation_script_name": "Block IP (iptables)",
             },
             {
                 "name": "Sudo Abuse",
@@ -161,7 +167,7 @@ class AnalysisService:
                 "action_level": 2,
                 "enabled": True,
                 "os_type": "linux",
-                "tags": ["security", "privilege"]
+                "tags": ["security", "privilege"],
             },
             {
                 "name": "Root Login Detection",
@@ -170,34 +176,36 @@ class AnalysisService:
                 "action_level": 2,
                 "enabled": True,
                 "os_type": "linux",
-                "tags": ["security", "root"]
+                "tags": ["security", "root"],
             },
             {
                 "name": "Out of Memory (OOM) Killer",
                 "pattern": r"(?i)(?:Out of memory|Kill process)\s+(?P<process_id>\d+)\s+\((?P<process_name>\S+)\)",
                 "severity": "critical",
-                "action_level": 3,
+                "action_level": 2,
                 "enabled": True,
                 "os_type": "linux",
-                "tags": ["system", "stability", "memory"]
+                "tags": ["system", "stability", "memory"],
+                "remediation_script_name": "Kill Process by PID",
             },
             {
                 "name": "Disk Space Critical",
                 "pattern": r"(?i)(No space left on device|I/O error|EXT4-fs error)",
                 "severity": "critical",
-                "action_level": 3,
+                "action_level": 2,
                 "enabled": True,
                 "os_type": "linux",
-                "tags": ["system", "storage"]
+                "tags": ["system", "storage"],
+                "remediation_script_name": "Clear Temp Files",
             },
             {
                 "name": "New User Creation",
                 "pattern": r"(?i)(?:new user|new group): name=(?P<username>\S+)",
                 "severity": "medium",
-                "action_level": 1,
+                "action_level": 3,
                 "enabled": True,
                 "os_type": "linux",
-                "tags": ["security", "persistence"]
+                "tags": ["security", "persistence"],
             },
 
             # ==============================
@@ -210,7 +218,8 @@ class AnalysisService:
                 "action_level": 2,
                 "enabled": True,
                 "os_type": "windows",
-                "tags": ["security", "auth"]
+                "tags": ["security", "auth"],
+                "remediation_script_name": "Block IP (Windows Firewall)",
             },
             {
                 "name": "Windows Defender Malware Detected",
@@ -219,16 +228,17 @@ class AnalysisService:
                 "action_level": 3,
                 "enabled": True,
                 "os_type": "windows",
-                "tags": ["security", "malware"]
+                "tags": ["security", "malware"],
             },
             {
                 "name": "Windows Service Crash",
                 "pattern": r"(?i)(?:service terminated unexpectedly|service hung|event id 7034)",
                 "severity": "high",
-                "action_level": 3,
+                "action_level": 2,
                 "enabled": True,
                 "os_type": "windows",
-                "tags": ["system", "stability"]
+                "tags": ["system", "stability"],
+                "remediation_script_name": "Restart Service (Windows)",
             },
             {
                 "name": "Suspicious PowerShell Execution",
@@ -237,7 +247,7 @@ class AnalysisService:
                 "action_level": 2,
                 "enabled": True,
                 "os_type": "windows",
-                "tags": ["security", "execution"]
+                "tags": ["security", "execution"],
             },
             {
                 "name": "Windows Security Log Cleared",
@@ -246,7 +256,7 @@ class AnalysisService:
                 "action_level": 2,
                 "enabled": True,
                 "os_type": "windows",
-                "tags": ["security", "evasion"]
+                "tags": ["security", "evasion"],
             },
 
             # ==============================
@@ -256,10 +266,10 @@ class AnalysisService:
                 "name": "Web Server 500 Error Flood",
                 "pattern": r"HTTP\/1\.[01].*\" 50[0-9] ",
                 "severity": "medium",
-                "action_level": 1,
+                "action_level": 3,
                 "enabled": True,
                 "os_type": "common",
-                "tags": ["app", "web"]
+                "tags": ["app", "web"],
             },
             {
                 "name": "SQL Injection Attempt",
@@ -268,7 +278,8 @@ class AnalysisService:
                 "action_level": 2,
                 "enabled": True,
                 "os_type": "common",
-                "tags": ["security", "web", "sqli"]
+                "tags": ["security", "web", "sqli"],
+                "remediation_script_name": "Block IP (iptables)",
             },
             {
                 "name": "Simulated Attack",
@@ -277,10 +288,18 @@ class AnalysisService:
                 "action_level": 1,
                 "enabled": True,
                 "os_type": "common",
-                # Make sure this ID matches your actual script in DB!
-                "remediation_script_id": "6984af9205e39028ed491207", 
-                "tags": ["test"]
-            }
+                "tags": ["test"],
+                "remediation_script_name": "Block IP (iptables)",
+            },
         ]
+
+        # --- Resolve script names to IDs ---
+        for rule in default_rules:
+            script_name = rule.pop("remediation_script_name", None)
+            if script_name and script_name in script_lookup:
+                rule["remediation_script_id"] = script_lookup[script_name]
+
         await db["rules"].insert_many(default_rules)
-        print("🌱 Default Rules Seeded")
+        
+        linked_count = sum(1 for r in default_rules if r.get("remediation_script_id"))
+        print(f"🌱 Default Rules Seeded ({len(default_rules)} rules, {linked_count} linked to scripts)")
