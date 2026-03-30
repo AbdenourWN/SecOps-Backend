@@ -11,14 +11,29 @@ from app.modules.logs.file_watcher import FileWatcherService
 scheduler = AsyncIOScheduler()
 
 # --- Semaphore: limits how many servers are processed at once ---
-# This prevents overwhelming the system with too many SSH connections.
-# Default: 20 concurrent. Override via MAX_CONCURRENT_SERVERS in .env.
 _semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
 
+# --- Per-Server Lock: prevents multiple jobs from hitting the same server ---
+# WHY: WinRM NTLM rejects concurrent auth handshakes from the same user.
+# If logs + metrics + health all connect to the same Windows server at once,
+# the 2nd and 3rd connections get "credentials rejected".
+# This dict creates one Lock per server_id. Different servers still run in parallel.
+_server_locks: dict[str, asyncio.Lock] = {}
 
-async def _run_with_limit(coro):
-    """Wraps a coroutine with the semaphore to limit concurrency."""
+
+def _get_server_lock(server_id: str) -> asyncio.Lock:
+    """Returns (or creates) the lock for a specific server."""
+    if server_id not in _server_locks:
+        _server_locks[server_id] = asyncio.Lock()
+    return _server_locks[server_id]
+
+
+async def _run_with_limit(coro, server_id: str = None):
+    """Wraps a coroutine with semaphore + per-server lock."""
     async with _semaphore:
+        if server_id:
+            async with _get_server_lock(server_id):
+                return await coro
         return await coro
 
 
@@ -31,7 +46,13 @@ async def job_file_watcher():
             return
 
         print(f"📂 Checking {len(sources)} file sources...")
-        tasks = [_run_with_limit(service.process_file_source(source)) for source in sources]
+        tasks = [
+            _run_with_limit(
+                service.process_file_source(source),
+                server_id=str(source.get("server_id", ""))
+            )
+            for source in sources
+        ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     except Exception as e:
@@ -59,12 +80,14 @@ async def job_log_collection():
 
         print(f"📥 Running Auto-Log Collection for {len(servers)} servers...")
         tasks = [
-            _run_with_limit(service.collect_logs_from_server(str(server["_id"])))
+            _run_with_limit(
+                service.collect_logs_from_server(str(server["_id"])),
+                server_id=str(server["_id"])
+            )
             for server in servers
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Log any individual server failures
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 print(f"❌ Log collection failed for {servers[i].get('hostname', 'unknown')}: {result}")
@@ -83,7 +106,10 @@ async def job_metric_collection():
             return
 
         tasks = [
-            _run_with_limit(service.collect_metrics(str(server["_id"])))
+            _run_with_limit(
+                service.collect_metrics(str(server["_id"])),
+                server_id=str(server["_id"])
+            )
             for server in servers
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -97,17 +123,11 @@ async def job_metric_collection():
 
 
 def start_scheduler():
-    # Add Health Check (60s)
     scheduler.add_job(job_health_check, "interval", seconds=60)
-
-    # Add Log Collection (60s)
     scheduler.add_job(job_log_collection, "interval", seconds=60)
-
-    # Add Metric Collection (60s)
     scheduler.add_job(job_metric_collection, "interval", seconds=60)
-
-    # Add File Watcher (60s)
     scheduler.add_job(job_file_watcher, "interval", seconds=60)
 
     scheduler.start()
-    print(f"⏰ Background Scheduler Started (max {settings.MAX_CONCURRENT_SERVERS} concurrent servers)")
+    print(f"⏰ Background Scheduler Started (max {settings.MAX_CONCURRENT_SERVERS} concurrent servers, per-server lock enabled)")
+

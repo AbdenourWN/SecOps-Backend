@@ -42,6 +42,7 @@ class ServerService:
     async def update_all_server_statuses(self):
             import asyncio
             from app.core.config import settings
+            from app.core.scheduler import _get_server_lock
 
             db = get_database()
             servers = await db["servers"].find().to_list(length=10000)
@@ -50,20 +51,22 @@ class ServerService:
             sem = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
 
             async def check_one(server):
+                server_id = str(server["_id"])
                 async with sem:
-                    executor = get_server_executor(server, plain_password="")
-                    is_online = await executor.check_health()
-                    new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
-                    
-                    await db["servers"].update_one(
-                        {"_id": server["_id"]},
-                        {
-                            "$set": {
-                                "status": new_status, 
-                                "last_health_check": datetime.now(timezone.utc)
+                    async with _get_server_lock(server_id):
+                        executor = get_server_executor(server, plain_password="")
+                        is_online = await executor.check_health()
+                        new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
+                        
+                        await db["servers"].update_one(
+                            {"_id": server["_id"]},
+                            {
+                                "$set": {
+                                    "status": new_status, 
+                                    "last_health_check": datetime.now(timezone.utc)
+                                }
                             }
-                        }
-                    )
+                        )
 
             tasks = [check_one(server) for server in servers]
             await asyncio.gather(*tasks, return_exceptions=True)

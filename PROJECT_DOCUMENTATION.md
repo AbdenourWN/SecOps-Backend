@@ -553,3 +553,197 @@ This means:
 
 **Batch Hostname Lookup (get_recent_incidents):**
 - Replaced per-server `find_one()` calls with a single `find({"_id": {"$in": oid_list}})` query
+
+---
+
+## Phase 5 — Alerting & Notifications (Mar 29)
+
+With the performance optimization complete, the detection pipeline had a gap: incidents were created and stored in MongoDB, but **nobody was notified**. A Level 3 "Alert Only" incident would sit in the database until someone manually checked the dashboard. This defeats the purpose of real-time detection.
+
+### Design Decision: Email Only, Pluggable Architecture
+
+The question was: implement email, Slack, Teams, SMS, or all of them? The answer: **email only**, but with a class architecture that makes adding Slack/Teams later a 30-line addition with zero refactoring.
+
+Reasoning:
+- Email is universal — every organization has it, no external service dependencies
+- Slack/Teams requires the team to actively monitor a channel, which not every SOC does
+- SMS costs money per message (Twilio billing) and is overkill for most severities
+- A clean `BaseChannel → EmailChannel` inheritance means future channels just implement `send()`
+
+### Module Structure
+
+```
+app/modules/notifications/
+├── __init__.py
+├── schemas.py              # AlertPayload, NotificationConfigCreate (Pydantic)
+├── service.py              # NotificationService — dispatch + DB config lookup
+├── router.py               # REST API for managing notification settings
+└── channels/
+    ├── __init__.py
+    ├── base.py             # Abstract BaseChannel (send method)
+    └── email.py            # EmailChannel — HTML emails via aiosmtplib
+```
+
+### How It Works
+
+1. **Analysis engine detects a match** → creates an incident
+2. If the incident is **Level 2** (Fix + Alert) or **Level 3** (Alert Only):
+   - Builds an `AlertPayload` with incident details (server, rule, severity, context)
+   - Calls `NotificationService.send_alert(payload)`
+3. **NotificationService** queries `notification_configs` collection in MongoDB
+   - If no DB config exists, falls back to `.env` recipients (`ALERT_RECIPIENTS`)
+   - Filters by `min_severity` (e.g., only alert on "high" and above)
+4. **EmailChannel.send()** builds an HTML email and sends via `aiosmtplib` (async SMTP)
+
+### What Changed in Existing Code
+
+#### `app/core/config.py`
+Added 7 new settings:
+```python
+SMTP_HOST: str = ""
+SMTP_PORT: int = 587
+SMTP_USER: str = ""
+SMTP_PASSWORD: str = ""
+SMTP_USE_TLS: bool = True
+ALERT_FROM_EMAIL: str = ""
+ALERT_RECIPIENTS: str = ""   # Comma-separated
+```
+All default to empty — the app starts fine without email configured. Alerts simply won't send.
+
+#### `app/modules/analysis/service.py`
+- Imported `NotificationService` and `AlertPayload`
+- Added `self.notification_service = NotificationService()` to `__init__`
+- Level 2 incidents: notification sent **after** remediation, including whether the fix succeeded or failed
+- Level 3 incidents: notification sent **after** bulk insert, with the inserted incident ID
+
+#### `app/main.py`
+- Registered the notifications router: `app.include_router(notifications_router, prefix="/api/notifications")`
+
+#### `requirements.txt`
+- Added `aiosmtplib==3.0.1`
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/notifications/config` | List all notification configs |
+| `POST` | `/api/notifications/config` | Create/update a config (upsert by channel) |
+| `DELETE` | `/api/notifications/config/{channel}` | Delete a config |
+| `POST` | `/api/notifications/test` | Send a test alert to verify setup |
+
+### Email Template
+
+The HTML email includes:
+- Color-coded header by severity (red for critical, orange for high, yellow for medium)
+- Server hostname and IP
+- Rule name and action level
+- Extracted context variables (the regex named groups)
+- Remediation status (if applicable)
+- Incident ID for reference
+
+---
+
+## Phase 6 — Per-Server Lock (Mar 30)
+
+### The Problem
+
+After enabling the parallel scheduler (OPT-1), all 4 jobs (logs, metrics, health, file_watcher) fired simultaneously for every server. For **Linux servers with SSH**, this was fine — SSH creates independent sessions per connection. But for **Windows servers with WinRM**, this caused `the specified credentials were rejected by the server` errors.
+
+### Why WinRM Breaks Under Concurrency
+
+The root cause is architectural:
+
+| | SSH (Linux) | WinRM (Windows) |
+|---|---|---|
+| Architecture | Multi-process (fork per connection) | Single HTTP service |
+| Auth | Per-session key exchange | Shared NTLM 3-step challenge-response |
+| Concurrent safe? | Yes, by design | No — auth handshakes collide |
+
+When two WinRM connections start the NTLM handshake at the exact same millisecond, the service gets confused about which challenge belongs to which client. The 2nd connection gets "credentials rejected" — not because the password is wrong, but because the auth state machine collided.
+
+### The Fix: `_server_locks` Dict
+
+Added a dictionary of `asyncio.Lock()` objects, one per server ID:
+
+```python
+_server_locks: dict[str, asyncio.Lock] = {}
+
+def _get_server_lock(server_id: str) -> asyncio.Lock:
+    if server_id not in _server_locks:
+        _server_locks[server_id] = asyncio.Lock()
+    return _server_locks[server_id]
+```
+
+Updated `_run_with_limit()` to accept `server_id`:
+```python
+async def _run_with_limit(coro, server_id: str = None):
+    async with _semaphore:
+        if server_id:
+            async with _get_server_lock(server_id):
+                return await coro
+        return await coro
+```
+
+**Result:**
+- Different servers still run in full parallel (each has its own lock)
+- Jobs targeting the same server run sequentially (lock ensures one-at-a-time)
+- The system adapts automatically — no time-based guessing
+
+### What Changed
+
+- `app/core/scheduler.py` — Added `_server_locks`, `_get_server_lock()`, updated all 4 jobs to pass `server_id`
+- `app/modules/servers/service.py` — Health check (`update_all_server_statuses`) also acquires the per-server lock
+
+### Why Not Just Stagger Job Intervals?
+
+This was considered (e.g., logs at 0s, metrics at 20s, health at 40s). The problem: with 100 servers, logs might take 25 seconds → metrics and logs overlap anyway. Staggering is based on time guesses; locks are based on actual completion. The lock approach adapts to any server count and any network latency without configuration.
+
+---
+
+## Phase 7 — Bug Fixes (Mar 30)
+
+### Bug 1: Windows Log Collection Crash — `expected string or bytes-like object`
+
+**Symptom:** `❌ Log collection failed for WinServer2022: expected string or bytes-like object`
+
+**Root cause:** Windows `Get-WinEvent` can return `"Message": null` in JSON when an event has no message body. Python's `dict.get("Message", "")` only returns the default `""` when the key is **missing**. When the key exists but the value is `null` (JSON null → Python `None`), `.get()` returns `None`. Then the regex engine received `None` instead of a string: `pattern.search(None)` → `TypeError`.
+
+**Fix:** Changed `.get("key", "")` to `.get("key") or ""` in 3 places:
+- `logs/service.py` line 159: Linux `MESSAGE` field
+- `logs/service.py` line 230: Windows `Message` field
+- `analysis/service.py` line 94: Analysis engine `message` field (defense in depth)
+
+The `or ""` pattern handles both missing keys AND explicit `None` values.
+
+### Bug 2: WinRM Service Reset on Windows Server VM
+
+**Symptom:** All WinRM connections failed with "credentials rejected" — even single, isolated connections from the test script.
+
+**Root cause:** The Windows Server VM's WinRM service configuration had been reset (likely after a reboot). The WinRM listener and auth settings needed to be reconfigured.
+
+**Fix (on the Windows Server VM):**
+```powershell
+winrm quickconfig -force
+Set-Item WSMan:\localhost\Service\Auth\Negotiate -Value $true
+Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $true
+```
+
+**Lesson:** This is an infrastructure-level issue, not a code issue. The diagnostic approach was:
+1. First suspected concurrency (per-server lock) — but the fix didn't help
+2. Tested with isolated single connection (test_winrm.py) — still failed
+3. Concluded it was a VM-level issue, not a code issue
+4. Reconfigured WinRM on the VM → solved
+
+This debugging process is documented here because the thought progression (concurrent fix → isolate → VM fix) is a useful pattern for future WinRM troubleshooting.
+
+### Bug 3: Remediation Scripts Fail on Windows — `iptables` Not Found
+
+**Symptom:** SQL Injection rule fires on Windows server, triggers remediation, but fails:
+```
+❌ Remediation Failed: The token '&&' is not a valid statement separator
+```
+
+**Root cause:** The default remediation script (`Block IP via iptables`) uses Linux-only commands (`iptables`, `&&`). These commands don't exist in PowerShell.
+
+**Status:** Known limitation. The fix is to create Windows-specific remediation scripts using PowerShell firewall rules (e.g., `New-NetFirewallRule`). This is tracked for a future phase but is not critical — the incident is still created and the alert is still sent, only the auto-fix fails on Windows.
+

@@ -156,9 +156,9 @@ class LogService:
             timestamp = datetime.fromtimestamp(ts_micro / 1_000_000, tz=timezone.utc)
             ts_iso = timestamp.isoformat()
             
-            message = entry.get("MESSAGE", "")
-            service = entry.get("SYSLOG_IDENTIFIER", "system")
-            priority = entry.get("PRIORITY", "6")
+            message = entry.get("MESSAGE") or ""
+            service = entry.get("SYSLOG_IDENTIFIER") or "system"
+            priority = entry.get("PRIORITY") or "6"
             
             # OPT-3: Skip logs older than what we already have (pure Python, no network)
             if latest_ts and ts_iso <= latest_ts:
@@ -227,7 +227,7 @@ class LogService:
             elif "warning" in lvl_str:
                 level = LogLevel.WARNING
 
-            message = entry.get("Message", "")
+            message = entry.get("Message") or ""
             timestamp = datetime.now(timezone.utc)
             ts_iso = timestamp.isoformat()
 

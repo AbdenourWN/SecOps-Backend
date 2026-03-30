@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/Abdenour/Documents/PFE/**)",
+      "Bash(printf 'N\\\\nN\\\\n')",
+      "Bash(npx create-next-app@latest secops-frontend --typescript --tailwind --eslint --app --src-dir --use-npm --no-turbopack --import-alias \"@/*\")",
+      "Bash(yes N)",
+      "Bash(npm install:*)",
+      "Bash(npx shadcn@latest init -d --style new-york --base-color neutral)",
+      "Bash(npx shadcn@latest add card table dialog select input badge dropdown-menu sheet tabs textarea switch separator skeleton tooltip avatar scroll-area popover command)",
+      "Bash(npx next:*)"
+    ]
+  }
+}

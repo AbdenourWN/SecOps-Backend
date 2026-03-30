@@ -91,7 +91,7 @@ class AnalysisService:
 
         # 3. The Matching Loop
         for log in logs:
-            log_msg = log.get("message", "")
+            log_msg = log.get("message") or ""
 
             for rule_obj in active_rules:
                 rule = rule_obj["data"]
