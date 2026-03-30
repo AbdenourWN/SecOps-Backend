@@ -1,8 +1,15 @@
 from app.core.database import get_database
+from app.core.elasticsearch import get_elasticsearch
 from app.modules.metrics.schemas import SystemMetric
 from app.core.executors import get_server_executor
 from app.core.security import decrypt_password
 from bson import ObjectId
+from datetime import datetime, timezone
+import uuid
+
+def _get_metric_index_name():
+    now = datetime.now(timezone.utc)
+    return f"secops-metrics-{now.strftime('%Y.%m')}"
 
 class MetricService:
     
@@ -86,16 +93,27 @@ class MetricService:
             ram_val = float(parts[1]) if parts[1] else 0.0
             disk_val = float(parts[2]) if parts[2] else 0.0
             
-            # 6. Save to DB
-            metric = SystemMetric(
-                server_id=str(server["_id"]),
-                cpu_usage=round(cpu_val, 2),
-                ram_usage=round(ram_val, 2),
-                disk_usage=round(disk_val, 2),
-                raw_data=output
-            )
+            # 6. Save to DB (Elasticsearch)
+            metric_doc = {
+                "server_id": str(server["_id"]),
+                "cpu_usage": round(cpu_val, 2),
+                "ram_usage": round(ram_val, 2),
+                "disk_usage": round(disk_val, 2),
+                "raw_data": output,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
             
-            await db["metrics"].insert_one(metric.model_dump())
+            es = get_elasticsearch()
+            if es:
+                try:
+                    await es.index(
+                        index=_get_metric_index_name(),
+                        id=str(uuid.uuid4()),
+                        document=metric_doc
+                    )
+                except Exception as e:
+                    print(f"⚠️ Failed to index metric to ES: {e}")
+            
             return True
             
         except Exception as e:
@@ -103,7 +121,30 @@ class MetricService:
             return False
 
     async def get_latest_metrics(self, server_id: str, limit: int = 20):
-        """Get history for charts"""
-        db = get_database()
-        cursor = db["metrics"].find({"server_id": server_id}).sort("timestamp", -1).limit(limit)
-        return await cursor.to_list(length=limit)
+        """Get history for charts from Elasticsearch"""
+        es = get_elasticsearch()
+        if not es:
+            return []
+            
+        try:
+            result = await es.search(
+                index="secops-metrics-*",
+                body={
+                    "query": {
+                        "term": {"server_id": server_id}
+                    },
+                    "sort": [{"timestamp": {"order": "desc"}}],
+                    "size": limit
+                }
+            )
+            
+            metrics = []
+            for hit in result["hits"]["hits"]:
+                doc = hit["_source"]
+                doc["_id"] = hit["_id"]
+                metrics.append(doc)
+                
+            return metrics
+        except Exception as e:
+            print(f"⚠️ ES search error: {e}")
+            return []

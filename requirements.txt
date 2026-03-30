@@ -7,6 +7,7 @@ pydantic==2.6.0          # Data validation (Ensures data is correct)
 pydantic-settings==2.1.0 # Manage configuration (API Keys)
 motor==3.4.0             # Async driver for MongoDB (The Database)
 pymongo==4.7.2 
+elasticsearch[async]>=8.0.0,<9.0.0  # Must match ES server version (8.13)
 
 # --- The Utilities ---
 paramiko==4.0.0          # SSH Client (To talk to Linux Servers)
@@ -18,3 +19,6 @@ cryptography==46.0.4
 apscheduler==3.11.2
 
 pywinrm
+
+# --- Notifications ---
+aiosmtplib==3.0.1        # Async SMTP client for email alerts

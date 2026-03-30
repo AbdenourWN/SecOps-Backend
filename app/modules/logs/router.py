@@ -1,14 +1,102 @@
-from fastapi import APIRouter, HTTPException
-from typing import List
+from fastapi import APIRouter, HTTPException, Query
+from typing import List, Optional
 from app.modules.logs.service import LogService
 from app.modules.logs.schemas import LogResponse, LogSourceCreate, LogSourceInDB
 from app.modules.logs.file_watcher import FileWatcherService
+from app.core.elasticsearch import get_elasticsearch
 
 watcher_service = FileWatcherService()
 
 
 router = APIRouter()
 service = LogService()
+
+
+@router.get("/search")
+async def search_logs(
+    q: Optional[str] = Query(None, description="Full-text search query (e.g., 'failed password')"),
+    server_id: Optional[str] = Query(None, description="Filter by server ID"),
+    level: Optional[str] = Query(None, description="Filter by level: ERROR, WARNING, INFO"),
+    from_date: Optional[str] = Query(None, description="Start date (ISO format: 2026-03-01)"),
+    to_date: Optional[str] = Query(None, description="End date (ISO format: 2026-03-31)"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """
+    Full-text log search powered by Elasticsearch.
+    
+    HOW THIS WORKS:
+    - 'q' searches the 'message' field using ES full-text analysis
+      (e.g., "failed password" finds "Failed Password for root from...")
+    - Filters (server_id, level, date range) use exact matching
+    - Results sorted newest-first
+    """
+    es = get_elasticsearch()
+    if not es:
+        raise HTTPException(status_code=503, detail="Elasticsearch is not available")
+
+    # Build the query dynamically
+    must_clauses = []
+    filter_clauses = []
+
+    # Full-text search on message field
+    if q:
+        must_clauses.append({"match": {"message": q}})
+
+    # Exact match filters
+    if server_id:
+        filter_clauses.append({"term": {"server_id": server_id}})
+    if level:
+        filter_clauses.append({"term": {"level": level.upper()}})
+
+    # Date range filter
+    if from_date or to_date:
+        date_range = {}
+        if from_date:
+            date_range["gte"] = from_date
+        if to_date:
+            date_range["lte"] = to_date
+        filter_clauses.append({"range": {"timestamp": date_range}})
+
+    # Combine into bool query
+    bool_query = {}
+    if must_clauses:
+        bool_query["must"] = must_clauses
+    if filter_clauses:
+        bool_query["filter"] = filter_clauses
+
+    # If nothing specified, match all
+    query = {"bool": bool_query} if bool_query else {"match_all": {}}
+
+    try:
+        result = await es.search(
+            index="secops-logs-*",
+            body={
+                "query": query,
+                "sort": [{"timestamp": {"order": "desc"}}],
+                "from": skip,
+                "size": limit,
+            }
+        )
+
+        total = result["hits"]["total"]["value"]
+        logs = []
+        for hit in result["hits"]["hits"]:
+            doc = hit["_source"]
+            doc["_id"] = hit["_id"]
+            doc["_score"] = hit.get("_score")  # Relevance score
+            logs.append(doc)
+
+        return {
+            "total": total,
+            "showing": len(logs),
+            "skip": skip,
+            "limit": limit,
+            "results": logs,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ES search error: {str(e)}")
+
 
 @router.post("/collect/{server_id}")
 async def trigger_log_collection(server_id: str):
@@ -21,10 +109,10 @@ async def trigger_log_collection(server_id: str):
         raise HTTPException(status_code=400, detail=result["error"])
     return result
 
-@router.get("/{server_id}", response_model=List[LogResponse])
+@router.get("/{server_id}")
 async def get_server_logs(server_id: str, limit: int = 50):
     """
-    Fetch the latest logs from the database.
+    Fetch the latest logs from Elasticsearch for a specific server.
     """
     return await service.get_logs(server_id, limit)
 

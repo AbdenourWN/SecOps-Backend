@@ -40,33 +40,35 @@ class ServerService:
         return {"valid": True, "credential_id": cred_id, "server_data": server}
     
     async def update_all_server_statuses(self):
+            import asyncio
+            from app.core.config import settings
+
             db = get_database()
-            cursor = db["servers"].find()
+            servers = await db["servers"].find().to_list(length=10000)
             print(f"🕵️  Starting Health Check Cycle...")
             
-            count = 0
-            async for server in cursor:
-                # FACTORY MAGIC: Ask for an executor for this server
-                # We don't need a password just to ping the port, so we pass ""
-                executor = get_server_executor(server, plain_password="")
-                
-                # The executor handles the details (Linux vs Windows)
-                is_online = await executor.check_health()
-                
-                new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
-                
-                await db["servers"].update_one(
-                    {"_id": server["_id"]},
-                    {
-                        "$set": {
-                            "status": new_status, 
-                            "last_health_check": datetime.now(timezone.utc)
+            sem = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
+
+            async def check_one(server):
+                async with sem:
+                    executor = get_server_executor(server, plain_password="")
+                    is_online = await executor.check_health()
+                    new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
+                    
+                    await db["servers"].update_one(
+                        {"_id": server["_id"]},
+                        {
+                            "$set": {
+                                "status": new_status, 
+                                "last_health_check": datetime.now(timezone.utc)
+                            }
                         }
-                    }
-                )
-                count += 1
+                    )
+
+            tasks = [check_one(server) for server in servers]
+            await asyncio.gather(*tasks, return_exceptions=True)
                 
-            print(f"✅ Health Check Complete. Scanned {count} servers.")
+            print(f"✅ Health Check Complete. Scanned {len(servers)} servers.")
     """ 
     🚀
     CRUD Operations 

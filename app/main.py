@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from app.core.database import connect_to_mongo, close_mongo_connection
+from app.core.elasticsearch import connect_to_elasticsearch, close_elasticsearch
 from app.modules.servers.router import router as servers_router
 from app.modules.logs.router import router as logs_router
 from app.modules.automation.router import router as automation_router
@@ -12,6 +13,8 @@ from app.modules.metrics.router import router as metrics_router
 from app.modules.analysis.router import router as analysis_router
 from app.modules.incidents.router import router as incidents_router
 from app.modules.dashboard.router import router as dashboard_router
+from app.modules.test.router import router as test_router
+from app.modules.notifications.router import router as notifications_router
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -19,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 async def lifespan(app: FastAPI):
     # -- Startup --
     await connect_to_mongo()
+    await connect_to_elasticsearch()
 
     # Seed Data (One time check — scripts first, then rules link to them)
     await AutomationService().seed_default_scripts()
@@ -30,6 +34,7 @@ async def lifespan(app: FastAPI):
 
     yield
     # -- Shutdown --
+    await close_elasticsearch()
     await close_mongo_connection()
 
 app = FastAPI(title="SecOps Backend", version="1.0.0", lifespan=lifespan)
@@ -55,6 +60,8 @@ app.include_router(metrics_router, prefix="/api/metrics", tags=["Metrics"])
 app.include_router(analysis_router, prefix="/api/analysis", tags=["AI Analysis"])
 app.include_router(incidents_router, prefix="/api/incidents", tags=["Incidents"])
 app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"])
+app.include_router(test_router, prefix="/api/test", tags=["Test & Simulation"])
+app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
 
 
 

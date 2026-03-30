@@ -1,0 +1,54 @@
+# ===========================================
+# SecOps Backend - Docker Services
+# ===========================================
+# Run: docker-compose up -d
+# Stop: docker-compose down
+# View logs: docker-compose logs -f elasticsearch
+# ===========================================
+
+services:
+  # ── Elasticsearch ──────────────────────────
+  # Think of ES like a super-fast search engine for your logs.
+  # It stores data in "indices" (like MongoDB collections)
+  # and builds an inverted index for instant full-text search.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: secops-elasticsearch
+    environment:
+      # Single-node mode (no cluster needed for development)
+      - discovery.type=single-node
+      # Disable paid security features (authentication/TLS) for dev
+      - xpack.security.enabled=false
+      # Limit memory usage (ES is memory-hungry by default)
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      # 9200 = HTTP API (where your Python code talks to ES)
+      # 9300 = inter-node transport (not needed in single-node)
+      - "9200:9200"
+    volumes:
+      # Persist data between container restarts
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Kibana (Optional) ─────────────────────
+  # Visual UI for exploring your ES data.
+  # Open http://localhost:5601 to browse indices, run queries, etc.
+  # You can comment this out if you don't want it.
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: secops-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+volumes:
+  es_data:
+    driver: local

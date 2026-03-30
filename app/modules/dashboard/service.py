@@ -1,13 +1,46 @@
 from app.core.database import get_database
+from app.core.elasticsearch import get_elasticsearch
 from datetime import datetime, timezone, timedelta
 
 
 class DashboardService:
 
+    async def _get_es_log_counts(self):
+        """
+        Gets log counts from Elasticsearch.
+        Returns (total_logs, logs_last_24h).
+        """
+        es = get_elasticsearch()
+        if not es:
+            return 0, 0
+
+        try:
+            # Total logs = count all documents in secops-logs-* indices
+            total_result = await es.count(index="secops-logs-*")
+            total_logs = total_result["count"]
+
+            # Last 24h = count with date range filter
+            last_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+            recent_result = await es.count(
+                index="secops-logs-*",
+                body={
+                    "query": {
+                        "range": {
+                            "ingested_at": {"gte": last_24h.isoformat()}
+                        }
+                    }
+                }
+            )
+            logs_last_24h = recent_result["count"]
+
+            return total_logs, logs_last_24h
+        except Exception:
+            return 0, 0
+
     async def get_summary(self):
         """
         Single endpoint that returns the full dashboard overview.
-        Pulls data from: servers, incidents, metrics, logs, scripts, rules.
+        Pulls data from: servers, incidents, metrics, logs (ES), scripts, rules.
         """
         db = get_database()
 
@@ -61,10 +94,8 @@ class DashboardService:
                 "by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0},
             }
 
-        # --- Log Stats (Last 24h) ---
-        last_24h = datetime.now(timezone.utc) - timedelta(hours=24)
-        logs_last_24h = await db["logs"].count_documents({"ingested_at": {"$gte": last_24h}})
-        total_logs = await db["logs"].count_documents({})
+        # --- Log Stats from Elasticsearch ---
+        total_logs, logs_last_24h = await self._get_es_log_counts()
 
         return {
             "servers": {
@@ -88,24 +119,28 @@ class DashboardService:
         """
         db = get_database()
 
-        # Fetch recent incidents
         cursor = db["incidents"].find().sort("detected_at", -1).limit(limit)
         incidents = await cursor.to_list(length=limit)
 
-        # Enrich with server hostname (batch lookup)
+        # OPT-6: Batch lookup — 1 query for all server hostnames instead of N
         from bson import ObjectId
 
         server_ids = list(set(inc.get("server_id") for inc in incidents if inc.get("server_id")))
-        servers = {}
+        oid_list = []
         for sid in server_ids:
             try:
-                server = await db["servers"].find_one({"_id": ObjectId(sid)})
-                if server:
-                    servers[sid] = server.get("hostname", "Unknown")
+                oid_list.append(ObjectId(sid))
             except Exception:
                 pass
 
-        # Format response
+        servers = {}
+        if oid_list:
+            server_docs = await db["servers"].find(
+                {"_id": {"$in": oid_list}},
+                {"hostname": 1}
+            ).to_list(length=100)
+            servers = {str(s["_id"]): s.get("hostname", "Unknown") for s in server_docs}
+
         result = []
         for inc in incidents:
             inc["_id"] = str(inc["_id"])
@@ -117,27 +152,62 @@ class DashboardService:
     async def get_server_health(self):
         """
         Returns all servers with their latest metric snapshot.
+        OPT-6: Batch queries instead of N+1.
         """
         db = get_database()
 
         servers = await db["servers"].find().to_list(length=100)
-        result = []
+        if not servers:
+            return []
 
+        server_ids = [str(s["_id"]) for s in servers]
+
+        # ============================================================
+        # OPT-6A: BATCH METRICS — 1 ES msearch instead of N searches
+        # msearch sends multiple search requests in a single HTTP call
+        # ============================================================
+        metrics_map = {}
+        es = get_elasticsearch()
+        if es:
+            try:
+                search_body = []
+                for sid in server_ids:
+                    search_body.append({"index": "secops-metrics-*"})
+                    search_body.append({
+                        "query": {"term": {"server_id": sid}},
+                        "sort": [{"timestamp": {"order": "desc"}}],
+                        "size": 1
+                    })
+                
+                if search_body:
+                    ms_result = await es.msearch(body=search_body)
+                    for i, response in enumerate(ms_result["responses"]):
+                        if response.get("hits", {}).get("hits"):
+                            metrics_map[server_ids[i]] = response["hits"]["hits"][0]["_source"]
+            except Exception:
+                pass
+
+        # ============================================================
+        # OPT-6B: BATCH INCIDENTS — 1 aggregation instead of N counts
+        # ============================================================
+        incident_counts = {}
+        try:
+            pipeline = [
+                {"$match": {"status": {"$in": ["open", "investigating"]}}},
+                {"$group": {"_id": "$server_id", "count": {"$sum": 1}}}
+            ]
+            counts = await db["incidents"].aggregate(pipeline).to_list(length=1000)
+            incident_counts = {c["_id"]: c["count"] for c in counts}
+        except Exception:
+            pass
+
+        # Build response
+        result = []
         for server in servers:
             server_id = str(server["_id"])
             server["_id"] = server_id
 
-            # Fetch latest metric for this server
-            latest_metric = await db["metrics"].find_one(
-                {"server_id": server_id},
-                sort=[("timestamp", -1)]
-            )
-
-            # Fetch open incident count for this server
-            open_incidents = await db["incidents"].count_documents({
-                "server_id": server_id,
-                "status": {"$in": ["open", "investigating"]}
-            })
+            latest_metric = metrics_map.get(server_id)
 
             result.append({
                 "server": server,
@@ -147,7 +217,7 @@ class DashboardService:
                     "disk_usage": latest_metric.get("disk_usage") if latest_metric else None,
                     "timestamp": latest_metric.get("timestamp") if latest_metric else None,
                 } if latest_metric else None,
-                "open_incidents": open_incidents,
+                "open_incidents": incident_counts.get(server_id, 0),
             })
 
         return result

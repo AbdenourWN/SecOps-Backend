@@ -1,29 +1,73 @@
 import re
+import time
+from datetime import datetime, timezone, timedelta
 from app.core.database import get_database
 from app.modules.analysis.schemas import IncidentInDB, ActionLevel, IncidentStatus
 from app.modules.logs.schemas import LogEntryInDB
 from bson import ObjectId
 from app.modules.automation.service import AutomationService
+from app.modules.notifications.service import NotificationService
+from app.modules.notifications.schemas import AlertPayload
+
+# ========================================================================
+# OPT-4: RULE CACHE
+# Rules rarely change (maybe once a week). Instead of re-querying MongoDB
+# and re-compiling regex every 60 seconds for every server, we cache them
+# in memory with a 5-minute TTL. 
+# ========================================================================
+_rule_cache = {
+    "rules": [],         # List of {"data": rule_dict, "compiled_pattern": re.Pattern}
+    "loaded_at": 0,      # Unix timestamp of when cache was last refreshed
+    "ttl": 300,          # 5 minutes
+}
+
+
+async def _get_cached_rules():
+    """
+    Returns compiled rules from cache. Re-fetches from MongoDB only if
+    the cache is older than TTL (5 minutes).
+    """
+    now = time.time()
+    if now - _rule_cache["loaded_at"] > _rule_cache["ttl"]:
+        db = get_database()
+        rules_data = await db["rules"].find({"enabled": True}).to_list(length=200)
+        
+        compiled = []
+        for r in rules_data:
+            try:
+                compiled.append({
+                    "data": r,
+                    "compiled_pattern": re.compile(r["pattern"], re.IGNORECASE)
+                })
+            except re.error:
+                print(f"❌ Invalid Regex in Rule {r['name']}")
+        
+        _rule_cache["rules"] = compiled
+        _rule_cache["loaded_at"] = now
+        print(f"🔄 Rule cache refreshed: {len(compiled)} rules compiled")
+    
+    return _rule_cache["rules"]
+
 
 class AnalysisService:
 
     def __init__(self):
         self.automation_service = AutomationService()
+        self.notification_service = NotificationService()
 
     async def analyze_logs(self, logs: list[dict]):
         """
         The Core Logic:
-        1. Fetch all enabled Rules from DB.
+        1. Get Rules from cache (OPT-4).
         2. Check every log against every rule.
-        3. Create Incidents if matches found.
+        3. Create Incidents if matches found (with dedup — OPT-5).
         """
         if not logs:
             return
 
         db = get_database()
 
-        # 1. OPTIMIZATION: Fetch Server OS once
-        # (Assuming all logs in this batch belong to the same server)
+        # 1. Fetch Server OS once
         first_server_id = logs[0]["server_id"]
         server = await db["servers"].find_one({"_id": ObjectId(first_server_id)})
         if not server:
@@ -31,31 +75,17 @@ class AnalysisService:
 
         server_os = server.get("os_type", "linux")
 
-        # 2. Load Rules
-        rules_cursor = db["rules"].find({"enabled": True})
-        rules_data = await rules_cursor.to_list(length=200)
+        # 2. OPT-4: Get rules from cache (no DB query if cache is fresh)
+        all_rules = await _get_cached_rules()
 
-        if not rules_data:
+        # Filter by OS (pure Python, no DB)
+        active_rules = [
+            r for r in all_rules
+            if r["data"].get("os_type", "common") in ("common", server_os)
+        ]
+
+        if not active_rules:
             return
-
-        # --- OPTIMIZATION: Pre-compile Regex & Filter OS ---
-        # We prepare the rules BEFORE looping through logs.
-        # This makes the engine much faster.
-        active_rules = []
-        for r in rules_data:
-            # OS Filter
-            if r.get("os_type", "common") != "common" and r.get("os_type") != server_os:
-                continue
-            
-            try:
-                # Compile Regex once
-                active_rules.append({
-                    "data": r,
-                    "compiled_pattern": re.compile(r["pattern"], re.IGNORECASE)
-                })
-            except re.error:
-                print(f"❌ Invalid Regex in Rule {r['name']}")
-        # ---------------------------------------------------
 
         new_incidents = []
 
@@ -67,7 +97,6 @@ class AnalysisService:
                 rule = rule_obj["data"]
                 pattern = rule_obj["compiled_pattern"]
 
-                # Run Regex
                 match = pattern.search(log_msg)
                 
                 if match:
@@ -75,6 +104,20 @@ class AnalysisService:
                     extracted_context = match.groupdict()
                     if not extracted_context:
                         extracted_context = {"raw_match": match.group(0)}
+
+                    # ========================================================
+                    # OPT-5: DUPLICATE INCIDENT PREVENTION
+                    # Check if an incident for this server + rule already 
+                    # exists in the last 5 minutes. If so, skip it.
+                    # ========================================================
+                    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+                    existing = await db["incidents"].find_one({
+                        "server_id": str(log["server_id"]),
+                        "rule_id": str(rule["_id"]),
+                        "detected_at": {"$gte": recent_cutoff}
+                    })
+                    if existing:
+                        continue  # Already reported — skip duplicate
 
                     print(f"🚨 Incident: {rule['name']} | Ctx: {extracted_context}")
 
@@ -85,7 +128,7 @@ class AnalysisService:
                         log_id=str(log["_id"]),
                         severity=rule["severity"],
                         description=f"Detected: {rule['name']}",
-                        context=extracted_context # Save vars to DB
+                        context=extracted_context
                     )
 
                     # CHECK LEVEL & AUTOMATION
@@ -94,24 +137,34 @@ class AnalysisService:
 
                     executed_fix = False
 
+                    # Build alert payload for notifications
+                    alert_payload = AlertPayload(
+                        incident_id="",  # Will be set after insert
+                        server_id=str(log["server_id"]),
+                        server_hostname=server.get("hostname", server.get("ip_address", "unknown")),
+                        server_ip=server.get("ip_address", "unknown"),
+                        rule_name=rule["name"],
+                        severity=rule["severity"],
+                        description=f"Detected: {rule['name']}",
+                        context=extracted_context,
+                        detected_at=datetime.now(timezone.utc),
+                        action_level=action_level,
+                    )
+
                     # If Level 1 (Auto) or Level 2 (Fix+Alert) AND we have a script
                     if action_level in [1, 2] and remediation_script_id:
                         print(f"⚙️ Triggering Automation for Rule: {rule['name']}")
 
-                        # Insert incident FIRST to get an ID
                         inc_result = await db["incidents"].insert_one(incident.model_dump())
                         incident_id = str(inc_result.inserted_id)
 
-                        # Execute Script
-                        # FIX: We pass the 'extracted_context' as variables!
                         success = await self.automation_service.execute_remediation(
                             server_id=str(log["server_id"]),
                             script_id=remediation_script_id,
                             incident_id=incident_id,
-                            variables=extracted_context # <--- CRITICAL FIX
+                            variables=extracted_context
                         )
 
-                        # If Auto-Fix (Level 1) worked, verify and close incident
                         if success and action_level == 1:
                             await db["incidents"].update_one(
                                 {"_id": inc_result.inserted_id},
@@ -123,14 +176,37 @@ class AnalysisService:
                                 },
                             )
                             executed_fix = True
+
+                        # Level 2: Send notification after remediation
+                        if action_level == 2:
+                            alert_payload.incident_id = incident_id
+                            alert_payload.remediation_status = "executed" if success else "failed"
+                            await self.notification_service.send_alert(alert_payload)
+
                     else:
-                        # Just save the incident normally via bulk list
                         new_incidents.append(incident.model_dump())
 
         # 4. Bulk Save (for incidents that didn't run automation)
         if new_incidents:
-            await db["incidents"].insert_many(new_incidents)
+            inc_results = await db["incidents"].insert_many(new_incidents)
             print(f"💾 Saved {len(new_incidents)} new incidents.")
+
+            # 5. Send notifications for Level 3 (alert-only) incidents
+            for i, inc_data in enumerate(new_incidents):
+                action_level = 3  # These are the non-automated ones
+                alert_payload = AlertPayload(
+                    incident_id=str(inc_results.inserted_ids[i]),
+                    server_id=inc_data["server_id"],
+                    server_hostname=server.get("hostname", server.get("ip_address", "unknown")),
+                    server_ip=server.get("ip_address", "unknown"),
+                    rule_name=inc_data["description"].replace("Detected: ", ""),
+                    severity=inc_data["severity"],
+                    description=inc_data["description"],
+                    context=inc_data.get("context", {}),
+                    detected_at=datetime.now(timezone.utc),
+                    action_level=action_level,
+                )
+                await self.notification_service.send_alert(alert_payload)
 
     async def seed_default_rules(self):
         """
