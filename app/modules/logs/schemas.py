@@ -34,6 +34,12 @@ class LogSourceCreate(BaseModel):
     file_path: str
     parser_type: LogParserType = LogParserType.RAW
 
+class LogSourceUpdate(BaseModel):
+    name: Optional[str] = None
+    file_path: Optional[str] = None
+    parser_type: Optional[LogParserType] = None
+    is_active: Optional[bool] = None
+
 class LogSourceInDB(LogSource):
     id: str = Field(alias="_id")
 

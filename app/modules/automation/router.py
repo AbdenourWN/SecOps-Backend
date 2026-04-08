@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB
 from app.modules.automation.service import AutomationService
 from app.core.database import get_database
@@ -7,6 +8,48 @@ from datetime import datetime, timezone
 
 router = APIRouter()
 service = AutomationService()
+
+
+@router.get("/history")
+async def get_automation_history(
+    limit: int = Query(20, ge=1, le=100),
+    skip: int = Query(0, ge=0),
+    status: Optional[str] = Query(None, description="Filter: success, failed"),
+    server_id: Optional[str] = Query(None),
+    script_id: Optional[str] = Query(None),
+):
+    """
+    Remediation runs (newest first), enriched with server hostname + script name.
+    Supports pagination and status/server/script filters — used by both the
+    dashboard activity widget and the dedicated automation history page.
+    NOTE: Must be declared above /{script_id}-style routes.
+    """
+    return await service.get_history(
+        limit=limit,
+        skip=skip,
+        status=status,
+        server_id=server_id,
+        script_id=script_id,
+    )
+
+
+@router.get("/history/stats")
+async def get_automation_history_stats(
+    status: Optional[str] = Query(None),
+    server_id: Optional[str] = Query(None),
+    script_id: Optional[str] = Query(None),
+):
+    """
+    Headline stats for the automation history page: total, success, failed,
+    last_24h count, and success rate. Honors the same filters as /history
+    so numbers stay in sync with the table.
+    """
+    return await service.get_history_stats(
+        status=status,
+        server_id=server_id,
+        script_id=script_id,
+    )
+
 
 @router.post("/", response_model=dict)
 async def create_new_script(script: ScriptCreate):

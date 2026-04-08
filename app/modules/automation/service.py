@@ -25,6 +25,150 @@ class AutomationService:
         except Exception:
             return None
 
+    def _build_history_filter(
+        self,
+        status: str | None = None,
+        server_id: str | None = None,
+        script_id: str | None = None,
+    ) -> dict:
+        """Shared filter builder for history list + stats queries."""
+        query: dict = {}
+        if status in ("success", "failed"):
+            query["status"] = status
+        if server_id:
+            query["server_id"] = server_id
+        if script_id:
+            query["script_id"] = script_id
+        return query
+
+    async def get_history(
+        self,
+        limit: int = 20,
+        skip: int = 0,
+        status: str | None = None,
+        server_id: str | None = None,
+        script_id: str | None = None,
+    ):
+        """
+        Returns remediation runs (newest first), optionally filtered by status,
+        server, or script. Enriched with server hostname and script name via batch
+        lookups. Used by both the dashboard widget (limit only) and the dedicated
+        activity page (with filters + pagination).
+        """
+        db = get_database()
+
+        query = self._build_history_filter(status, server_id, script_id)
+
+        cursor = (
+            db["automation_logs"]
+            .find(query)
+            .sort("executed_at", -1)
+            .skip(skip)
+            .limit(limit)
+        )
+        runs = await cursor.to_list(length=limit)
+
+        if not runs:
+            return []
+
+        # Batch lookup: server hostnames
+        server_ids = list({r.get("server_id") for r in runs if r.get("server_id")})
+        server_oids = []
+        for sid in server_ids:
+            try:
+                server_oids.append(ObjectId(sid))
+            except Exception:
+                pass
+
+        servers_map = {}
+        if server_oids:
+            server_docs = await db["servers"].find(
+                {"_id": {"$in": server_oids}},
+                {"hostname": 1},
+            ).to_list(length=len(server_oids))
+            servers_map = {str(s["_id"]): s.get("hostname", "Unknown") for s in server_docs}
+
+        # Batch lookup: script names
+        script_ids = list({r.get("script_id") for r in runs if r.get("script_id")})
+        script_oids = []
+        for sid in script_ids:
+            try:
+                script_oids.append(ObjectId(sid))
+            except Exception:
+                pass
+
+        scripts_map = {}
+        if script_oids:
+            script_docs = await db["scripts"].find(
+                {"_id": {"$in": script_oids}},
+                {"name": 1},
+            ).to_list(length=len(script_oids))
+            scripts_map = {str(s["_id"]): s.get("name", "Unknown script") for s in script_docs}
+
+        result = []
+        for run in runs:
+            run["_id"] = str(run["_id"])
+            run["server_hostname"] = servers_map.get(run.get("server_id", ""), "Unknown")
+            run["script_name"] = scripts_map.get(run.get("script_id", ""), "Unknown script")
+            result.append(run)
+
+        return result
+
+    async def get_history_stats(
+        self,
+        status: str | None = None,
+        server_id: str | None = None,
+        script_id: str | None = None,
+    ):
+        """
+        Aggregate counts for the automation history page headline stats.
+        Honors the same filters as get_history so stats always match the
+        user's current view. Also returns last_24h count for a freshness signal.
+        """
+        from datetime import timedelta
+
+        db = get_database()
+        query = self._build_history_filter(status, server_id, script_id)
+
+        # Single aggregation: total + success + failed
+        pipeline = [
+            {"$match": query},
+            {
+                "$group": {
+                    "_id": None,
+                    "total": {"$sum": 1},
+                    "success": {
+                        "$sum": {"$cond": [{"$eq": ["$status", "success"]}, 1, 0]}
+                    },
+                    "failed": {
+                        "$sum": {"$cond": [{"$eq": ["$status", "failed"]}, 1, 0]}
+                    },
+                }
+            },
+        ]
+        agg = await db["automation_logs"].aggregate(pipeline).to_list(length=1)
+
+        if agg:
+            r = agg[0]
+            total = r["total"]
+            success = r["success"]
+            failed = r["failed"]
+        else:
+            total = success = failed = 0
+
+        # Separate count for the last 24h (same filters)
+        since_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+        last_24h_query = {**query, "executed_at": {"$gte": since_24h}}
+        last_24h = await db["automation_logs"].count_documents(last_24h_query)
+
+        return {
+            "total": total,
+            "success": success,
+            "failed": failed,
+            "last_24h": last_24h,
+            "success_rate": round((success / total) * 100, 1) if total > 0 else 0,
+        }
+
     def _substitute_variables(self, template: str, variables: dict) -> str:
         """
         Replaces {{key}} placeholders in the script content with actual values.
@@ -88,14 +232,22 @@ class AutomationService:
         # 4. Execute
         result = await executor.run_command(command)
 
+        status = "success" if result["status"] == "success" else "failed"
+        output = result.get("output")
+        error = result.get("error")
+        if server.get("os_type") == "linux":
+            if status == "failed":
+                error= output
+                output = None
+
         # 5. Audit Log (Save to DB)
         audit_log = AutomationLog(
             incident_id=incident_id,
             script_id=script_id,
             server_id=server_id,
-            status=result["status"],
-            output=result.get("output"),
-            error=result.get("error"),
+            status= status,
+            output=output,
+            error=error,
         )
         await db["automation_logs"].insert_one(audit_log.model_dump())
 

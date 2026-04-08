@@ -28,6 +28,59 @@ class FileWatcherService:
         db = get_database()
         return await db["log_sources"].find({"is_active": True}).to_list(length=1000)
 
+    async def get_sources_by_server(self, server_id: str):
+        """List every log source registered for a given server (active or not)."""
+        db = get_database()
+        sources = await db["log_sources"].find({"server_id": server_id}).to_list(length=200)
+        for s in sources:
+            s["_id"] = str(s["_id"])
+        return sources
+
+    async def get_source(self, source_id: str):
+        db = get_database()
+        try:
+            doc = await db["log_sources"].find_one({"_id": ObjectId(source_id)})
+        except Exception:
+            return None
+        if doc:
+            doc["_id"] = str(doc["_id"])
+        return doc
+
+    async def update_source(self, source_id: str, updates: dict) -> bool:
+        """
+        Patch a log source. If the file_path or parser changes we reset the
+        bookmark state so the next poll re-reads from the start of the new file
+        instead of jumping to a stale offset.
+        """
+        db = get_database()
+        try:
+            oid = ObjectId(source_id)
+        except Exception:
+            return False
+
+        clean = {k: v for k, v in updates.items() if v is not None}
+        if not clean:
+            return True
+
+        # Reset bookmark state when the target file changes
+        if "file_path" in clean:
+            clean["last_offset"] = 0
+            clean["last_inode"] = None
+            clean["last_header"] = None
+            clean["error_count"] = 0
+
+        result = await db["log_sources"].update_one({"_id": oid}, {"$set": clean})
+        return result.matched_count > 0
+
+    async def delete_source(self, source_id: str) -> bool:
+        db = get_database()
+        try:
+            oid = ObjectId(source_id)
+        except Exception:
+            return False
+        result = await db["log_sources"].delete_one({"_id": oid})
+        return result.deleted_count > 0
+
     # =========================================================================
     # 🚦 MAIN DISPATCHER
     # =========================================================================

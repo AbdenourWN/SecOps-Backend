@@ -54,19 +54,19 @@ class AIService:
         print(f"🧠 AI is thinking about: {incident_description}...")
 
         try:
-            # We use a long timeout (60s) because Llama3 might take time to think
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            # We use a long timeout (120s) because Llama3 might take time to think
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(self.ollama_url, json=payload)
                 
                 if response.status_code != 200:
-                    return f"Error: Ollama returned status {response.status_code}"
+                    raise RuntimeError(f"Ollama returned status {response.status_code}: {response.text}")
                 
                 result = response.json()
                 # The actual text reply is in the 'response' key
                 return result.get("response", "No response from AI.")
                 
+        except RuntimeError:
+            raise  # Re-raise our own errors as-is
         except Exception as e:
-            error_msg = f"❌ Connection Error: {str(e)}"
-            print(error_msg)
-            # RETURN THE ACTUAL ERROR so we can see it in Postman
-            return error_msg
+            # Convert connection errors to RuntimeError so the router can catch them cleanly
+            raise RuntimeError(f"Could not reach Ollama at {self.ollama_url}: {str(e)}")

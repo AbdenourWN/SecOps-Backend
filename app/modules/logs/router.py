@@ -1,7 +1,12 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional
 from app.modules.logs.service import LogService
-from app.modules.logs.schemas import LogResponse, LogSourceCreate, LogSourceInDB
+from app.modules.logs.schemas import (
+    LogResponse,
+    LogSourceCreate,
+    LogSourceInDB,
+    LogSourceUpdate,
+)
 from app.modules.logs.file_watcher import FileWatcherService
 from app.core.elasticsearch import get_elasticsearch
 
@@ -109,12 +114,26 @@ async def trigger_log_collection(server_id: str):
         raise HTTPException(status_code=400, detail=result["error"])
     return result
 
-@router.get("/{server_id}")
-async def get_server_logs(server_id: str, limit: int = 50):
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log sources CRUD
+# IMPORTANT: every /sources* route MUST be declared above /{server_id} below,
+# otherwise FastAPI will match "sources" as a server_id and shadow these.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/sources", response_model=list)
+async def list_log_sources(server_id: Optional[str] = Query(None)):
     """
-    Fetch the latest logs from Elasticsearch for a specific server.
+    List log sources. When server_id is provided, returns only that server's
+    sources (used by the per-server settings tab).
     """
-    return await service.get_logs(server_id, limit)
+    if server_id:
+        return await watcher_service.get_sources_by_server(server_id)
+    sources = await watcher_service.get_all_sources()
+    for s in sources:
+        s["_id"] = str(s["_id"])
+    return sources
+
 
 @router.post("/sources", response_model=dict)
 async def add_log_source(source: LogSourceCreate):
@@ -123,6 +142,7 @@ async def add_log_source(source: LogSourceCreate):
     """
     id = await watcher_service.create_source(source)
     return {"status": "success", "id": id}
+
 
 @router.post("/sources/poll")
 async def force_poll_sources():
@@ -133,3 +153,35 @@ async def force_poll_sources():
     for source in sources:
         await watcher_service.process_file_source(source)
     return {"status": "success", "processed": len(sources)}
+
+
+@router.put("/sources/{source_id}", response_model=dict)
+async def update_log_source(source_id: str, updates: LogSourceUpdate):
+    """
+    Patch an existing log source. Changing file_path resets the bookmark
+    state so the new file is read from offset 0 on the next poll.
+    """
+    payload = updates.model_dump(exclude_unset=True)
+    if not payload:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    ok = await watcher_service.update_source(source_id, payload)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Log source not found")
+    return {"status": "success"}
+
+
+@router.delete("/sources/{source_id}", response_model=dict)
+async def delete_log_source(source_id: str):
+    ok = await watcher_service.delete_source(source_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Log source not found")
+    return {"status": "success"}
+
+
+@router.get("/{server_id}")
+async def get_server_logs(server_id: str, limit: int = 50):
+    """
+    Fetch the latest logs from Elasticsearch for a specific server.
+    """
+    return await service.get_logs(server_id, limit)
