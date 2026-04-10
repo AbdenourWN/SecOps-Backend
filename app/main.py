@@ -16,6 +16,7 @@ from app.modules.dashboard.router import router as dashboard_router
 from app.modules.test.router import router as test_router
 from app.modules.notifications.router import router as notifications_router
 from fastapi.middleware.cors import CORSMiddleware
+from app.core.config import settings
 
 
 @asynccontextmanager
@@ -67,9 +68,9 @@ app.include_router(notifications_router, prefix="/api/notifications", tags=["Not
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace "*" with ["http://localhost:3000"]
+    allow_origins=settings.ALLOWED_ORIGINS.split(",") if settings.ALLOWED_ORIGINS != "*" else ["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow GET, POST, DELETE, etc.
-    allow_headers=["*"],  # Allow Auth headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 

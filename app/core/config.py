@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     ALERT_FROM_EMAIL: str = ""
     ALERT_RECIPIENTS: str = ""  # Comma-separated: "a@x.com,b@x.com"
 
+    ALLOWED_ORIGINS: str = "*"  # Comma-separated: "https://security.ctt.tn,https://other.com"
+
     class Config:
         env_file = ".env"
 
