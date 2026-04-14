@@ -1,3 +1,5 @@
+import re as re_mod
+
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB
@@ -56,13 +58,30 @@ async def create_new_script(script: ScriptCreate):
     script_id = await service.create_script(script)
     return {"status": "success", "id": script_id}
 
-@router.get("/scripts", response_model=list)
-async def list_scripts():
+@router.get("/scripts")
+async def list_scripts(
+    language: Optional[str] = Query(None, description="Filter: bash, python, powershell"),
+    target_os: Optional[str] = Query(None, description="Filter: linux, windows"),
+    search: Optional[str] = Query(None, description="Search name or description"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+):
     db = get_database()
-    scripts = await db["scripts"].find().to_list(length=100)
+    query = {}
+    if language:
+        query["language"] = language
+    if target_os:
+        query["target_os"] = target_os
+    if search:
+        pattern = re_mod.compile(re_mod.escape(search), re_mod.IGNORECASE)
+        query["$or"] = [{"name": pattern}, {"description": pattern}]
+
+    total = await db["scripts"].count_documents(query)
+    skip = (page - 1) * page_size
+    scripts = await db["scripts"].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(length=page_size)
     for s in scripts:
         s["_id"] = str(s["_id"])
-    return scripts
+    return {"total": total, "page": page, "page_size": page_size, "results": scripts}
 
 @router.get("/scripts/{script_id}")
 async def get_script(script_id: str):

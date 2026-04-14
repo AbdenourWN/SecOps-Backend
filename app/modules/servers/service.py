@@ -134,11 +134,21 @@ class ServerService:
             "credential_id": str(new_cred_id)
         }
     
-    async def get_all_servers(self, limit: int = 100):
+    async def get_all_servers(self, status=None, os_type=None, search=None, page: int = 1, page_size: int = 9):
         db = get_database()
-        # Fetch servers. limit(100) prevents crashing if you have 1 million servers
-        servers = await db["servers"].find().to_list(limit)
-        return servers
+        query = {}
+        if status is not None:
+            query["status"] = status
+        if os_type is not None:
+            query["os_type"] = os_type
+        if search:
+            import re
+            pattern = re.compile(re.escape(search), re.IGNORECASE)
+            query["$or"] = [{"hostname": pattern}, {"ip_address": pattern}]
+        total = await db["servers"].count_documents(query)
+        skip = (page - 1) * page_size
+        servers = await db["servers"].find(query).skip(skip).limit(page_size).to_list(page_size)
+        return {"total": total, "page": page, "page_size": page_size, "results": servers}
 
     async def get_server(self, server_id: str):
         db = get_database()

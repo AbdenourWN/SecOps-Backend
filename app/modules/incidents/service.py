@@ -11,12 +11,13 @@ class IncidentService:
         server_id: str = None,
         severity: str = None,
         status: str = None,
-        skip: int = 0,
-        limit: int = 50,
+        search: str = None,
+        page: int = 1,
+        page_size: int = 20,
     ):
+        import re
         db = get_database()
 
-        # Build dynamic filter
         query = {}
         if server_id:
             query["server_id"] = server_id
@@ -24,21 +25,25 @@ class IncidentService:
             query["severity"] = severity
         if status:
             query["status"] = status
+        if search:
+            pattern = re.compile(re.escape(search), re.IGNORECASE)
+            query["$or"] = [{"description": pattern}, {"rule_id": pattern}]
 
+        total = await db["incidents"].count_documents(query)
+        skip = (page - 1) * page_size
         cursor = (
             db["incidents"]
             .find(query)
             .sort("detected_at", -1)
             .skip(skip)
-            .limit(limit)
+            .limit(page_size)
         )
-        incidents = await cursor.to_list(length=limit)
+        incidents = await cursor.to_list(length=page_size)
 
-        # Convert ObjectId for JSON
         for inc in incidents:
             inc["_id"] = str(inc["_id"])
 
-        return incidents
+        return {"total": total, "page": page, "page_size": page_size, "results": incidents}
 
     async def get_by_id(self, incident_id: str):
         db = get_database()

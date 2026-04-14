@@ -1,4 +1,7 @@
-from fastapi import APIRouter, HTTPException
+import re as re_mod
+
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional
 from app.modules.analysis.ai_service import AIService
 from app.modules.analysis.schemas import DetectionRule
 from app.core.database import get_database
@@ -11,14 +14,34 @@ ai_service = AIService()
 # ── Rules CRUD ──
 
 @router.get("/rules")
-async def list_rules():
+async def list_rules(
+    severity: Optional[str] = Query(None, description="Filter: critical, high, medium, low"),
+    os_type: Optional[str] = Query(None, description="Filter: linux, windows, common"),
+    enabled: Optional[bool] = Query(None, description="Filter by enabled/disabled"),
+    search: Optional[str] = Query(None, description="Search name or pattern"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+):
     db = get_database()
-    rules = await db["rules"].find().to_list(length=200)
+    query = {}
+    if severity:
+        query["severity"] = severity
+    if os_type:
+        query["os_type"] = os_type
+    if enabled is not None:
+        query["enabled"] = enabled
+    if search:
+        pattern = re_mod.compile(re_mod.escape(search), re_mod.IGNORECASE)
+        query["$or"] = [{"name": pattern}, {"pattern": pattern}]
+
+    total = await db["rules"].count_documents(query)
+    skip = (page - 1) * page_size
+    rules = await db["rules"].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(length=page_size)
     for r in rules:
         r["_id"] = str(r["_id"])
         if "remediation_script_id" in r and r["remediation_script_id"]:
             r["remediation_script_id"] = str(r["remediation_script_id"])
-    return rules
+    return {"total": total, "page": page, "page_size": page_size, "results": rules}
 
 @router.get("/rules/{rule_id}")
 async def get_rule(rule_id: str):

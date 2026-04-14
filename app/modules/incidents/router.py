@@ -1,10 +1,18 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List
+from pydantic import BaseModel
 from app.modules.incidents.service import IncidentService
 from app.modules.incidents.schemas import IncidentResponse, IncidentStatusUpdate
 
 router = APIRouter()
 service = IncidentService()
+
+
+class IncidentListResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    results: List[IncidentResponse]
 
 
 @router.get("/stats")
@@ -16,13 +24,14 @@ async def get_incident_stats():
     return await service.get_stats()
 
 
-@router.get("/", response_model=List[IncidentResponse])
+@router.get("/", response_model=IncidentListResponse)
 async def list_incidents(
     server_id: Optional[str] = Query(None, description="Filter by server"),
     severity: Optional[str] = Query(None, description="Filter: critical, high, medium, low"),
     status: Optional[str] = Query(None, description="Filter: open, investigating, resolved, false_positive"),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
+    search: Optional[str] = Query(None, description="Search in description and rule_id"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
 ):
     """
     List all incidents with optional filters. Sorted newest first.
@@ -31,8 +40,9 @@ async def list_incidents(
         server_id=server_id,
         severity=severity,
         status=status,
-        skip=skip,
-        limit=limit,
+        search=search,
+        page=page,
+        page_size=page_size,
     )
 
 

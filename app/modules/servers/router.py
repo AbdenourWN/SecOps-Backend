@@ -1,8 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from app.modules.servers.service import ServerService
-from app.modules.servers.schemas import ServerCreate, ServerResponse, ServerUpdate, ServerDelete
-from typing import List
+from app.modules.servers.schemas import ServerCreate, ServerResponse, ServerUpdate, ServerDelete, ServerStatus, OSType
+from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 
 
@@ -14,10 +14,26 @@ class IDCommandRequest(BaseModel):
     command: str = "uptime"
 
 
+class ServerListResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    results: List[ServerResponse]
+
+
 # 1. List All Servers
-@router.get("/", response_model=List[ServerResponse])
-async def list_servers():
-    return await service.get_all_servers()
+@router.get("/", response_model=ServerListResponse)
+async def list_servers(
+    status: Optional[ServerStatus] = Query(None, description="Filter by status"),
+    os_type: Optional[OSType] = Query(None, description="Filter by OS type"),
+    search: Optional[str] = Query(None, description="Search hostname or IP address"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(9, ge=1, le=100, description="Items per page"),
+):
+    return await service.get_all_servers(
+        status=status, os_type=os_type, search=search,
+        page=page, page_size=page_size,
+    )
 
 # 2. Get One Server
 @router.get("/{server_id}", response_model=ServerResponse)
