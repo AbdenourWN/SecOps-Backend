@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Query
-from pydantic import BaseModel
+import unicodedata
+from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, Field, field_validator
 from app.modules.servers.service import ServerService
 from app.modules.servers.schemas import ServerCreate, ServerResponse, ServerUpdate, ServerDelete, ServerStatus, OSType
 from typing import List, Optional
@@ -10,8 +11,29 @@ router = APIRouter()
 service = ServerService()
 
 
+_MAX_COMMAND_BYTES = 4096
+
+
 class IDCommandRequest(BaseModel):
-    command: str = "uptime"
+    command: str = Field(default="uptime")
+    confirmed: bool = False
+    timeout_s: Optional[int] = Field(default=None, ge=1, le=300)
+
+    @field_validator("command")
+    @classmethod
+    def _hygiene(cls, v: str) -> str:
+        v = unicodedata.normalize("NFC", v).strip()
+        if not v:
+            raise ValueError("Command cannot be empty.")
+        if "\x00" in v:
+            raise ValueError("Null byte in command is not allowed.")
+        # Allow tab and newline; reject other control chars.
+        for ch in v:
+            if ch < " " and ch not in ("\t", "\n", "\r"):
+                raise ValueError("Disallowed control character in command.")
+        if len(v.encode("utf-8")) > _MAX_COMMAND_BYTES:
+            raise ValueError(f"Command exceeds {_MAX_COMMAND_BYTES} bytes.")
+        return v
 
 
 class ServerListResponse(BaseModel):
@@ -46,13 +68,52 @@ async def get_server_details(server_id: str):
 # 3. Execute Command using ID (The Smart One)
 
 @router.post("/{server_id}/execute")
-async def execute_on_server(server_id: str, request: IDCommandRequest):
-    result = await service.execute_command_by_id(server_id, request.command)
-    if result.get("status") == "failed":
-         # If server not found, 404. If SSH failed, 400.
+async def execute_on_server(
+    server_id: str,
+    request: IDCommandRequest,
+    http_request: Request,
+):
+    source_ip = http_request.client.host if http_request.client else None
+
+    result = await service.execute_command_by_id(
+        server_id,
+        request.command,
+        confirmed=request.confirmed,
+        timeout_s=request.timeout_s,
+        principal_id=None,  # P4: wire JWT user_id here
+        source_ip=source_ip,
+    )
+
+    status = result.get("status")
+
+    if status == "blocked":
+        raise HTTPException(
+            status_code=403,
+            detail={"blocked_reason": result.get("blocked_reason"),
+                    "error": result.get("error")},
+        )
+
+    if status == "requires_confirmation":
+        raise HTTPException(
+            status_code=412,
+            detail={"requires_confirmation": True,
+                    "blocked_reason": result.get("blocked_reason"),
+                    "error": result.get("error")},
+        )
+
+    if status == "rate_limited":
+        raise HTTPException(
+            status_code=429,
+            detail={"retry_after_seconds": result.get("retry_after_seconds"),
+                    "error": result.get("error")},
+        )
+
+    if status == "failed":
         if result.get("error") == "Server not found":
             raise HTTPException(status_code=404, detail="Server not found")
         raise HTTPException(status_code=400, detail=result.get("error"))
+
+    # success / error / timeout all return 200 with a status field
     return result
 
 

@@ -40,10 +40,14 @@ async def connect_to_mongo():
         
         # 3. Metrics: Same as logs, we need history for charts
         await database["metrics"].create_index([
-            ("server_id", ASCENDING), 
+            ("server_id", ASCENDING),
             ("timestamp", DESCENDING)
         ])
-        
+
+        # 4. Command audit log (90-day TTL on started_at + query indexes)
+        from app.modules.servers.audit import ensure_audit_indexes
+        await ensure_audit_indexes()
+
         print("⚡ Database Indexes Created")
 
     except Exception as e:

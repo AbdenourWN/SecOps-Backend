@@ -5,6 +5,13 @@ from app.core.security import encrypt_password, decrypt_password
 from bson import ObjectId
 from datetime import datetime ,timezone
 from app.core.executors import get_server_executor
+from app.core.rate_limit import check_rate_limit
+from app.modules.servers.guardrails import check_command
+from app.modules.servers.audit import write_audit
+
+
+DEFAULT_COMMAND_TIMEOUT_S = 60
+MAX_COMMAND_TIMEOUT_S = 300
 
 
 
@@ -238,45 +245,137 @@ class ServerService:
     
 
 
-    async def execute_command_by_id(self, server_id: str, command: str):
+    async def execute_command_by_id(
+        self,
+        server_id: str,
+        command: str,
+        *,
+        confirmed: bool = False,
+        timeout_s: int | None = None,
+        principal_id: str | None = None,
+        source_ip: str | None = None,
+    ):
+        """
+        Guardrail pipeline (defense in depth):
+          rate-limit -> block-list -> confirm-list -> exec with timeout.
+        Every outcome writes a row to command_audit.
+        """
         db = get_database()
+        started_at = datetime.now(timezone.utc)
+        principal = principal_id or source_ip or "anonymous"
 
-        
-        # 1. Find the Server
+        # --- Server lookup ---
         try:
             s_oid = ObjectId(server_id)
-        except:
+        except Exception:
             return {"status": "failed", "error": "Invalid Server ID"}
 
         server = await db["servers"].find_one({"_id": s_oid})
         if not server:
             return {"status": "failed", "error": "Server not found"}
 
-        # 2. Find the Linked Credential
+        os_type = server.get("os_type", "linux")
+
+        # --- 1. Rate limit ---
+        rl = await check_rate_limit(principal, server_id)
+        if not rl.allowed:
+            await write_audit(
+                server_id=server_id, command=command, status="rate_limited",
+                started_at=started_at, principal_id=principal_id,
+                source_ip=source_ip, confirmed=confirmed,
+                blocked_reason=f"rate limit exceeded (retry in {rl.retry_after_s}s)",
+            )
+            return {
+                "status": "rate_limited",
+                "retry_after_seconds": rl.retry_after_s,
+                "error": "Rate limit exceeded.",
+            }
+
+        # --- 2. Guardrail check (block / confirm / allow) ---
+        check = check_command(command, os_type)
+        if not check.allowed:
+            await write_audit(
+                server_id=server_id, command=command, status="blocked",
+                started_at=started_at, principal_id=principal_id,
+                source_ip=source_ip, confirmed=confirmed,
+                blocked_reason=check.reason,
+            )
+            return {
+                "status": "blocked",
+                "blocked_reason": check.reason,
+                "error": check.reason,
+            }
+
+        if check.requires_confirmation and not confirmed:
+            await write_audit(
+                server_id=server_id, command=command, status="requires_confirmation",
+                started_at=started_at, principal_id=principal_id,
+                source_ip=source_ip, confirmed=False,
+                blocked_reason=check.reason,
+            )
+            return {
+                "status": "requires_confirmation",
+                "blocked_reason": check.reason,
+                "error": check.reason,
+            }
+
+        # --- 3. Resolve credential and run ---
         cred_id = server.get("credential_id")
         try:
             s_c_oid = ObjectId(cred_id)
-        except:
+        except Exception:
             return {"status": "failed", "error": "Invalid Credential ID"}
 
         credential = await db["credentials"].find_one({"_id": s_c_oid})
-        
         if not credential:
             return {"status": "failed", "error": "Linked credential not found"}
 
-        # 3. Decrypt Secret
         try:
             plain_secret = decrypt_password(credential["encrypted_secret"])
         except Exception:
             return {"status": "failed", "error": "Decryption failed"}
-        
-        
+
         executor = get_server_executor(server, plain_password=plain_secret)
-        
-        # 4. Inject the username (since factory defaults to 'unknown')
         executor.credential['username'] = credential['username']
 
-        # 5. Run
-        return await executor.run_command(command)
-    
+        effective_timeout = DEFAULT_COMMAND_TIMEOUT_S if timeout_s is None else \
+            max(1, min(MAX_COMMAND_TIMEOUT_S, int(timeout_s)))
+
+        try:
+            result = await asyncio.wait_for(
+                executor.run_command(command), timeout=effective_timeout
+            )
+        except asyncio.TimeoutError:
+            await write_audit(
+                server_id=server_id, command=command, status="timeout",
+                started_at=started_at, principal_id=principal_id,
+                source_ip=source_ip, confirmed=confirmed,
+                stderr=f"[timed out after {effective_timeout}s]",
+            )
+            return {
+                "status": "timeout",
+                "output": "",
+                "error": f"Command exceeded {effective_timeout}s timeout.",
+                "timeout_s": effective_timeout,
+            }
+        except Exception as e:
+            await write_audit(
+                server_id=server_id, command=command, status="error",
+                started_at=started_at, principal_id=principal_id,
+                source_ip=source_ip, confirmed=confirmed, stderr=str(e),
+            )
+            return {"status": "failed", "error": str(e)}
+
+        # --- 4. Audit the run ---
+        run_status = result.get("status", "error")
+        audit_status = "ok" if run_status == "success" else "error"
+        await write_audit(
+            server_id=server_id, command=command, status=audit_status,
+            started_at=started_at, principal_id=principal_id,
+            source_ip=source_ip, confirmed=confirmed,
+            stdout=result.get("output"),
+            stderr=result.get("error"),
+        )
+        return result
+
         # Logic for 'ssh_key' file handling will be added later.
