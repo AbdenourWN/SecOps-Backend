@@ -19,6 +19,12 @@ class Settings(BaseSettings):
 
     ALLOWED_ORIGINS: str = "*"  # Comma-separated: "https://security.ctt.tn,https://other.com"
 
+    # WebSocket
+    WS_PING_INTERVAL: int = 20
+    WS_PING_TIMEOUT: int = 25
+    WS_MAX_CONNECTIONS: int = 100
+    WS_MESSAGE_QUEUE_SIZE: int = 64
+
     class Config:
         env_file = ".env"
 

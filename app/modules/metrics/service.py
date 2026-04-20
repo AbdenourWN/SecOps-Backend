@@ -1,5 +1,6 @@
 from app.core.database import get_database
 from app.core.elasticsearch import get_elasticsearch
+from app.core.events import event_bus
 from app.modules.metrics.schemas import SystemMetric
 from app.core.executors import get_server_executor
 from app.core.security import decrypt_password
@@ -113,7 +114,15 @@ class MetricService:
                     )
                 except Exception as e:
                     print(f"⚠️ Failed to index metric to ES: {e}")
-            
+
+            event_bus.emit("servers.metrics", "metric.sampled", {
+                "server_id": str(server["_id"]),
+                "cpu_usage": metric_doc["cpu_usage"],
+                "ram_usage": metric_doc["ram_usage"],
+                "disk_usage": metric_doc["disk_usage"],
+                "timestamp": metric_doc["timestamp"],
+            })
+
             return True
             
         except Exception as e:

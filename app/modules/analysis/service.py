@@ -8,6 +8,7 @@ from bson import ObjectId
 from app.modules.automation.service import AutomationService
 from app.modules.notifications.service import NotificationService
 from app.modules.notifications.schemas import AlertPayload
+from app.core.events import event_bus
 
 # ========================================================================
 # OPT-4: RULE CACHE
@@ -158,6 +159,17 @@ class AnalysisService:
                         inc_result = await db["incidents"].insert_one(incident.model_dump())
                         incident_id = str(inc_result.inserted_id)
 
+                        event_bus.emit("incidents", "incident.created", {
+                            "incident_id": incident_id,
+                            "server_id": str(log["server_id"]),
+                            "severity": rule["severity"],
+                            "rule_name": rule["name"],
+                            "action_level": action_level,
+                        })
+                        event_bus.emit("dashboard.summary", "incident.created", {
+                            "incident_id": incident_id,
+                        })
+
                         success = await self.automation_service.execute_remediation(
                             server_id=str(log["server_id"]),
                             script_id=remediation_script_id,
@@ -176,6 +188,13 @@ class AnalysisService:
                                 },
                             )
                             executed_fix = True
+                            event_bus.emit("incidents", "incident.resolved", {
+                                "incident_id": incident_id,
+                                "server_id": str(log["server_id"]),
+                            })
+                            event_bus.emit("dashboard.summary", "incident.resolved", {
+                                "incident_id": incident_id,
+                            })
 
                         # Level 2: Send notification after remediation
                         if action_level == 2:
@@ -190,6 +209,18 @@ class AnalysisService:
         if new_incidents:
             inc_results = await db["incidents"].insert_many(new_incidents)
             print(f"💾 Saved {len(new_incidents)} new incidents.")
+
+            for i, inc_data in enumerate(new_incidents):
+                event_bus.emit("incidents", "incident.created", {
+                    "incident_id": str(inc_results.inserted_ids[i]),
+                    "server_id": inc_data["server_id"],
+                    "severity": inc_data.get("severity"),
+                    "rule_name": inc_data["description"].replace("Detected: ", ""),
+                    "action_level": 3,
+                })
+            event_bus.emit("dashboard.summary", "incidents.bulk_created", {
+                "count": len(new_incidents),
+            })
 
             # 5. Send notifications for Level 3 (alert-only) incidents
             for i, inc_data in enumerate(new_incidents):

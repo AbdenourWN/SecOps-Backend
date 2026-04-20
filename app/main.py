@@ -15,6 +15,7 @@ from app.modules.incidents.router import router as incidents_router
 from app.modules.dashboard.router import router as dashboard_router
 from app.modules.test.router import router as test_router
 from app.modules.notifications.router import router as notifications_router
+from app.modules.ws.router import router as ws_router
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 
@@ -63,6 +64,7 @@ app.include_router(incidents_router, prefix="/api/incidents", tags=["Incidents"]
 app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"])
 app.include_router(test_router, prefix="/api/test", tags=["Test & Simulation"])
 app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
+app.include_router(ws_router, prefix="/api", tags=["WebSocket"])
 
 
 

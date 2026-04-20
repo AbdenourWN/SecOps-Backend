@@ -5,6 +5,7 @@ from typing import Optional
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB
 from app.modules.automation.service import AutomationService
 from app.core.database import get_database
+from app.core.events import event_bus
 from bson import ObjectId
 from datetime import datetime, timezone
 
@@ -112,6 +113,7 @@ async def update_script(script_id: str, updates: dict):
     update_data["updated_at"] = datetime.now(timezone.utc)
 
     await db["scripts"].update_one({"_id": oid}, {"$set": update_data})
+    event_bus.emit("scripts", "script.updated", {"script_id": str(oid)})
     return {"status": "success", "message": "Script updated"}
 
 @router.delete("/scripts/{script_id}")
@@ -125,4 +127,5 @@ async def delete_script(script_id: str):
     result = await db["scripts"].delete_one({"_id": oid})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Script not found")
+    event_bus.emit("scripts", "script.deleted", {"script_id": str(oid)})
     return {"status": "success", "message": "Script deleted"}

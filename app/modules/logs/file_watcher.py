@@ -1,5 +1,6 @@
 import asyncio
 from app.core.database import get_database
+from app.core.events import event_bus
 from app.modules.logs.schemas import LogEntryInDB, LogLevel
 from app.core.executors import get_server_executor
 from app.core.security import decrypt_password
@@ -22,6 +23,10 @@ class FileWatcherService:
         new_source["created_at"] = datetime.now(timezone.utc)
 
         result = await db["log_sources"].insert_one(new_source)
+        event_bus.emit("log.sources", "log_source.created", {
+            "source_id": str(result.inserted_id),
+            "server_id": new_source.get("server_id"),
+        })
         return str(result.inserted_id)
 
     async def get_all_sources(self):
@@ -70,6 +75,8 @@ class FileWatcherService:
             clean["error_count"] = 0
 
         result = await db["log_sources"].update_one({"_id": oid}, {"$set": clean})
+        if result.matched_count > 0:
+            event_bus.emit("log.sources", "log_source.updated", {"source_id": str(oid)})
         return result.matched_count > 0
 
     async def delete_source(self, source_id: str) -> bool:
@@ -79,6 +86,8 @@ class FileWatcherService:
         except Exception:
             return False
         result = await db["log_sources"].delete_one({"_id": oid})
+        if result.deleted_count > 0:
+            event_bus.emit("log.sources", "log_source.deleted", {"source_id": str(oid)})
         return result.deleted_count > 0
 
     # =========================================================================
@@ -325,4 +334,9 @@ class FileWatcherService:
             for i, log in enumerate(new_logs):
                 log["_id"] = res.inserted_ids[i]
             await analysis_service.analyze_logs(new_logs)
+            event_bus.emit("servers.logs", "logs.ingested", {
+                "server_id": source_doc["server_id"],
+                "source_id": str(source_doc.get("_id", "")),
+                "count": len(new_logs),
+            })
             print(f"📥 Collected {len(new_logs)} lines from {source_doc['file_path']}")

@@ -8,6 +8,7 @@ from app.core.executors import get_server_executor
 from app.core.rate_limit import check_rate_limit
 from app.modules.servers.guardrails import check_command
 from app.modules.servers.audit import write_audit
+from app.core.events import event_bus
 
 
 DEFAULT_COMMAND_TIMEOUT_S = 60
@@ -59,21 +60,34 @@ class ServerService:
 
             async def check_one(server):
                 server_id = str(server["_id"])
+                previous_status = server.get("status")
                 async with sem:
                     async with _get_server_lock(server_id):
                         executor = get_server_executor(server, plain_password="")
                         is_online = await executor.check_health()
                         new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
-                        
+
                         await db["servers"].update_one(
                             {"_id": server["_id"]},
                             {
                                 "$set": {
-                                    "status": new_status, 
+                                    "status": new_status,
                                     "last_health_check": datetime.now(timezone.utc)
                                 }
                             }
                         )
+
+                        if previous_status != new_status:
+                            event_bus.emit("servers.status", "server.status_changed", {
+                                "server_id": server_id,
+                                "status": new_status,
+                                "previous_status": previous_status,
+                                "hostname": server.get("hostname"),
+                            })
+                            event_bus.emit("dashboard.summary", "server.status_changed", {
+                                "server_id": server_id,
+                                "status": new_status,
+                            })
 
             tasks = [check_one(server) for server in servers]
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -134,9 +148,17 @@ class ServerService:
 
         # Save Server to "servers" collection
         server_result = await db["servers"].insert_one(server_in_db.model_dump())
-        
+
+        event_bus.emit("servers", "server.created", {
+            "server_id": str(server_result.inserted_id),
+            "hostname": server_data.hostname,
+        })
+        event_bus.emit("dashboard.summary", "server.created", {
+            "server_id": str(server_result.inserted_id),
+        })
+
         return {
-            "status": "success", 
+            "status": "success",
             "server_id": str(server_result.inserted_id),
             "credential_id": str(new_cred_id)
         }
@@ -218,6 +240,8 @@ class ServerService:
             server_updates["updated_at"] = datetime.now(timezone.utc)
             await db["servers"].update_one({"_id": oid}, {"$set": server_updates})
 
+        event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
+
         return {"status": "success", "message": "Server and credentials updated"}
 
     # --- DELETE Logic ---
@@ -240,7 +264,10 @@ class ServerService:
         await db["servers"].delete_one({"_id": oid})
         # Delete the Linked Credential
         await db["credentials"].delete_one({"_id": cred_id})
-        
+
+        event_bus.emit("servers", "server.deleted", {"server_id": str(oid)})
+        event_bus.emit("dashboard.summary", "server.deleted", {"server_id": str(oid)})
+
         return {"status": "success", "message": "Server and associated credentials deleted"}
     
 

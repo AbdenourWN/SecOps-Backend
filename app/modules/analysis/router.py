@@ -5,6 +5,7 @@ from typing import Optional
 from app.modules.analysis.ai_service import AIService
 from app.modules.analysis.schemas import DetectionRule
 from app.core.database import get_database
+from app.core.events import event_bus
 from bson import ObjectId
 
 router = APIRouter()
@@ -62,6 +63,7 @@ async def create_rule(rule: DetectionRule):
     db = get_database()
     rule_data = rule.model_dump()
     result = await db["rules"].insert_one(rule_data)
+    event_bus.emit("rules", "rule.created", {"rule_id": str(result.inserted_id)})
     return {"status": "success", "id": str(result.inserted_id)}
 
 @router.put("/rules/{rule_id}")
@@ -86,6 +88,8 @@ async def update_rule(rule_id: str, updates: dict):
     from app.modules.analysis.service import _rule_cache
     _rule_cache["loaded_at"] = 0
 
+    event_bus.emit("rules", "rule.updated", {"rule_id": str(oid)})
+
     return {"status": "success", "message": "Rule updated"}
 
 @router.delete("/rules/{rule_id}")
@@ -102,6 +106,8 @@ async def delete_rule(rule_id: str):
 
     from app.modules.analysis.service import _rule_cache
     _rule_cache["loaded_at"] = 0
+
+    event_bus.emit("rules", "rule.deleted", {"rule_id": str(oid)})
 
     return {"status": "success", "message": "Rule deleted"}
 

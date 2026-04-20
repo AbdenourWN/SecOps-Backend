@@ -5,6 +5,7 @@ from app.core.executors import get_server_executor
 from app.core.security import decrypt_password
 from bson import ObjectId
 from datetime import datetime, timezone
+from app.core.events import event_bus
 
 
 class AutomationService:
@@ -16,6 +17,7 @@ class AutomationService:
         new_script["updated_at"] = datetime.now(timezone.utc)
 
         result = await db["scripts"].insert_one(new_script)
+        event_bus.emit("scripts", "script.created", {"script_id": str(result.inserted_id)})
         return str(result.inserted_id)
 
     async def get_script(self, script_id: str):
@@ -249,7 +251,15 @@ class AutomationService:
             output=output,
             error=error,
         )
-        await db["automation_logs"].insert_one(audit_log.model_dump())
+        log_result = await db["automation_logs"].insert_one(audit_log.model_dump())
+
+        event_bus.emit("automation.history", "remediation.executed", {
+            "log_id": str(log_result.inserted_id),
+            "script_id": script_id,
+            "server_id": server_id,
+            "incident_id": incident_id,
+            "status": status,
+        })
 
         if result["status"] == "success":
             print(f"✅ Remediation Successful: {result.get('output')}")
