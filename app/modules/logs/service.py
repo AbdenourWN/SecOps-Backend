@@ -95,32 +95,30 @@ class LogService:
         except Exception:
             return None
 
+    async def collect_logs_with(self, executor, server: dict):
+        """
+        Collect logs using a pre-resolved pooled executor.
+        Called by the combined scheduler job (no credential lookup needed).
+        """
+        if server.get("os_type") == "windows":
+            return await self._collect_windows_logs(server, executor)
+        return await self._collect_linux_logs(server, executor)
+
     async def collect_logs_from_server(self, server_id: str):
+        """Backwards-compatible wrapper — resolves executor from DB then delegates to collect_logs_with."""
         db = get_database()
-        
-        # 1. Fetch Server & Creds
         try:
             s_oid = ObjectId(server_id)
         except Exception:
             return {"status": "failed", "error": "Invalid ID"}
-            
         server = await db["servers"].find_one({"_id": s_oid})
         if not server:
             return {"status": "failed", "error": "Server not found"}
-        
         cred = await db["credentials"].find_one({"_id": ObjectId(server["credential_id"])})
         plain_secret = decrypt_password(cred["encrypted_secret"])
-
-        # 2. Get Executor
         executor = get_server_executor(server, plain_secret)
-        executor.credential['username'] = cred['username']
-
-        # 3. ROUTING: Check OS
-        if server.get("os_type") == "windows":
-            return await self._collect_windows_logs(server, executor)
-        
-        # 4. RUN LINUX COLLECTION
-        return await self._collect_linux_logs(server, executor)
+        executor.credential["username"] = cred["username"]
+        return await self.collect_logs_with(executor, server)
 
     async def _collect_linux_logs(self, server, executor):
         """
@@ -198,7 +196,20 @@ class LogService:
         Fetches Windows Event Logs (System & Security) as JSON.
         Saves to Elasticsearch using bulk indexing.
         """
-        ps_script = """Get-WinEvent -FilterHashTable @{LogName='System','Security','Application'; Level=1,2,3; StartTime=(Get-Date).AddMinutes(-5)} -ErrorAction SilentlyContinue | Select-Object TimeCreated, Id, LevelDisplayName, Message, ProviderName | ConvertTo-Json -Depth 1 -Compress"""
+        # ForEach-Object builds a plain PSCustomObject so ConvertTo-Json depth
+        # is irrelevant and TimeCreated is ISO-8601.  The $m fallback pulls the
+        # raw substitution strings when the source has no registered message DLL
+        # (the common case for custom Write-EventLog sources).
+        ps_script = (
+            "Get-WinEvent -FilterHashTable @{LogName='System','Security','Application';"
+            "Level=1,2,3;StartTime=(Get-Date).AddMinutes(-5)} -EA SilentlyContinue|"
+            "%{$m=$_.Message;"
+            "if(-not $m){$m=($_.Properties.Value|?{$_ -is [string]})-join' '};"
+            "if(-not $m){$m=\"EventId=$($_.Id)\"};"
+            "[PSCustomObject]@{TimeCreated=$_.TimeCreated.ToString('o');"
+            "Id=$_.Id;LevelDisplayName=$_.LevelDisplayName;"
+            "Message=$m;ProviderName=$_.ProviderName}}|ConvertTo-Json -Compress"
+        )
         
         result = await executor.run_command(ps_script)
         
@@ -228,7 +239,12 @@ class LogService:
                 level = LogLevel.WARNING
 
             message = entry.get("Message") or ""
-            timestamp = datetime.now(timezone.utc)
+
+            tc = entry.get("TimeCreated") or ""
+            try:
+                timestamp = datetime.fromisoformat(tc.replace("Z", "+00:00")) if tc else datetime.now(timezone.utc)
+            except (ValueError, AttributeError):
+                timestamp = datetime.now(timezone.utc)
             ts_iso = timestamp.isoformat()
 
             # OPT-3: Skip if we already have this timestamp

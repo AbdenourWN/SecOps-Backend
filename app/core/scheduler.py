@@ -1,133 +1,189 @@
 import asyncio
+import logging
+from datetime import datetime, timezone
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from app.modules.servers.service import ServerService
+
+from app.core.config import settings
+from app.core.database import get_database
+from app.core.events import event_bus
+from app.modules.logs.file_watcher import FileWatcherService
 from app.modules.logs.service import LogService
 from app.modules.metrics.service import MetricService
-from app.core.database import get_database
-from app.core.config import settings
-from app.modules.logs.file_watcher import FileWatcherService
+from app.modules.servers.service import ServerService
 
+logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
-# --- Semaphore: limits how many servers are processed at once ---
+# Global semaphore: cap how many servers run collection in parallel.
+# Per-server serialization is handled by connection_pool's per-entry lock.
 _semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
 
-# --- Per-Server Lock: prevents multiple jobs from hitting the same server ---
-# WHY: WinRM NTLM rejects concurrent auth handshakes from the same user.
-# If logs + metrics + health all connect to the same Windows server at once,
-# the 2nd and 3rd connections get "credentials rejected".
-# This dict creates one Lock per server_id. Different servers still run in parallel.
+# Expose lock accessor for code that still imports it (e.g. health-check path in ServerService).
+# Health check creates a fresh executor (no pool), so it doesn't share the pool lock.
 _server_locks: dict[str, asyncio.Lock] = {}
 
 
 def _get_server_lock(server_id: str) -> asyncio.Lock:
-    """Returns (or creates) the lock for a specific server."""
     if server_id not in _server_locks:
         _server_locks[server_id] = asyncio.Lock()
     return _server_locks[server_id]
 
 
-async def _run_with_limit(coro, server_id: str = None):
-    """Wraps a coroutine with semaphore + per-server lock."""
+async def _with_semaphore(coro):
     async with _semaphore:
-        if server_id:
-            async with _get_server_lock(server_id):
-                return await coro
         return await coro
 
 
+# ---------------------------------------------------------------------------
+# Job: health check — stays fast + independent (TCP only, no pool)
+# ---------------------------------------------------------------------------
+
+async def job_health_check():
+    try:
+        service = ServerService()
+        t0 = asyncio.get_event_loop().time()
+        await service.update_all_server_statuses()
+        elapsed = asyncio.get_event_loop().time() - t0
+        logger.info("health_check complete in %.1fs", elapsed)
+    except Exception as e:
+        logger.error("health_check failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Job: combined telemetry — logs + metrics in one SSH/WinRM session per server
+# ---------------------------------------------------------------------------
+
+_metric_service = MetricService()
+_log_service = LogService()
+
+
+async def _collect_telemetry_for_server(server: dict):
+    from app.core.connection_pool import connection_pool, _STALL_THRESHOLD
+
+    server_id = str(server["_id"])
+    hostname = server.get("hostname", server_id)
+
+    async with connection_pool.try_get(server_id, timeout=5) as executor:
+        if executor is None:
+            skip_count = connection_pool.get_skip_count(server_id)
+            logger.warning("[scheduler] skipped collection for %s (terminal busy, consecutive=%d)",
+                           hostname, skip_count)
+            event_bus.emit("servers", "collection_skipped", {
+                "server_id": server_id,
+                "hostname": hostname,
+                "consecutive": skip_count,
+                "reason": "terminal_busy",
+            })
+            if skip_count >= _STALL_THRESHOLD:
+                logger.warning("[scheduler] telemetry STALLED for %s (%d consecutive skips)",
+                               hostname, skip_count)
+                event_bus.emit("servers", "collection_stalled", {
+                    "server_id": server_id,
+                    "hostname": hostname,
+                    "consecutive": skip_count,
+                })
+            return
+
+        # Sequential — NOT asyncio.gather. Both use the same WinRM Protocol
+        # object under the hood; concurrent open_shell() calls on the same
+        # requests.Session trigger NTLM MIC failures on Windows.
+        for label, coro in (
+            ("metrics", _metric_service.collect_with(executor, server)),
+            ("logs",    _log_service.collect_logs_with(executor, server)),
+        ):
+            try:
+                await coro
+            except Exception as e:
+                logger.error("[scheduler] %s collection error for %s: %s", label, hostname, e)
+
+
+async def job_collect_telemetry():
+    try:
+        db = get_database()
+        servers = await db["servers"].find().to_list(length=10000)
+        if not servers:
+            return
+
+        # Skip servers that are offline — avoids hanging on dead hosts.
+        # Health check still runs for all and will flip is_online when they recover.
+        online = [s for s in servers if s.get("is_online", True)]
+        skipped_count = len(servers) - len(online)
+
+        t0 = asyncio.get_event_loop().time()
+        logger.info("[scheduler] telemetry: %d servers (%d offline-skipped)", len(online), skipped_count)
+
+        tasks = [_with_semaphore(_collect_telemetry_for_server(s)) for s in online]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        elapsed = asyncio.get_event_loop().time() - t0
+        logger.info("[scheduler] telemetry complete in %.1fs", elapsed)
+
+    except Exception as e:
+        logger.error("job_collect_telemetry failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Job: file watcher — kept separate (per-source iteration, uses pool internally)
+# ---------------------------------------------------------------------------
+
 async def job_file_watcher():
-    """Runs every 60 seconds to check file offsets"""
     try:
         service = FileWatcherService()
         sources = await service.get_all_sources()
         if not sources:
             return
 
-        print(f"📂 Checking {len(sources)} file sources...")
+        t0 = asyncio.get_event_loop().time()
+        logger.info("[scheduler] file_watcher: %d sources", len(sources))
+
         tasks = [
-            _run_with_limit(
-                service.process_file_source(source),
-                server_id=str(source.get("server_id", ""))
-            )
+            _with_semaphore(service.process_file_source(source))
             for source in sources
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    except Exception as e:
-        print(f"❌ File Watcher Failed: {e}")
-
-
-async def job_health_check():
-    """Runs every 60 seconds"""
-    try:
-        service = ServerService()
-        await service.update_all_server_statuses()
-    except Exception as e:
-        print(f"❌ Health Check Failed: {e}")
-
-
-async def job_log_collection():
-    """Runs every 60 seconds — collects logs from all servers in parallel"""
-    try:
-        db = get_database()
-        service = LogService()
-
-        servers = await db["servers"].find().to_list(length=10000)
-        if not servers:
-            return
-
-        print(f"📥 Running Auto-Log Collection for {len(servers)} servers...")
-        tasks = [
-            _run_with_limit(
-                service.collect_logs_from_server(str(server["_id"])),
-                server_id=str(server["_id"])
-            )
-            for server in servers
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"❌ Log collection failed for {servers[i].get('hostname', 'unknown')}: {result}")
+        elapsed = asyncio.get_event_loop().time() - t0
+        logger.info("[scheduler] file_watcher complete in %.1fs", elapsed)
 
     except Exception as e:
-        print(f"❌ Log Collection Failed: {e}")
+        logger.error("job_file_watcher failed: %s", e)
 
 
-async def job_metric_collection():
-    """Runs every 60 seconds — collects metrics from all servers in parallel"""
-    try:
-        db = get_database()
-        service = MetricService()
-        servers = await db["servers"].find().to_list(length=10000)
-        if not servers:
-            return
-
-        tasks = [
-            _run_with_limit(
-                service.collect_metrics(str(server["_id"])),
-                server_id=str(server["_id"])
-            )
-            for server in servers
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"❌ Metrics failed for {servers[i].get('hostname', 'unknown')}: {result}")
-
-    except Exception as e:
-        print(f"❌ Metric Collection Failed: {e}")
-
+# ---------------------------------------------------------------------------
+# Scheduler startup
+# ---------------------------------------------------------------------------
 
 def start_scheduler():
-    scheduler.add_job(job_health_check, "interval", seconds=60)
-    scheduler.add_job(job_log_collection, "interval", seconds=60)
-    scheduler.add_job(job_metric_collection, "interval", seconds=60)
-    scheduler.add_job(job_file_watcher, "interval", seconds=60)
+    from datetime import timedelta
+
+    # APScheduler job options applied to every job:
+    #   max_instances=1  — only one tick of a given job runs at a time
+    #   coalesce=True    — if N ticks were missed, run once (not N times)
+    #   misfire_grace_time=30 — forgive ticks that fire up to 30s late
+    _job_kwargs = dict(max_instances=1, coalesce=True, misfire_grace_time=30)
+
+    def _at(offset_s: int):
+        return datetime.now(timezone.utc) + timedelta(seconds=offset_s)
+
+    scheduler.add_job(
+        job_health_check, "interval", seconds=60,
+        next_run_time=_at(0), **_job_kwargs,
+    )
+    scheduler.add_job(
+        job_collect_telemetry, "interval", seconds=60,
+        next_run_time=_at(15), **_job_kwargs,
+    )
+    scheduler.add_job(
+        job_file_watcher, "interval", seconds=60,
+        next_run_time=_at(45), **_job_kwargs,
+    )
 
     scheduler.start()
-    print(f"⏰ Background Scheduler Started (max {settings.MAX_CONCURRENT_SERVERS} concurrent servers, per-server lock enabled)")
-
+    logger.info(
+        "scheduler started (max_concurrent=%d, coalesce=True, staggered offsets 0/15/45s)",
+        settings.MAX_CONCURRENT_SERVERS,
+    )
+    print(f"⏰ Scheduler started — health@+0s, telemetry@+15s, file_watcher@+45s "
+          f"(max {settings.MAX_CONCURRENT_SERVERS} concurrent)")

@@ -1,154 +1,514 @@
-import paramiko
-import asyncio
-from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
-import winrm
+from __future__ import annotations
 
-# --- 1. The Blueprint (Abstract Base Class) ---
+import asyncio
+import logging
+import queue as _queue
+import threading
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import AsyncIterator, Dict, Any, Literal, Optional
+
+import base64
+import paramiko
+import winrm
+import winrm.protocol
+
+logger = logging.getLogger(__name__)
+
+# How recently the connection was used before we skip the liveness probe (seconds)
+_LIVENESS_SKIP_WINDOW_S = 10.0
+
+
+# ---------------------------------------------------------------------------
+# Streaming primitives
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Chunk:
+    stream: Literal["stdout", "stderr"]
+    data: str
+
+
+@dataclass
+class ChunkDone:
+    exit_code: int
+    status: Literal["success", "failed", "timeout", "aborted"]
+
+
+# ---------------------------------------------------------------------------
+# Base
+# ---------------------------------------------------------------------------
+
 class BaseExecutor(ABC):
     def __init__(self, ip: str, port: int, credential: Optional[Dict[str, str]] = None):
         self.ip = ip
         self.port = port
         self.credential = credential or {}
+        self._last_used_at: float = 0.0
 
     @abstractmethod
+    async def _ensure_connected(self) -> None:
+        """Guarantee a live connection. Reconnects if dead. Called before every use."""
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Cleanly disconnect. Called by connection pool on eviction / shutdown."""
+
+    @abstractmethod
+    def stream_command(
+        self,
+        command: str,
+        abort_event: asyncio.Event,
+        timeout_s: int = 60,
+        stdin_queue: Optional[asyncio.Queue] = None,
+    ) -> AsyncIterator[Chunk | ChunkDone]:
+        """Yield Chunk items then a single ChunkDone."""
+
     async def run_command(self, command: str) -> Dict[str, Any]:
-        """Execute a shell command and return {status, output, error}"""
-        pass
+        """Buffered wrapper — used by scheduler helpers and HTTP health paths."""
+        abort = asyncio.Event()
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        done: ChunkDone | None = None
+        async for item in self.stream_command(command, abort):
+            if isinstance(item, Chunk):
+                if item.stream == "stdout":
+                    stdout_parts.append(item.data)
+                else:
+                    stderr_parts.append(item.data)
+            elif isinstance(item, ChunkDone):
+                done = item
+
+        out = "".join(stdout_parts).strip()
+        err = "".join(stderr_parts).strip()
+        status = done.status if done else "failed"
+
+        if status == "success":
+            if err:
+                return {"status": "error", "output": out, "error": err}
+            return {"status": "success", "output": out}
+        if status == "timeout":
+            return {"status": "timeout", "output": out, "error": err or "Timed out"}
+        if status == "aborted":
+            return {"status": "aborted", "output": out, "error": err}
+        return {"status": "failed", "output": out, "error": err or "Command failed"}
 
     @abstractmethod
     async def check_health(self) -> bool:
-        """Check if the specific service is responding (Ping/TCP)"""
-        pass
+        """TCP ping — does NOT use the pooled connection. Always direct."""
 
-# --- 2. The Linux Specialist (SSH) ---
+
+# ---------------------------------------------------------------------------
+# Linux (SSH / Paramiko)
+# ---------------------------------------------------------------------------
+
 class LinuxExecutor(BaseExecutor):
-    async def run_command(self, command: str) -> Dict[str, Any]:
-        
-        # We define the blocking SSH code inside this inner function
-        def _ssh_task():
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            try:
-                # Extract credentials
-                username = self.credential.get('username')
-                password = self.credential.get('password') # This expects the PLAIN text password
 
-                print(f"🔌 Executor connecting to {self.ip}...")
-                client.connect(
-                    hostname=self.ip, 
-                    port=self.port, 
-                    username=username, 
-                    password=password, 
-                    timeout=10
-                )
-                
-                print(f"🚀 Executing: {command}")
-                stdin, stdout, stderr = client.exec_command(command)
-                result = stdout.read().decode().strip()
-                error = stderr.read().decode().strip()
-                client.close()
-                
-                if error:
-                    return {"status": "error", "output": error}
-                return {"status": "success", "output": result}
-                
-            except Exception as e:
-                print(f"❌ Executor Error: {str(e)}")
-                return {"status": "failed", "error": str(e)}
+    def __init__(self, ip: str, port: int, credential: Optional[Dict[str, str]] = None):
+        super().__init__(ip, port, credential)
+        self._client: Optional[paramiko.SSHClient] = None
 
-        # We run the blocking code in a separate thread so the API stays fast
+    async def _ensure_connected(self) -> None:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _ssh_task)
+        now = loop.time()
+        transport = self._client.get_transport() if self._client else None
+
+        if transport and transport.is_active():
+            # Recently used → trust the local state, skip probe
+            if (now - self._last_used_at) < _LIVENESS_SKIP_WINDOW_S:
+                return
+            # Idle connection → quick session-open probe (detects silent NAT drops)
+            try:
+                def _probe():
+                    ch = transport.open_session()
+                    ch.close()
+                await asyncio.wait_for(loop.run_in_executor(None, _probe), timeout=3.0)
+                logger.debug("[pool] SSH reused %s", self.ip)
+                self._last_used_at = now
+                return
+            except Exception:
+                logger.info("[pool] SSH liveness probe failed for %s — reconnecting", self.ip)
+
+        # Connect fresh
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=self.ip,
+            port=self.port,
+            username=self.credential.get("username"),
+            password=self.credential.get("password"),
+            timeout=10,
+        )
+        client.get_transport().set_keepalive(30)
+        self._client = client
+        self._last_used_at = asyncio.get_event_loop().time()
+        logger.info("[pool] SSH fresh connection to %s", self.ip)
+
+    async def close(self) -> None:
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+
+    async def stream_command(
+        self,
+        command: str,
+        abort_event: asyncio.Event,
+        timeout_s: int = 60,
+        stdin_queue: Optional[asyncio.Queue] = None,
+    ) -> AsyncIterator[Chunk | ChunkDone]:
+        # _ensure_connected must have been called by the pool before this.
+        # If called outside pool context (e.g. run_command), call it here.
+        if not self._client or not self._client.get_transport() or \
+                not self._client.get_transport().is_active():
+            await self._ensure_connected()
+
+        loop = asyncio.get_event_loop()
+        chunk_queue: asyncio.Queue[Chunk | ChunkDone | BaseException] = asyncio.Queue()
+        thread_stdin: _queue.Queue[str] = _queue.Queue()
+        transport = self._client.get_transport()
+
+        def _worker():
+            try:
+                channel = transport.open_session()
+                channel.exec_command(command)
+
+                while True:
+                    # Forward any stdin data queued by the async side
+                    while True:
+                        try:
+                            data = thread_stdin.get_nowait()
+                            channel.send(data)
+                        except _queue.Empty:
+                            break
+
+                    if abort_event.is_set():
+                        # Drain remaining output before closing
+                        while channel.recv_ready():
+                            data = channel.recv(4096).decode("utf-8", errors="replace")
+                            if data:
+                                loop.call_soon_threadsafe(
+                                    chunk_queue.put_nowait,
+                                    Chunk(stream="stdout", data=data),
+                                )
+                        while channel.recv_stderr_ready():
+                            data = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                            if data:
+                                loop.call_soon_threadsafe(
+                                    chunk_queue.put_nowait,
+                                    Chunk(stream="stderr", data=data),
+                                )
+                        channel.close()
+                        loop.call_soon_threadsafe(
+                            chunk_queue.put_nowait,
+                            ChunkDone(exit_code=-1, status="aborted"),
+                        )
+                        return
+
+                    got_data = False
+                    if channel.recv_ready():
+                        data = channel.recv(4096).decode("utf-8", errors="replace")
+                        if data:
+                            got_data = True
+                            loop.call_soon_threadsafe(
+                                chunk_queue.put_nowait,
+                                Chunk(stream="stdout", data=data),
+                            )
+
+                    if channel.recv_stderr_ready():
+                        data = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                        if data:
+                            got_data = True
+                            loop.call_soon_threadsafe(
+                                chunk_queue.put_nowait,
+                                Chunk(stream="stderr", data=data),
+                            )
+
+                    if channel.exit_status_ready():
+                        exit_code = channel.recv_exit_status()
+                        # Final drain
+                        while channel.recv_ready():
+                            data = channel.recv(4096).decode("utf-8", errors="replace")
+                            if data:
+                                loop.call_soon_threadsafe(
+                                    chunk_queue.put_nowait,
+                                    Chunk(stream="stdout", data=data),
+                                )
+                        while channel.recv_stderr_ready():
+                            data = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                            if data:
+                                loop.call_soon_threadsafe(
+                                    chunk_queue.put_nowait,
+                                    Chunk(stream="stderr", data=data),
+                                )
+                        status = "success" if exit_code == 0 else "failed"
+                        loop.call_soon_threadsafe(
+                            chunk_queue.put_nowait,
+                            ChunkDone(exit_code=exit_code, status=status),
+                        )
+                        channel.close()
+                        return
+
+                    if not got_data:
+                        time.sleep(0.05)  # avoid busy-loop
+
+            except Exception as exc:
+                loop.call_soon_threadsafe(chunk_queue.put_nowait, exc)
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+        deadline = loop.time() + timeout_s
+        timed_out = False
+
+        while True:
+            # Bridge asyncio stdin_queue → thread
+            if stdin_queue:
+                while not stdin_queue.empty():
+                    try:
+                        data = stdin_queue.get_nowait()
+                        thread_stdin.put_nowait(data)
+                    except Exception:
+                        break
+
+            remaining = deadline - loop.time()
+
+            if remaining <= 0 and not timed_out:
+                timed_out = True
+                abort_event.set()
+
+            wait = 0.2 if not abort_event.is_set() else 0.05
+
+            try:
+                item = await asyncio.wait_for(chunk_queue.get(), timeout=wait)
+            except asyncio.TimeoutError:
+                if abort_event.is_set():
+                    # Give worker ~150 ms to flush remaining data
+                    await asyncio.sleep(0.15)
+                    while True:
+                        try:
+                            pending = chunk_queue.get_nowait()
+                            if isinstance(pending, Chunk):
+                                yield pending
+                            elif isinstance(pending, ChunkDone):
+                                yield pending
+                                return
+                        except Exception:
+                            break
+                    yield ChunkDone(
+                        exit_code=-1,
+                        status="timeout" if timed_out else "aborted",
+                    )
+                    return
+                continue
+
+            if isinstance(item, BaseException):
+                yield ChunkDone(exit_code=-1, status="failed")
+                return
+            yield item
+            if isinstance(item, ChunkDone):
+                self._last_used_at = asyncio.get_event_loop().time()
+                return
 
     async def check_health(self) -> bool:
-        """
-        Simple TCP Handshake. 
-        Does not need credentials, just checks if port is open.
-        """
+        """Direct TCP ping — independent of the pooled connection."""
         try:
-            future = asyncio.open_connection(self.ip, self.port)
-            reader, writer = await asyncio.wait_for(future, timeout=3)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.ip, self.port), timeout=3
+            )
             writer.close()
             await writer.wait_closed()
             return True
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
             return False
 
-# --- 3. The Windows Specialist (Future Proofing) ---
+
+# ---------------------------------------------------------------------------
+# Windows (WinRM / pywinrm protocol-level polling)
+# ---------------------------------------------------------------------------
+
 class WindowsExecutor(BaseExecutor):
-    def __init__(self, ip: str, port: int, credential: dict):
+    def __init__(self, ip: str, port: int, credential: Optional[Dict[str, str]] = None):
         super().__init__(ip, port, credential)
-        # Default WinRM HTTP port
-        if self.port == 22: 
-            self.port = 5985 
+        if port == 22:
+            self.port = 5985
+        self._protocol: Optional[winrm.protocol.Protocol] = None
 
-    async def run_command(self, command: str) -> dict:
-        """
-        Executes a PowerShell command via WinRM (NTLM Encrypted).
-        """
-        def _winrm_task():
-            try:
-                # PRODUCTION SECURITY: NTLM
-                session = winrm.Session(
-                    f"http://{self.ip}:{self.port}/wsman", 
-                    auth=(self.credential.get('username'), self.credential.get('password')),
-                    transport='ntlm' # <--- Confirmed working in your test
-                )
-                
-                # Wrap command in PowerShell to avoid interactive hangs
-                # -NoProfile: Fast startup
-                # -NonInteractive: Don't wait for user input
-                ps_command = f"powershell -NoProfile -NonInteractive -Command \"{command}\""
-                
-                print(f"🪟 WinRM Connecting to {self.ip}...")
-                print(f"🚀 Executing: {ps_command}")
-                run_result = session.run_cmd(ps_command)
-                
-                std_out = run_result.std_out.decode('utf-8', errors='ignore').strip()
-                std_err = run_result.std_err.decode('utf-8', errors='ignore').strip()
-                
-                if std_err:
-                    # Windows often writes warnings to stderr, but we return it for debugging
-                    return {"status": "error", "output": std_out, "error": std_err}
-                
-                return {"status": "success", "output": std_out}
+    def _make_protocol(self) -> winrm.protocol.Protocol:
+        return winrm.protocol.Protocol(
+            endpoint=f"http://{self.ip}:{self.port}/wsman",
+            transport="ntlm",
+            username=self.credential.get("username"),
+            password=self.credential.get("password"),
+        )
 
-            except Exception as e:
-                return {"status": "failed", "error": str(e)}
+    async def _ensure_connected(self) -> None:
+        # WinRM/NTLM: each open_shell() consumes an auth token. Reusing the
+        # Protocol object across separate open_shell() calls causes "Invalid MIC"
+        # SpnegoErrors on the second call. Always create a fresh Protocol so each
+        # command sequence gets a clean NTLM handshake.
+        # The per-server pool lock (not session reuse) is what prevents NTLM
+        # collision between concurrent callers.
+        self._protocol = self._make_protocol()
+        self._last_used_at = asyncio.get_event_loop().time()
+        logger.debug("[pool] WinRM protocol ready for %s", self.ip)
+
+    async def close(self) -> None:
+        self._protocol = None
+
+    async def stream_command(
+        self,
+        command: str,
+        abort_event: asyncio.Event,
+        timeout_s: int = 60,
+        stdin_queue: Optional[asyncio.Queue] = None,
+    ) -> AsyncIterator[Chunk | ChunkDone]:
+        if not self._protocol:
+            await self._ensure_connected()
 
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _winrm_task)
+
+        # Use -EncodedCommand (Base64 UTF-16LE) so the command string is opaque
+        # to the cmd.exe shell — no quoting issues regardless of what the command
+        # contains (semicolons, double-quotes, dollar signs, etc.).
+        encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+        ps_command = f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
+        protocol = self._protocol
+
+        shell_id = await loop.run_in_executor(None, protocol.open_shell)
+        cmd_id = await loop.run_in_executor(
+            None, lambda: protocol.run_command(shell_id, ps_command)
+        )
+
+        deadline = loop.time() + timeout_s
+        timed_out = False
+
+        try:
+            while True:
+                # Forward stdin if any
+                if stdin_queue:
+                    while not stdin_queue.empty():
+                        try:
+                            data = stdin_queue.get_nowait()
+                            await loop.run_in_executor(
+                                None,
+                                lambda d=data: protocol.send_input(shell_id, cmd_id, d),
+                            )
+                        except Exception:
+                            break
+
+                if abort_event.is_set():
+                    await loop.run_in_executor(
+                        None, lambda: protocol.cleanup_command(shell_id, cmd_id)
+                    )
+                    yield ChunkDone(exit_code=-1, status="aborted")
+                    return
+
+                if loop.time() >= deadline and not timed_out:
+                    timed_out = True
+                    abort_event.set()
+                    await loop.run_in_executor(
+                        None, lambda: protocol.cleanup_command(shell_id, cmd_id)
+                    )
+                    yield ChunkDone(exit_code=-1, status="timeout")
+                    return
+
+                # pywinrm returns (stdout, stderr, return_code) — 3 values.
+                # return_code is None while running, an int when finished.
+                std_out_b, std_err_b, exit_status = await loop.run_in_executor(
+                    None,
+                    lambda: protocol.get_command_output(shell_id, cmd_id),
+                )
+                done = exit_status is not None
+
+                if std_out_b:
+                    yield Chunk(stream="stdout", data=std_out_b.decode("utf-8", errors="replace"))
+
+                if std_err_b:
+                    err_text = std_err_b.decode("utf-8", errors="replace")
+                    # CLIXML is PowerShell host-formatting (progress bars, "Preparing
+                    # modules for first use.", etc.) written to stderr on every fresh
+                    # PS session.  It is never an actionable error — drop it silently
+                    # so callers see a clean exit status and no false "error" results.
+                    if not err_text.lstrip().startswith("#< CLIXML"):
+                        yield Chunk(stream="stderr", data=err_text)
+
+                if done:
+                    status = "success" if exit_status == 0 else "failed"
+                    yield ChunkDone(exit_code=exit_status, status=status)
+                    self._last_used_at = asyncio.get_event_loop().time()
+                    return
+
+                await asyncio.sleep(0.2)
+        finally:
+            try:
+                await loop.run_in_executor(None, lambda: protocol.close_shell(shell_id))
+            except Exception:
+                pass
+            # Reset so the next call gets a completely fresh NTLM auth context.
+            # WinRM auth tokens are per-handshake; reusing them across separate
+            # command sequences causes SpnegoError (Invalid MIC).
+            self._protocol = None
+
+    async def run_command(self, command: str) -> dict:
+        abort = asyncio.Event()
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        done: ChunkDone | None = None
+        async for item in self.stream_command(command, abort):
+            if isinstance(item, Chunk):
+                if item.stream == "stdout":
+                    stdout_parts.append(item.data)
+                else:
+                    stderr_parts.append(item.data)
+            elif isinstance(item, ChunkDone):
+                done = item
+
+        out = "".join(stdout_parts).strip()
+        err = "".join(stderr_parts).strip()
+        status = done.status if done else "failed"
+
+        if status == "success":
+            if err:
+                return {"status": "error", "output": out, "error": err}
+            return {"status": "success", "output": out}
+        if status == "timeout":
+            return {"status": "timeout", "output": out, "error": err or "Timed out"}
+        if status == "aborted":
+            return {"status": "aborted", "output": out, "error": err}
+        return {"status": "failed", "output": out, "error": err or "Command failed"}
 
     async def check_health(self) -> bool:
-        """TCP Ping"""
         try:
-            future = asyncio.open_connection(self.ip, self.port)
-            reader, writer = await asyncio.wait_for(future, timeout=3)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.ip, self.port), timeout=3
+            )
             writer.close()
             await writer.wait_closed()
             return True
-        except:
+        except Exception:
             return False
 
-# --- 4. The Factory (The Decision Maker) ---
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
 def get_server_executor(server_doc: Dict, plain_password: str = "") -> BaseExecutor:
-    """
-    Decides which Executor to use based on the 'os_type' in the server document.
-    """
     os_type = server_doc.get("os_type", "linux")
     ip = server_doc["ip_address"]
     port = server_doc.get("port", 22)
-    
-    # Bundle the credentials into a simple dict
-    # (The Service extracts the username/password before calling this)
-    creds = {
-        "username": "unknown", # Service must set this if needed
-        "password": plain_password
-    }
-    
+    creds = {"username": "unknown", "password": plain_password}
+
     if os_type == "windows":
         return WindowsExecutor(ip, port, creds)
-    else:
-        return LinuxExecutor(ip, port, creds)
+    return LinuxExecutor(ip, port, creds)

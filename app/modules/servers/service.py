@@ -1,14 +1,19 @@
 import asyncio
+import uuid
+from typing import AsyncIterator, Optional, Union
+
 from app.core.database import get_database
 from app.modules.servers.schemas import ServerCreate, ServerInDB, CredentialInDB, ServerUpdate, ServerDelete, ServerStatus
 from app.core.security import encrypt_password, decrypt_password
 from bson import ObjectId
-from datetime import datetime ,timezone
-from app.core.executors import get_server_executor
+from datetime import datetime, timezone
+from app.core.executors import get_server_executor, Chunk, ChunkDone
+# get_server_executor kept for health-check path (direct TCP, no pool)
 from app.core.rate_limit import check_rate_limit
 from app.modules.servers.guardrails import check_command
 from app.modules.servers.audit import write_audit
 from app.core.events import event_bus
+from app.core.connection_pool import connection_pool
 
 
 DEFAULT_COMMAND_TIMEOUT_S = 60
@@ -48,51 +53,48 @@ class ServerService:
         return {"valid": True, "credential_id": cred_id, "server_data": server}
     
     async def update_all_server_statuses(self):
-            import asyncio
-            from app.core.config import settings
-            from app.core.scheduler import _get_server_lock
+        from app.core.config import settings
 
-            db = get_database()
-            servers = await db["servers"].find().to_list(length=10000)
-            print(f"🕵️  Starting Health Check Cycle...")
-            
-            sem = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
+        db = get_database()
+        servers = await db["servers"].find().to_list(length=10000)
+        print(f"🕵️  Starting Health Check Cycle...")
 
-            async def check_one(server):
-                server_id = str(server["_id"])
-                previous_status = server.get("status")
-                async with sem:
-                    async with _get_server_lock(server_id):
-                        executor = get_server_executor(server, plain_password="")
-                        is_online = await executor.check_health()
-                        new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
+        sem = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
 
-                        await db["servers"].update_one(
-                            {"_id": server["_id"]},
-                            {
-                                "$set": {
-                                    "status": new_status,
-                                    "last_health_check": datetime.now(timezone.utc)
-                                }
-                            }
-                        )
+        async def check_one(server):
+            server_id = str(server["_id"])
+            previous_status = server.get("status")
+            async with sem:
+                # Health check uses a direct TCP ping — no pooled session needed,
+                # no per-server lock needed (read-only probe, no auth collision).
+                executor = get_server_executor(server, plain_password="")
+                is_online = await executor.check_health()
+                new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
 
-                        if previous_status != new_status:
-                            event_bus.emit("servers.status", "server.status_changed", {
-                                "server_id": server_id,
-                                "status": new_status,
-                                "previous_status": previous_status,
-                                "hostname": server.get("hostname"),
-                            })
-                            event_bus.emit("dashboard.summary", "server.status_changed", {
-                                "server_id": server_id,
-                                "status": new_status,
-                            })
+                await db["servers"].update_one(
+                    {"_id": server["_id"]},
+                    {"$set": {
+                        "status": new_status,
+                        "is_online": is_online,
+                        "last_health_check": datetime.now(timezone.utc),
+                    }},
+                )
 
-            tasks = [check_one(server) for server in servers]
-            await asyncio.gather(*tasks, return_exceptions=True)
-                
-            print(f"✅ Health Check Complete. Scanned {len(servers)} servers.")
+                if previous_status != new_status:
+                    event_bus.emit("servers.status", "server.status_changed", {
+                        "server_id": server_id,
+                        "status": new_status,
+                        "previous_status": previous_status,
+                        "hostname": server.get("hostname"),
+                    })
+                    event_bus.emit("dashboard.summary", "server.status_changed", {
+                        "server_id": server_id,
+                        "status": new_status,
+                    })
+
+        tasks = [check_one(server) for server in servers]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        print(f"✅ Health Check Complete. Scanned {len(servers)} servers.")
     """ 
     🚀
     CRUD Operations 
@@ -240,6 +242,9 @@ class ServerService:
             server_updates["updated_at"] = datetime.now(timezone.utc)
             await db["servers"].update_one({"_id": oid}, {"$set": server_updates})
 
+        # Evict from connection pool so the next access picks up fresh credentials/config
+        connection_pool.evict(str(oid))
+
         event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
 
         return {"status": "success", "message": "Server and credentials updated"}
@@ -260,10 +265,10 @@ class ServerService:
         cred_id = ObjectId(verification["credential_id"])
 
         # 2. DELETE EVERYTHING (Cascade)
-        # Delete the Server
         await db["servers"].delete_one({"_id": oid})
-        # Delete the Linked Credential
         await db["credentials"].delete_one({"_id": cred_id})
+        # Evict from connection pool — releases the cached session immediately
+        connection_pool.evict(str(oid))
 
         event_bus.emit("servers", "server.deleted", {"server_id": str(oid)})
         event_bus.emit("dashboard.summary", "server.deleted", {"server_id": str(oid)})
@@ -346,45 +351,29 @@ class ServerService:
                 "error": check.reason,
             }
 
-        # --- 3. Resolve credential and run ---
-        cred_id = server.get("credential_id")
-        try:
-            s_c_oid = ObjectId(cred_id)
-        except Exception:
-            return {"status": "failed", "error": "Invalid Credential ID"}
-
-        credential = await db["credentials"].find_one({"_id": s_c_oid})
-        if not credential:
-            return {"status": "failed", "error": "Linked credential not found"}
-
-        try:
-            plain_secret = decrypt_password(credential["encrypted_secret"])
-        except Exception:
-            return {"status": "failed", "error": "Decryption failed"}
-
-        executor = get_server_executor(server, plain_password=plain_secret)
-        executor.credential['username'] = credential['username']
-
+        # --- 3. Acquire pooled executor and run ---
         effective_timeout = DEFAULT_COMMAND_TIMEOUT_S if timeout_s is None else \
             max(1, min(MAX_COMMAND_TIMEOUT_S, int(timeout_s)))
 
         try:
-            result = await asyncio.wait_for(
-                executor.run_command(command), timeout=effective_timeout
-            )
-        except asyncio.TimeoutError:
-            await write_audit(
-                server_id=server_id, command=command, status="timeout",
-                started_at=started_at, principal_id=principal_id,
-                source_ip=source_ip, confirmed=confirmed,
-                stderr=f"[timed out after {effective_timeout}s]",
-            )
-            return {
-                "status": "timeout",
-                "output": "",
-                "error": f"Command exceeded {effective_timeout}s timeout.",
-                "timeout_s": effective_timeout,
-            }
+            async with connection_pool.get(server_id) as executor:
+                try:
+                    result = await asyncio.wait_for(
+                        executor.run_command(command), timeout=effective_timeout
+                    )
+                except asyncio.TimeoutError:
+                    await write_audit(
+                        server_id=server_id, command=command, status="timeout",
+                        started_at=started_at, principal_id=principal_id,
+                        source_ip=source_ip, confirmed=confirmed,
+                        stderr=f"[timed out after {effective_timeout}s]",
+                    )
+                    return {
+                        "status": "timeout",
+                        "output": "",
+                        "error": f"Command exceeded {effective_timeout}s timeout.",
+                        "timeout_s": effective_timeout,
+                    }
         except Exception as e:
             await write_audit(
                 server_id=server_id, command=command, status="error",
@@ -405,4 +394,198 @@ class ServerService:
         )
         return result
 
-        # Logic for 'ssh_key' file handling will be added later.
+    # ------------------------------------------------------------------
+    # Streaming terminal (P7.6)
+    # ------------------------------------------------------------------
+
+    async def stream_command(
+        self,
+        server_id: str,
+        command: str,
+        abort_event: asyncio.Event,
+        *,
+        confirmed: bool = False,
+        timeout_s: int | None = None,
+        principal_id: str | None = None,
+        source_ip: str | None = None,
+        stdin_queue: Optional[asyncio.Queue] = None,
+    ) -> AsyncIterator[dict]:
+        """
+        Guardrail-checked streaming command.  Yields dicts matching the WS
+        protocol:  started | chunk | done | error.
+        Always writes an audit row (including on abort/disconnect).
+        """
+        started_at = datetime.now(timezone.utc)
+        principal = principal_id or source_ip or "anonymous"
+        command_id = str(uuid.uuid4())
+
+        db = get_database()
+        try:
+            s_oid = ObjectId(server_id)
+        except Exception:
+            yield {"type": "error", "command_id": None, "code": "invalid_command",
+                   "message": "Invalid server ID"}
+            return
+
+        server = await db["servers"].find_one({"_id": s_oid})
+        if not server:
+            yield {"type": "error", "command_id": None, "code": "invalid_command",
+                   "message": "Server not found"}
+            return
+
+        os_type = server.get("os_type", "linux")
+
+        # --- Rate limit ---
+        rl = await check_rate_limit(principal, server_id)
+        if not rl.allowed:
+            await write_audit(
+                server_id=server_id, command=command, status="rate_limited",
+                started_at=started_at, principal_id=principal_id,
+                source_ip=source_ip, confirmed=confirmed,
+                blocked_reason=f"rate limit exceeded (retry in {rl.retry_after_s}s)",
+                transport="ws",
+            )
+            yield {
+                "type": "error", "command_id": None, "code": "rate_limited",
+                "message": "Rate limit exceeded.",
+                "retry_after_s": rl.retry_after_s,
+            }
+            return
+
+        # --- Guardrail check ---
+        check = check_command(command, os_type)
+        if not check.allowed:
+            await write_audit(
+                server_id=server_id, command=command, status="blocked",
+                started_at=started_at, principal_id=principal_id,
+                source_ip=source_ip, confirmed=confirmed,
+                blocked_reason=check.reason, transport="ws",
+            )
+            yield {"type": "error", "command_id": None, "code": "blocked",
+                   "message": check.reason}
+            return
+
+        if check.requires_confirmation and not confirmed:
+            await write_audit(
+                server_id=server_id, command=command, status="requires_confirmation",
+                started_at=started_at, principal_id=principal_id,
+                source_ip=source_ip, confirmed=False,
+                blocked_reason=check.reason, transport="ws",
+            )
+            yield {"type": "error", "command_id": None,
+                   "code": "requires_confirmation", "message": check.reason}
+            return
+
+        effective_timeout = (
+            DEFAULT_COMMAND_TIMEOUT_S if timeout_s is None
+            else max(1, min(MAX_COMMAND_TIMEOUT_S, int(timeout_s)))
+        )
+
+        # Acquire the pooled executor — holds the per-server lock for the full
+        # streaming duration, serialising terminal and scheduler on this server.
+        try:
+            _pool_ctx = connection_pool.get(server_id)
+            executor = await _pool_ctx.__aenter__()
+        except Exception as exc:
+            yield {"type": "error", "command_id": None, "code": "internal",
+                   "message": str(exc)}
+            return
+
+        yield {
+            "type": "started",
+            "command_id": command_id,
+            "command": command,
+            "started_at": started_at.isoformat(),
+        }
+
+        # Rolling 4 KB preview buffers for audit
+        stdout_preview_buf: list[str] = []
+        stderr_preview_buf: list[str] = []
+        PREVIEW_MAX = 4096
+        stdout_total = 0
+        stderr_total = 0
+        chunk_count = 0
+        seq = 0
+        final_done: ChunkDone | None = None
+
+        try:
+            async for item in executor.stream_command(command, abort_event, effective_timeout, stdin_queue):
+                if isinstance(item, Chunk):
+                    chunk_count += 1
+                    seq_val = seq
+                    seq += 1
+                    yield {
+                        "type": "chunk",
+                        "command_id": command_id,
+                        "stream": item.stream,
+                        "data": item.data,
+                        "seq": seq_val,
+                    }
+                    raw = item.data.encode("utf-8", errors="replace")
+                    if item.stream == "stdout":
+                        stdout_total += len(raw)
+                        if stdout_total <= PREVIEW_MAX:
+                            stdout_preview_buf.append(item.data)
+                    else:
+                        stderr_total += len(raw)
+                        if stderr_total <= PREVIEW_MAX:
+                            stderr_preview_buf.append(item.data)
+
+                elif isinstance(item, ChunkDone):
+                    final_done = item
+                    finished_at = datetime.now(timezone.utc)
+                    duration_ms = int(
+                        (finished_at - started_at).total_seconds() * 1000
+                    )
+                    yield {
+                        "type": "done",
+                        "command_id": command_id,
+                        "exit_code": item.exit_code,
+                        "duration_ms": duration_ms,
+                        "status": item.status,
+                    }
+        finally:
+            finished_at = datetime.now(timezone.utc)
+            fd = final_done
+            aborted = fd is not None and fd.status == "aborted"
+            timed_out = fd is not None and fd.status == "timeout"
+            if aborted:
+                abort_reason = "user" if abort_event.is_set() else "client_disconnect"
+            elif timed_out:
+                abort_reason = "timeout"
+            else:
+                abort_reason = None
+
+            audit_status: str
+            if fd is None:
+                audit_status = "error"
+            elif fd.status == "success":
+                audit_status = "ok"
+            elif fd.status in ("timeout",):
+                audit_status = "timeout"
+            else:
+                audit_status = "error"
+
+            await write_audit(
+                server_id=server_id,
+                command=command,
+                status=audit_status,  # type: ignore[arg-type]
+                started_at=started_at,
+                finished_at=finished_at,
+                principal_id=principal_id,
+                source_ip=source_ip,
+                confirmed=confirmed,
+                exit_code=fd.exit_code if fd else None,
+                stdout="".join(stdout_preview_buf),
+                stderr="".join(stderr_preview_buf),
+                transport="ws",
+                aborted=aborted,
+                abort_reason=abort_reason,  # type: ignore[arg-type]
+                stream_stats={
+                    "bytes_stdout": stdout_total,
+                    "bytes_stderr": stderr_total,
+                    "chunk_count": chunk_count,
+                },
+            )
+            # Release the pool lock so scheduler can proceed on this server
+            await _pool_ctx.__aexit__(None, None, None)

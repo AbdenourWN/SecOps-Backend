@@ -7,7 +7,7 @@ persisted; previews are truncated to 4 KB per stream.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 from pymongo import ASCENDING, DESCENDING
 
@@ -22,6 +22,8 @@ AuditStatus = Literal[
     "requires_confirmation",
     "rate_limited",
 ]
+
+AbortReason = Literal["user", "timeout", "client_disconnect"]
 
 
 PREVIEW_MAX_BYTES = 4096
@@ -67,6 +69,11 @@ async def write_audit(
     stderr: Optional[str] = None,
     blocked_reason: Optional[str] = None,
     confirmed: bool = False,
+    # WS streaming fields (additive — no migration needed)
+    transport: Literal["http", "ws"] = "http",
+    aborted: bool = False,
+    abort_reason: Optional[AbortReason] = None,
+    stream_stats: Optional[Dict[str, int]] = None,
 ) -> None:
     finished = finished_at or datetime.now(timezone.utc)
     stdout_preview, stdout_bytes = _preview(stdout)
@@ -90,6 +97,10 @@ async def write_audit(
         "stderr_preview": stderr_preview,
         "blocked_reason": blocked_reason,
         "confirmed": confirmed,
+        "transport": transport,
+        "aborted": aborted,
+        "abort_reason": abort_reason,
+        "stream_stats": stream_stats,
     }
     try:
         await get_database()["command_audit"].insert_one(doc)

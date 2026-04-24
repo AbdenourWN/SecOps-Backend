@@ -16,6 +16,8 @@ from app.modules.dashboard.router import router as dashboard_router
 from app.modules.test.router import router as test_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.ws.router import router as ws_router
+from app.modules.ws.terminal_router import router as terminal_ws_router
+from app.core.connection_pool import connection_pool
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 
@@ -26,16 +28,20 @@ async def lifespan(app: FastAPI):
     await connect_to_mongo()
     await connect_to_elasticsearch()
 
-    # Seed Data (One time check — scripts first, then rules link to them)
+    # Seed Data (scripts first — rules reference script IDs by name)
     await AutomationService().seed_default_scripts()
     await AnalysisService().seed_default_rules()
-    
-    # Start the "Heartbeat" of the application
-    
+
+    # Start connection pool idle sweeper
+    await connection_pool.start()
+
+    # Start the scheduler (health, telemetry, file_watcher jobs)
     start_scheduler()
 
     yield
+
     # -- Shutdown --
+    await connection_pool.close_all(grace_s=5)
     await close_elasticsearch()
     await close_mongo_connection()
 
@@ -65,6 +71,7 @@ app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"]
 app.include_router(test_router, prefix="/api/test", tags=["Test & Simulation"])
 app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(ws_router, prefix="/api", tags=["WebSocket"])
+app.include_router(terminal_ws_router, prefix="/api", tags=["Terminal WebSocket"])
 
 
 

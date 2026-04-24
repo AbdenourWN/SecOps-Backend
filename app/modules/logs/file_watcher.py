@@ -1,12 +1,17 @@
 import asyncio
+import uuid
 from app.core.database import get_database
+from app.core.elasticsearch import get_elasticsearch
 from app.core.events import event_bus
-from app.modules.logs.schemas import LogEntryInDB, LogLevel
-from app.core.executors import get_server_executor
-from app.core.security import decrypt_password
+from app.modules.logs.schemas import LogLevel
 from bson import ObjectId
 from datetime import datetime, timezone
+from elasticsearch.helpers import async_bulk
 from app.modules.analysis.service import AnalysisService
+
+
+def _get_log_index_name():
+    return f"secops-logs-{datetime.now(timezone.utc).strftime('%Y.%m')}"
 
 
 class FileWatcherService:
@@ -94,32 +99,32 @@ class FileWatcherService:
     # 🚦 MAIN DISPATCHER
     # =========================================================================
     async def process_file_source(self, source_doc: dict):
+        from app.core.connection_pool import connection_pool
+
         db = get_database()
         server_id = source_doc["server_id"]
 
-        # 1. Fetch Server & Executor (Shared Logic)
         server = await db["servers"].find_one({"_id": ObjectId(server_id)})
         if not server:
             return
 
-        cred = await db["credentials"].find_one(
-            {"_id": ObjectId(server["credential_id"])}
-        )
-        plain_secret = decrypt_password(cred["encrypted_secret"])
+        # Skip offline servers — avoids hanging on dead hosts
+        if not server.get("is_online", True):
+            return
 
-        executor = get_server_executor(server, plain_secret)
-        executor.credential["username"] = cred["username"]
+        async with connection_pool.try_get(str(server["_id"]), timeout=5) as executor:
+            if executor is None:
+                return  # server busy with terminal; skip this source this tick
 
-        # 2. Dispatch based on OS
-        if server.get("os_type") == "windows":
-            await self._process_windows_source(executor, source_doc, db)
-        else:
-            await self._process_linux_source(executor, source_doc, db)
+            if server.get("os_type") == "windows":
+                await self._process_windows_source(executor, source_doc, db, server)
+            else:
+                await self._process_linux_source(executor, source_doc, db, server)
 
     # =========================================================================
     # 🐧 LINUX LOGIC (Bash + Stat + Tail)
     # =========================================================================
-    async def _process_linux_source(self, executor, source_doc, db):
+    async def _process_linux_source(self, executor, source_doc, db, server=None):
         file_path = source_doc["file_path"]
         last_offset = source_doc.get("last_offset", 0)
         last_inode = source_doc.get("last_inode")
@@ -177,24 +182,20 @@ class FileWatcherService:
 
         read_result = await executor.run_command(cmd)
         if read_result["status"] == "success":
-            await self._save_logs(read_result["output"], source_doc, db)
-
-            # Update State
+            await self._save_logs(read_result["output"], source_doc, db, server)
             await db["log_sources"].update_one(
                 {"_id": source_id},
-                {
-                    "$set": {
-                        "last_offset": current_size,
-                        "last_inode": current_inode,
-                        "last_header": current_header,
-                    }
-                },
+                {"$set": {
+                    "last_offset": current_size,
+                    "last_inode": current_inode,
+                    "last_header": current_header,
+                }},
             )
 
     # =========================================================================
     # 🪟 WINDOWS LOGIC (PowerShell .NET)
     # =========================================================================
-    async def _process_windows_source(self, executor, source_doc, db):
+    async def _process_windows_source(self, executor, source_doc, db, server=None):
         file_path = source_doc["file_path"]
         last_offset = source_doc.get("last_offset", 0)
         last_inode = str(source_doc.get("last_inode", ""))  # String for Windows
@@ -248,9 +249,8 @@ class FileWatcherService:
         ps_read = f" $path = '{file_path}'; $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite); $null = $stream.Seek({read_start}, [System.IO.SeekOrigin]::Begin); $buffer = New-Object byte[] {read_len}; $bytesRead = $stream.Read($buffer, 0, {read_len}); $stream.Close(); [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)"
 
         read_result = await executor.run_command(ps_read)
-        print(f"🐛 WINDOWS READ RESULT: {read_result}")
         if read_result["status"] == "success":
-            await self._save_logs(read_result["output"], source_doc, db)
+            await self._save_logs(read_result["output"], source_doc, db, server)
 
             await db["log_sources"].update_one(
                 {"_id": source_id},
@@ -310,33 +310,58 @@ class FileWatcherService:
             updates["is_active"] = False
         await db["log_sources"].update_one({"_id": source_id}, {"$set": updates})
 
-    async def _save_logs(self, raw_data, source_doc, db):
+    async def _save_logs(self, raw_data, source_doc, db, server=None):
         if not raw_data:
             return
+
+        server_id = source_doc["server_id"]
+        hostname = (server or {}).get("hostname") or server_id
+        os_type = (server or {}).get("os_type", "linux")
+        now = datetime.now(timezone.utc)
 
         lines = raw_data.split("\n")
         new_logs = []
         for line in lines:
             if not line.strip():
                 continue
-            log_entry = LogEntryInDB(
-                server_id=source_doc["server_id"],
-                timestamp=datetime.now(timezone.utc),
-                message=line.strip(),
-                service=source_doc["name"],
-                level=LogLevel.INFO,
-            )
-            new_logs.append(log_entry.model_dump())
-
-        if new_logs:
-            res = await db["logs"].insert_many(new_logs)
-            analysis_service = AnalysisService()
-            for i, log in enumerate(new_logs):
-                log["_id"] = res.inserted_ids[i]
-            await analysis_service.analyze_logs(new_logs)
-            event_bus.emit("servers.logs", "logs.ingested", {
-                "server_id": source_doc["server_id"],
-                "source_id": str(source_doc.get("_id", "")),
-                "count": len(new_logs),
+            doc_id = str(uuid.uuid4())
+            new_logs.append({
+                "_id": doc_id,
+                "server_id": server_id,
+                "hostname": hostname,
+                "timestamp": now.isoformat(),
+                "message": line.strip(),
+                "service": source_doc["name"],
+                "level": LogLevel.INFO.value,
+                "os_type": os_type,
+                "source": "file_watcher",
+                "log_source": source_doc.get("name", "file"),
+                "ingested_at": now.isoformat(),
             })
-            print(f"📥 Collected {len(new_logs)} lines from {source_doc['file_path']}")
+
+        if not new_logs:
+            return
+
+        # Index to Elasticsearch so logs appear in the frontend viewer
+        es = get_elasticsearch()
+        if es:
+            try:
+                actions = [
+                    {
+                        "_index": _get_log_index_name(),
+                        "_id": doc["_id"],
+                        "_source": {k: v for k, v in doc.items() if k != "_id"},
+                    }
+                    for doc in new_logs
+                ]
+                await async_bulk(es, actions, raise_on_error=False)
+            except Exception as e:
+                print(f"⚠️ ES bulk index error (file_watcher): {e}")
+
+        await AnalysisService().analyze_logs(new_logs)
+        event_bus.emit("servers.logs", "logs.ingested", {
+            "server_id": server_id,
+            "source_id": str(source_doc.get("_id", "")),
+            "count": len(new_logs),
+        })
+        print(f"📥 Indexed {len(new_logs)} lines from {source_doc['file_path']} → ES")
