@@ -7,8 +7,6 @@ from app.modules.servers.router import router as servers_router
 from app.modules.logs.router import router as logs_router
 from app.modules.automation.router import router as automation_router
 from app.core.scheduler import start_scheduler
-from app.modules.analysis.service import AnalysisService
-from app.modules.automation.service import AutomationService
 from app.modules.metrics.router import router as metrics_router
 from app.modules.analysis.router import router as analysis_router
 from app.modules.incidents.router import router as incidents_router
@@ -28,10 +26,7 @@ async def lifespan(app: FastAPI):
     await connect_to_mongo()
     await connect_to_elasticsearch()
 
-    # Seed Data (scripts first — rules reference script IDs by name)
-    await AutomationService().seed_default_scripts()
-    await AnalysisService().seed_default_rules()
-
+    # Seeding is manual only — run `python seed.py` to populate defaults.
     # Start connection pool idle sweeper
     await connection_pool.start()
 

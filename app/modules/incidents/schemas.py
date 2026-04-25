@@ -19,6 +19,7 @@ class SeverityLevel(str, Enum):
 
 class IncidentStatus(str, Enum):
     OPEN = "open"
+    VERIFYING = "verifying"   # remediation ran; waiting to see if rule re-fires
     INVESTIGATING = "investigating"
     RESOLVED = "resolved"
     FALSE_POSITIVE = "false_positive"
@@ -44,12 +45,22 @@ class IncidentInDB(BaseModel):
 
     detected_at: datetime = Field(default_factory=utc_now)
     resolved_at: Optional[datetime] = None
+    auto_resolved_at: Optional[datetime] = None
     description: str  # Copied from rule name for easy reading
 
     # Extracted context from regex match (e.g., {"source_ip": "1.2.3.4", "username": "root"})
     context: Optional[Dict[str, Any]] = None
-    # AI analysis result (saved after manual or auto AI analysis)
     ai_analysis: Optional[str] = None
+    # Set when a rule's linked script was disabled/missing at fire time
+    automation_skipped_reason: Optional[str] = None
+    # Set when remediation was attempted but failed in a structural way
+    # ("remediation_exhausted" after MAX retries; "permission_denied" reserved for Phase 20.6)
+    automation_failure_reason: Optional[str] = None
+
+    # Verification / retry tracking
+    remediation_attempts: int = 0
+    last_remediation_at: Optional[datetime] = None
+    verification_until: Optional[datetime] = None
 
     class Config:
         populate_by_name = True

@@ -11,6 +11,19 @@ from app.modules.notifications.schemas import AlertPayload
 from app.core.events import event_bus
 
 # ========================================================================
+# Remediation Verification Tunables
+# ========================================================================
+# After a remediation runs we wait this long before declaring success.
+# If the same rule re-fires on the same server within this window, the
+# remediation didn't work.
+VERIFICATION_WINDOW_MINUTES = 10
+# How many times we retry the same script before giving up and escalating.
+MAX_REMEDIATION_ATTEMPTS = 3
+# An open/verifying incident older than this is considered stale; a new
+# incident is opened instead of being treated as a recurrence.
+RECENT_INCIDENT_LOOKBACK_MINUTES = 30
+
+# ========================================================================
 # OPT-4: RULE CACHE
 # Rules rarely change (maybe once a week). Instead of re-querying MongoDB
 # and re-compiling regex every 60 seconds for every server, we cache them
@@ -101,108 +114,242 @@ class AnalysisService:
                 match = pattern.search(log_msg)
                 
                 if match:
-                    # SMART EXTRACTION 🧠
-                    extracted_context = match.groupdict()
-                    if not extracted_context:
-                        extracted_context = {"raw_match": match.group(0)}
+                    # Extract named capture groups; always inject server metadata
+                    extracted_context = match.groupdict() or {"raw_match": match.group(0)}
+                    extracted_context.setdefault("hostname", server.get("hostname", ""))
+                    extracted_context.setdefault("os_type", server_os)
+
+                    server_id_str = str(log["server_id"])
+                    rule_id_str = str(rule["_id"])
+                    now = datetime.now(timezone.utc)
+
+                    action_level = rule.get("action_level", 3)
+
+                    # Pick OS-appropriate script ID
+                    if server_os == "windows" and rule.get("remediation_script_id_windows"):
+                        candidate_script_id = rule["remediation_script_id_windows"]
+                    else:
+                        candidate_script_id = rule.get("remediation_script_id")
 
                     # ========================================================
-                    # OPT-5: DUPLICATE INCIDENT PREVENTION
-                    # Check if an incident for this server + rule already 
-                    # exists in the last 5 minutes. If so, skip it.
+                    # State-machine dedup (replaces the old 5-min hard dedup):
+                    #
+                    #   1. Look for an OPEN or VERIFYING incident on the same
+                    #      (server, rule) within the lookback window (30 min).
+                    #   2. If found:
+                    #        - exhausted    → skip silently (already escalated)
+                    #        - verifying & still in the window → the previous
+                    #          remediation FAILED. Retry up to MAX_ATTEMPTS,
+                    #          then escalate.
+                    #        - any other open state → standard dedup; skip
+                    #          (this matches the old behaviour but with a
+                    #          wider window so we don't churn out duplicates).
+                    #   3. If nothing found → fresh detection: create incident
+                    #      and (for L1/L2) run script, mark VERIFYING.
                     # ========================================================
-                    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
-                    existing = await db["incidents"].find_one({
-                        "server_id": str(log["server_id"]),
-                        "rule_id": str(rule["_id"]),
-                        "detected_at": {"$gte": recent_cutoff}
-                    })
-                    if existing:
-                        continue  # Already reported — skip duplicate
+                    lookback_cutoff = now - timedelta(minutes=RECENT_INCIDENT_LOOKBACK_MINUTES)
+                    existing = await db["incidents"].find_one(
+                        {
+                            "server_id": server_id_str,
+                            "rule_id": rule_id_str,
+                            "status": {"$in": [
+                                IncidentStatus.OPEN.value,
+                                IncidentStatus.VERIFYING.value,
+                            ]},
+                            "detected_at": {"$gte": lookback_cutoff},
+                        },
+                        sort=[("detected_at", -1)],
+                    )
 
+                    if existing is not None:
+                        existing_id = existing["_id"]
+
+                        # Already escalated: don't retry, don't alert again. Waits for manual resolve.
+                        if existing.get("automation_failure_reason") == "remediation_exhausted":
+                            continue
+
+                        verification_until = existing.get("verification_until")
+                        in_verification_window = (
+                            existing.get("status") == IncidentStatus.VERIFYING.value
+                            and verification_until is not None
+                            and verification_until > now
+                        )
+
+                        if in_verification_window:
+                            # Re-trigger inside the verification window → previous remediation FAILED.
+                            attempts = existing.get("remediation_attempts", 0) + 1
+                            print(f"🔁 Rule '{rule['name']}' re-fired during verification — attempt {attempts}/{MAX_REMEDIATION_ATTEMPTS}")
+
+                            if attempts >= MAX_REMEDIATION_ATTEMPTS:
+                                # Give up — mark exhausted, escalate, do NOT re-run.
+                                await db["incidents"].update_one(
+                                    {"_id": existing_id},
+                                    {"$set": {
+                                        "status": IncidentStatus.OPEN.value,
+                                        "remediation_attempts": attempts,
+                                        "automation_failure_reason": "remediation_exhausted",
+                                        "verification_until": None,
+                                        "description": existing["description"] + f" (Auto-remediation failed {attempts}x)",
+                                    }},
+                                )
+                                event_bus.emit("incidents", "incident.updated", {
+                                    "incident_id": str(existing_id),
+                                    "server_id": server_id_str,
+                                    "reason": "remediation_exhausted",
+                                })
+                                escalation_payload = AlertPayload(
+                                    incident_id=str(existing_id),
+                                    server_id=server_id_str,
+                                    server_hostname=server.get("hostname", server.get("ip_address", "unknown")),
+                                    server_ip=server.get("ip_address", "unknown"),
+                                    rule_name=rule["name"],
+                                    severity=rule["severity"],
+                                    description=f"Auto-remediation exhausted: {rule['name']}",
+                                    context=existing.get("context", extracted_context),
+                                    detected_at=now,
+                                    action_level=action_level,
+                                    remediation_status="exhausted",
+                                    is_escalation=True,
+                                    remediation_attempts=attempts,
+                                )
+                                await self.notification_service.send_alert(escalation_payload)
+                                continue
+
+                            # Still under the limit — retry the same script with the original context.
+                            await db["incidents"].update_one(
+                                {"_id": existing_id},
+                                {"$set": {
+                                    "remediation_attempts": attempts,
+                                    "last_remediation_at": now,
+                                    "verification_until": now + timedelta(minutes=VERIFICATION_WINDOW_MINUTES),
+                                    "status": IncidentStatus.VERIFYING.value,
+                                }},
+                            )
+                            event_bus.emit("incidents", "incident.updated", {
+                                "incident_id": str(existing_id),
+                                "server_id": server_id_str,
+                                "reason": "remediation_retry",
+                                "attempt": attempts,
+                            })
+
+                            if candidate_script_id:
+                                await self.automation_service.execute_remediation(
+                                    server_id=server_id_str,
+                                    script_id=candidate_script_id,
+                                    incident_id=str(existing_id),
+                                    variables=existing.get("context", extracted_context),
+                                )
+                            continue
+
+                        # Existing OPEN/VERIFYING but verification window already expired — standard dedup.
+                        continue
+
+                    # ========================================================
+                    # No prior recent incident — fresh detection.
+                    # ========================================================
                     print(f"🚨 Incident: {rule['name']} | Ctx: {extracted_context}")
 
-                    # Create Incident Object
                     incident = IncidentInDB(
-                        server_id=str(log["server_id"]),
-                        rule_id=str(rule["_id"]),
+                        server_id=server_id_str,
+                        rule_id=rule_id_str,
                         log_id=str(log["_id"]),
                         severity=rule["severity"],
                         description=f"Detected: {rule['name']}",
-                        context=extracted_context
+                        context=extracted_context,
                     )
 
-                    # CHECK LEVEL & AUTOMATION
-                    action_level = rule.get("action_level", 3)
-                    remediation_script_id = rule.get("remediation_script_id")
+                    # Check if script is enabled (only relevant for L1/L2)
+                    skipped_reason = None
+                    if action_level in [1, 2] and candidate_script_id:
+                        try:
+                            script_doc = await db["scripts"].find_one({"_id": ObjectId(candidate_script_id)})
+                        except Exception:
+                            script_doc = None
+                        if not script_doc:
+                            skipped_reason = "script_missing"
+                        elif not script_doc.get("enabled", True):
+                            skipped_reason = "script_disabled"
 
-                    executed_fix = False
-
-                    # Build alert payload for notifications
                     alert_payload = AlertPayload(
-                        incident_id="",  # Will be set after insert
-                        server_id=str(log["server_id"]),
+                        incident_id="",
+                        server_id=server_id_str,
                         server_hostname=server.get("hostname", server.get("ip_address", "unknown")),
                         server_ip=server.get("ip_address", "unknown"),
                         rule_name=rule["name"],
                         severity=rule["severity"],
                         description=f"Detected: {rule['name']}",
                         context=extracted_context,
-                        detected_at=datetime.now(timezone.utc),
+                        detected_at=now,
                         action_level=action_level,
                     )
 
-                    # If Level 1 (Auto) or Level 2 (Fix+Alert) AND we have a script
-                    if action_level in [1, 2] and remediation_script_id:
+                    if action_level in [1, 2] and candidate_script_id and not skipped_reason:
+                        # Run remediation — incident enters VERIFYING state.
+                        # If the rule re-fires within VERIFICATION_WINDOW_MINUTES, the
+                        # background job_verify_remediation will not auto-resolve and the
+                        # next analyze_logs() call will retry/escalate via the branch above.
                         print(f"⚙️ Triggering Automation for Rule: {rule['name']}")
 
-                        inc_result = await db["incidents"].insert_one(incident.model_dump())
+                        incident_data = incident.model_dump()
+                        incident_data["status"] = IncidentStatus.VERIFYING.value
+                        incident_data["remediation_attempts"] = 1
+                        incident_data["last_remediation_at"] = now
+                        incident_data["verification_until"] = now + timedelta(minutes=VERIFICATION_WINDOW_MINUTES)
+                        inc_result = await db["incidents"].insert_one(incident_data)
                         incident_id = str(inc_result.inserted_id)
 
                         event_bus.emit("incidents", "incident.created", {
                             "incident_id": incident_id,
-                            "server_id": str(log["server_id"]),
+                            "server_id": server_id_str,
                             "severity": rule["severity"],
                             "rule_name": rule["name"],
                             "action_level": action_level,
                         })
-                        event_bus.emit("dashboard.summary", "incident.created", {
-                            "incident_id": incident_id,
-                        })
+                        event_bus.emit("dashboard.summary", "incident.created", {"incident_id": incident_id})
 
                         success = await self.automation_service.execute_remediation(
-                            server_id=str(log["server_id"]),
-                            script_id=remediation_script_id,
+                            server_id=server_id_str,
+                            script_id=candidate_script_id,
                             incident_id=incident_id,
-                            variables=extracted_context
+                            variables=extracted_context,
                         )
 
-                        if success and action_level == 1:
+                        # Hard execution failure (exit != 0) — drop verification, surface as OPEN.
+                        if not success:
                             await db["incidents"].update_one(
                                 {"_id": inc_result.inserted_id},
-                                {
-                                    "$set": {
-                                        "status": IncidentStatus.RESOLVED,
-                                        "description": incident.description + " (Auto-Resolved)",
-                                    }
-                                },
+                                {"$set": {
+                                    "status": IncidentStatus.OPEN.value,
+                                    "verification_until": None,
+                                }},
                             )
-                            executed_fix = True
-                            event_bus.emit("incidents", "incident.resolved", {
-                                "incident_id": incident_id,
-                                "server_id": str(log["server_id"]),
-                            })
-                            event_bus.emit("dashboard.summary", "incident.resolved", {
-                                "incident_id": incident_id,
-                            })
 
-                        # Level 2: Send notification after remediation
                         if action_level == 2:
                             alert_payload.incident_id = incident_id
                             alert_payload.remediation_status = "executed" if success else "failed"
                             await self.notification_service.send_alert(alert_payload)
 
+                    elif action_level in [1, 2] and skipped_reason:
+                        # Script disabled/missing — degrade to alert-only.
+                        incident_data = incident.model_dump()
+                        incident_data["automation_skipped_reason"] = skipped_reason
+                        inc_result = await db["incidents"].insert_one(incident_data)
+                        incident_id = str(inc_result.inserted_id)
+                        print(f"⚠️ Automation skipped ({skipped_reason}) for rule: {rule['name']}")
+                        event_bus.emit("incidents", "incident.created", {
+                            "incident_id": incident_id,
+                            "server_id": server_id_str,
+                            "severity": rule["severity"],
+                            "rule_name": rule["name"],
+                            "action_level": 3,
+                        })
+                        event_bus.emit("dashboard.summary", "incident.created", {"incident_id": incident_id})
+                        alert_payload.incident_id = incident_id
+                        alert_payload.remediation_status = "skipped"
+                        await self.notification_service.send_alert(alert_payload)
+
                     else:
+                        # L3 (alert-only) or no script linked
                         new_incidents.append(incident.model_dump())
 
         # 4. Bulk Save (for incidents that didn't run automation)
@@ -239,15 +386,14 @@ class AnalysisService:
                 )
                 await self.notification_service.send_alert(alert_payload)
 
-    async def seed_default_rules(self):
+    # seed_default_rules removed — use `python seed.py` to populate defaults.
+    async def _seed_default_rules_removed(self):
         """
-        Creates basic rules so the system isn't empty.
-        Run this once on startup.
-        Dynamically links scripts by name (scripts must be seeded first).
+        Ensures default rules exist. Safe to call on every startup — only
+        inserts rules whose name is not already in the collection, so
+        user-created or user-modified rules are never overwritten.
         """
         db = get_database()
-        if await db["rules"].count_documents({}) > 0:
-            return
 
         # --- Build a name→id lookup from seeded scripts ---
         scripts = await db["scripts"].find().to_list(length=100)
@@ -400,13 +546,25 @@ class AnalysisService:
             },
         ]
 
-        # --- Resolve script names to IDs ---
+        # --- Resolve script names to IDs and stamp timestamps ---
+        now = datetime.now(timezone.utc)
         for rule in default_rules:
             script_name = rule.pop("remediation_script_name", None)
             if script_name and script_name in script_lookup:
                 rule["remediation_script_id"] = script_lookup[script_name]
+            rule.setdefault("created_at", now)
+            rule.setdefault("updated_at", None)
 
-        await db["rules"].insert_many(default_rules)
-        
-        linked_count = sum(1 for r in default_rules if r.get("remediation_script_id"))
-        print(f"🌱 Default Rules Seeded ({len(default_rules)} rules, {linked_count} linked to scripts)")
+        # Only insert rules that don't already exist by name
+        existing_names = {
+            r["name"]
+            for r in await db["rules"].find({}, projection={"name": 1}).to_list(length=1000)
+        }
+        missing = [r for r in default_rules if r["name"] not in existing_names]
+
+        if missing:
+            await db["rules"].insert_many(missing)
+            linked_count = sum(1 for r in missing if r.get("remediation_script_id"))
+            print(f"🌱 Seeded {len(missing)} missing rule(s) ({linked_count} linked to scripts)")
+        else:
+            print(f"✅ Rules up-to-date ({len(existing_names)} rules in DB)")

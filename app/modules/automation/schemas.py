@@ -16,9 +16,9 @@ class ScriptBase(BaseModel):
     description: Optional[str] = None
     language: ScriptLanguage = ScriptLanguage.BASH
     content: str = Field(..., description="The actual code to execute")
-    
-    # Security: whitelist specific OS types?
-    target_os: Optional[str] = "linux" 
+    target_os: Optional[str] = "linux"
+    category: Optional[str] = "recovery"   # diagnostic | containment | recovery
+    enabled: bool = True                    # disabled scripts degrade rule to alert-only
 
 class ScriptCreate(ScriptBase):
     pass

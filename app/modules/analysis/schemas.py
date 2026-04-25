@@ -33,6 +33,10 @@ class DetectionRule(BaseModel):
     tags: List[str] = []
 
     remediation_script_id: Optional[str] = None
+    remediation_script_id_windows: Optional[str] = None  # Windows override for cross-OS rules
+
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: Optional[datetime] = None
 
 class DetectionRuleInDB(DetectionRule):
     id: str = Field(alias="_id")

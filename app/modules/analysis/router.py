@@ -60,8 +60,12 @@ async def get_rule(rule_id: str):
 
 @router.post("/rules")
 async def create_rule(rule: DetectionRule):
+    from datetime import datetime, timezone
     db = get_database()
     rule_data = rule.model_dump()
+    now = datetime.now(timezone.utc)
+    rule_data["created_at"] = now
+    rule_data["updated_at"] = None
     result = await db["rules"].insert_one(rule_data)
     event_bus.emit("rules", "rule.created", {"rule_id": str(result.inserted_id)})
     return {"status": "success", "id": str(result.inserted_id)}
@@ -78,9 +82,11 @@ async def update_rule(rule_id: str, updates: dict):
     if not existing:
         raise HTTPException(status_code=404, detail="Rule not found")
 
+    from datetime import datetime, timezone
     allowed = {"name", "pattern", "severity", "action_level", "description",
                "enabled", "os_type", "tags", "remediation_script_id"}
     update_data = {k: v for k, v in updates.items() if k in allowed}
+    update_data["updated_at"] = datetime.now(timezone.utc)
 
     await db["rules"].update_one({"_id": oid}, {"$set": update_data})
 

@@ -32,4 +32,8 @@ class AlertPayload(BaseModel):
     context: dict = {}
     detected_at: datetime = None
     action_level: int = 3
-    remediation_status: Optional[str] = None  # "executed", "failed", or None
+    remediation_status: Optional[str] = None  # "executed", "failed", "exhausted", or None
+    # When True, formatting layer should mark the email as a louder escalation
+    # (auto-remediation has been attempted MAX times without resolving the issue).
+    is_escalation: bool = False
+    remediation_attempts: int = 0

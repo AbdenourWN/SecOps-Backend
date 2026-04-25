@@ -133,7 +133,9 @@ class EmailChannel(BaseChannel):
         try:
             # Build the email
             msg = MIMEMultipart("alternative")
-            msg["Subject"] = f"[SecOps {payload.severity.upper()}] {payload.rule_name} — {payload.server_hostname}"
+            subject_prefix = "[SecOps ESCALATION] " if payload.is_escalation else f"[SecOps {payload.severity.upper()}] "
+            esc_suffix = f" — auto-remediation failed {payload.remediation_attempts}x" if payload.is_escalation else ""
+            msg["Subject"] = f"{subject_prefix}{payload.rule_name} — {payload.server_hostname}{esc_suffix}"
             msg["From"] = self.from_email
             msg["To"] = ", ".join(recipients)
 

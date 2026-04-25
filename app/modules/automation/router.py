@@ -108,13 +108,35 @@ async def update_script(script_id: str, updates: dict):
     if not existing:
         raise HTTPException(status_code=404, detail="Script not found")
 
-    allowed = {"name", "description", "language", "content", "target_os"}
+    allowed = {"name", "description", "language", "content", "target_os", "category", "enabled"}
     update_data = {k: v for k, v in updates.items() if k in allowed}
     update_data["updated_at"] = datetime.now(timezone.utc)
 
     await db["scripts"].update_one({"_id": oid}, {"$set": update_data})
     event_bus.emit("scripts", "script.updated", {"script_id": str(oid)})
     return {"status": "success", "message": "Script updated"}
+
+
+@router.patch("/scripts/{script_id}/toggle")
+async def toggle_script_enabled(script_id: str):
+    """Toggle a script's enabled state. Disabled scripts degrade linked rules to alert-only."""
+    db = get_database()
+    try:
+        oid = ObjectId(script_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID")
+
+    script = await db["scripts"].find_one({"_id": oid}, {"enabled": 1})
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+
+    new_state = not script.get("enabled", True)
+    await db["scripts"].update_one(
+        {"_id": oid},
+        {"$set": {"enabled": new_state, "updated_at": datetime.now(timezone.utc)}},
+    )
+    event_bus.emit("scripts", "script.updated", {"script_id": str(oid), "enabled": new_state})
+    return {"status": "success", "enabled": new_state}
 
 @router.delete("/scripts/{script_id}")
 async def delete_script(script_id: str):

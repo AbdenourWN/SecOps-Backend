@@ -125,6 +125,54 @@ async def job_collect_telemetry():
 
 
 # ---------------------------------------------------------------------------
+# Job: verify remediation — auto-resolve VERIFYING incidents whose window expired
+# ---------------------------------------------------------------------------
+
+async def job_verify_remediation():
+    """
+    For every incident in `verifying` state whose `verification_until` is in the past,
+    promote to `resolved` (auto). If the underlying problem had recurred, the analysis
+    service would have flipped it back to verifying with an incremented attempt count
+    or escalated it; reaching this point means the rule didn't fire again — the fix
+    held.
+    """
+    try:
+        db = get_database()
+        now = datetime.now(timezone.utc)
+        cursor = db["incidents"].find({
+            "status": "verifying",
+            "verification_until": {"$lt": now},
+        })
+        to_resolve = await cursor.to_list(length=500)
+        if not to_resolve:
+            return
+
+        for inc in to_resolve:
+            await db["incidents"].update_one(
+                {"_id": inc["_id"]},
+                {"$set": {
+                    "status": "resolved",
+                    "auto_resolved_at": now,
+                    "resolved_at": now,
+                    "description": inc.get("description", "") + " (Auto-Resolved)",
+                }},
+            )
+            event_bus.emit("incidents", "incident.resolved", {
+                "incident_id": str(inc["_id"]),
+                "server_id": inc.get("server_id"),
+                "auto": True,
+            })
+            event_bus.emit("dashboard.summary", "incident.resolved", {
+                "incident_id": str(inc["_id"]),
+            })
+
+        logger.info("[scheduler] auto-resolved %d verified incident(s)", len(to_resolve))
+
+    except Exception as e:
+        logger.error("job_verify_remediation failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Job: file watcher — kept separate (per-source iteration, uses pool internally)
 # ---------------------------------------------------------------------------
 
@@ -179,11 +227,18 @@ def start_scheduler():
         job_file_watcher, "interval", seconds=60,
         next_run_time=_at(45), **_job_kwargs,
     )
+    # Auto-resolve VERIFYING incidents whose verification window has elapsed
+    # without the rule re-firing. Runs every 60 s, offset to land between the
+    # other jobs.
+    scheduler.add_job(
+        job_verify_remediation, "interval", seconds=60,
+        next_run_time=_at(30), **_job_kwargs,
+    )
 
     scheduler.start()
     logger.info(
-        "scheduler started (max_concurrent=%d, coalesce=True, staggered offsets 0/15/45s)",
+        "scheduler started (max_concurrent=%d, coalesce=True, staggered offsets 0/15/30/45s)",
         settings.MAX_CONCURRENT_SERVERS,
     )
-    print(f"⏰ Scheduler started — health@+0s, telemetry@+15s, file_watcher@+45s "
+    print(f"⏰ Scheduler started — health@+0s, telemetry@+15s, verify@+30s, file_watcher@+45s "
           f"(max {settings.MAX_CONCURRENT_SERVERS} concurrent)")
