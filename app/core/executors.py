@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 # How recently the connection was used before we skip the liveness probe (seconds)
 _LIVENESS_SKIP_WINDOW_S = 10.0
 
+# Timeout constants used by run_command and all callers.
+DEFAULT_COMMAND_TIMEOUT_S = 60
+MAX_COMMAND_TIMEOUT_S = 300
+
 
 # ---------------------------------------------------------------------------
 # Streaming primitives
@@ -65,13 +69,20 @@ class BaseExecutor(ABC):
     ) -> AsyncIterator[Chunk | ChunkDone]:
         """Yield Chunk items then a single ChunkDone."""
 
-    async def run_command(self, command: str) -> Dict[str, Any]:
-        """Buffered wrapper — used by scheduler helpers and HTTP health paths."""
+    async def run_command(
+        self, command: str, timeout_s: int = DEFAULT_COMMAND_TIMEOUT_S
+    ) -> Dict[str, Any]:
+        """Buffered wrapper — used by scheduler helpers and HTTP health paths.
+
+        Timeout is enforced inside the executor's stream_command(), which kills
+        the remote process when the deadline is reached. No outer asyncio.wait_for
+        needed — callers should pass timeout_s here instead.
+        """
         abort = asyncio.Event()
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         done: ChunkDone | None = None
-        async for item in self.stream_command(command, abort):
+        async for item in self.stream_command(command, abort, timeout_s):
             if isinstance(item, Chunk):
                 if item.stream == "stdout":
                     stdout_parts.append(item.data)
@@ -320,14 +331,27 @@ class LinuxExecutor(BaseExecutor):
                 return
 
     async def check_health(self) -> bool:
-        """Direct TCP ping — independent of the pooled connection."""
+        """SSH banner-grab — independent of the pooled connection.
+
+        TCP-only "is the port open" isn't enough: a half-broken sshd or a stale
+        port-forward will accept the connection but never serve. A real sshd
+        sends `SSH-2.0-...` within ~100ms of accept; if we don't see that, the
+        service isn't actually usable.
+        """
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.ip, self.port), timeout=3
             )
-            writer.close()
-            await writer.wait_closed()
-            return True
+            try:
+                banner = await asyncio.wait_for(reader.readline(), timeout=2)
+                ok = banner.startswith(b"SSH-")
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            return ok
         except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
             return False
 
@@ -459,12 +483,14 @@ class WindowsExecutor(BaseExecutor):
             # command sequences causes SpnegoError (Invalid MIC).
             self._protocol = None
 
-    async def run_command(self, command: str) -> dict:
+    async def run_command(
+        self, command: str, timeout_s: int = DEFAULT_COMMAND_TIMEOUT_S
+    ) -> dict:
         abort = asyncio.Event()
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         done: ChunkDone | None = None
-        async for item in self.stream_command(command, abort):
+        async for item in self.stream_command(command, abort, timeout_s):
             if isinstance(item, Chunk):
                 if item.stream == "stdout":
                     stdout_parts.append(item.data)
@@ -488,13 +514,36 @@ class WindowsExecutor(BaseExecutor):
         return {"status": "failed", "output": out, "error": err or "Command failed"}
 
     async def check_health(self) -> bool:
+        """WinRM HTTP probe — independent of the pooled connection.
+
+        WinRM speaks HTTP. A bare TCP connect succeeds even if the WinRM
+        service is uninstalled and another process has bound the port. Sending
+        `HEAD /wsman` and checking for any HTTP-shaped reply (200/401/405 are
+        all fine — they prove the service is alive) catches that case.
+
+        Note: this assumes WinRM-over-HTTP. WinRM-over-HTTPS (port 5986) needs
+        a TLS handshake — `asyncio.open_connection(ssl=...)` — which we'll add
+        if/when HTTPS support lands.
+        """
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.ip, self.port), timeout=3
             )
-            writer.close()
-            await writer.wait_closed()
-            return True
+            try:
+                writer.write(
+                    b"HEAD /wsman HTTP/1.1\r\nHost: " + self.ip.encode()
+                    + b"\r\nConnection: close\r\n\r\n"
+                )
+                await writer.drain()
+                line = await asyncio.wait_for(reader.readline(), timeout=2)
+                ok = line.startswith(b"HTTP/")
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            return ok
         except Exception:
             return False
 

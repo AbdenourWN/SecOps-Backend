@@ -1,5 +1,5 @@
 from app.core.database import get_database
-from app.core.executors import get_server_executor
+from app.core.executors import get_server_executor, DEFAULT_COMMAND_TIMEOUT_S
 from app.core.security import decrypt_password
 from bson import ObjectId
 from datetime import datetime, timezone
@@ -204,7 +204,7 @@ class SimulationService:
                 sc_result = {"name": sc["name"], "triggers_rule": sc["triggers_rule"], "commands_run": 0, "errors": []}
 
                 for cmd in sc["commands"]:
-                    result = await executor.run_command(cmd)
+                    result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
                     if result["status"] == "success":
                         sc_result["commands_run"] += 1
                     else:
@@ -279,7 +279,7 @@ class SimulationService:
                 continue
 
             # Write the file
-            write_result = await executor.run_command(cmd)
+            write_result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
 
             if write_result["status"] == "failed":
                 results.append({

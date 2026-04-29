@@ -1,0 +1,70 @@
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+
+from app.modules.anomalies.schemas import LogObservationListResponse
+from app.modules.anomalies.service import AnomaliesService
+
+router = APIRouter()
+service = AnomaliesService()
+
+
+@router.get("/stats")
+async def get_anomaly_stats():
+    """
+    Dashboard aggregate: total / pending / dismissed / promoted counts.
+    Must be above /{observation_id}.
+    """
+    return await service.stats()
+
+
+@router.get("/", response_model=LogObservationListResponse)
+async def list_observations(
+    server_id: Optional[str] = Query(None, description="Filter by server"),
+    status: Optional[str] = Query(None, description="pending_review | dismissed | promoted_to_incident | all"),
+    severity: Optional[str] = Query(None, description="low | medium | high | all"),
+    type: Optional[str] = Query(None, description="log | volume | all"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+):
+    """List anomaly observations, newest first."""
+    return await service.list(
+        page=page,
+        page_size=page_size,
+        server_id=server_id,
+        status=status,
+        severity=severity,
+        type_=type,
+    )
+
+
+@router.patch("/{observation_id}/dismiss")
+async def dismiss_observation(observation_id: str):
+    """Mark a pending observation as dismissed (false positive / not interesting)."""
+    ok = await service.dismiss(observation_id)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail="Observation not found or already reviewed",
+        )
+    return {"status": "dismissed", "observation_id": observation_id}
+
+
+@router.post("/{observation_id}/promote")
+async def promote_observation(observation_id: str):
+    """
+    Promote a pending observation to a real incident. The observation
+    transitions to PROMOTED_TO_INCIDENT and a new incident is created with
+    rule_id="anomaly:promoted".
+    """
+    incident_id = await service.promote_to_incident(observation_id)
+    if not incident_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Observation not found, already reviewed, or invalid id",
+        )
+    return {
+        "status": "promoted",
+        "observation_id": observation_id,
+        "incident_id": incident_id,
+    }

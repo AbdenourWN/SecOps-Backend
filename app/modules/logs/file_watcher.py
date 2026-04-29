@@ -1,6 +1,8 @@
 import asyncio
+import shlex
 import uuid
 from app.core.database import get_database
+from app.core.executors import DEFAULT_COMMAND_TIMEOUT_S
 from app.core.elasticsearch import get_elasticsearch
 from app.core.events import event_bus
 from app.modules.logs.schemas import LogLevel
@@ -12,6 +14,25 @@ from app.modules.analysis.service import AnalysisService
 
 def _get_log_index_name():
     return f"secops-logs-{datetime.now(timezone.utc).strftime('%Y.%m')}"
+
+
+def _q_linux(path: str) -> str:
+    """Shell-quote a path for safe embedding in a bash command string."""
+    return shlex.quote(path)
+
+
+def _q_windows(path: str) -> str:
+    """Quote a path for safe embedding in a PowerShell double-quoted string.
+
+    PowerShell uses backtick as the escape character inside double-quoted
+    strings. We escape backtick first, then double-quote and dollar sign to
+    prevent variable expansion. The result is wrapped in double-quotes so
+    that single-quotes in the path are treated as literals.
+    """
+    path = path.replace('`', '``')   # backtick → ``
+    path = path.replace('"', '`"')   # double-quote → `"
+    path = path.replace('$', '`$')   # dollar sign → `$ (no variable expansion)
+    return f'"{path}"'
 
 
 class FileWatcherService:
@@ -28,10 +49,16 @@ class FileWatcherService:
         new_source["created_at"] = datetime.now(timezone.utc)
 
         result = await db["log_sources"].insert_one(new_source)
+        _sid = new_source.get("server_id")
         event_bus.emit("log.sources", "log_source.created", {
             "source_id": str(result.inserted_id),
-            "server_id": new_source.get("server_id"),
+            "server_id": _sid,
         })
+        if _sid:
+            event_bus.emit(f"servers.{_sid}.log_sources", "log_source.created", {  # deprecated: remove when RBAC lands
+                "source_id": str(result.inserted_id),
+                "server_id": _sid,
+            })
         return str(result.inserted_id)
 
     async def get_all_sources(self):
@@ -79,9 +106,16 @@ class FileWatcherService:
             clean["last_header"] = None
             clean["error_count"] = 0
 
+        # Fetch server_id before update for per-server topic emit
+        src = await db["log_sources"].find_one({"_id": oid}, {"server_id": 1})
         result = await db["log_sources"].update_one({"_id": oid}, {"$set": clean})
         if result.matched_count > 0:
             event_bus.emit("log.sources", "log_source.updated", {"source_id": str(oid)})
+            _sid = src.get("server_id") if src else None
+            if _sid:
+                event_bus.emit(f"servers.{_sid}.log_sources", "log_source.updated", {  # deprecated: remove when RBAC lands
+                    "source_id": str(oid), "server_id": _sid,
+                })
         return result.matched_count > 0
 
     async def delete_source(self, source_id: str) -> bool:
@@ -90,9 +124,16 @@ class FileWatcherService:
             oid = ObjectId(source_id)
         except Exception:
             return False
+        # Fetch server_id before delete for per-server topic emit
+        src = await db["log_sources"].find_one({"_id": oid}, {"server_id": 1})
         result = await db["log_sources"].delete_one({"_id": oid})
         if result.deleted_count > 0:
             event_bus.emit("log.sources", "log_source.deleted", {"source_id": str(oid)})
+            _sid = src.get("server_id") if src else None
+            if _sid:
+                event_bus.emit(f"servers.{_sid}.log_sources", "log_source.deleted", {  # deprecated: remove when RBAC lands
+                    "source_id": str(oid), "server_id": _sid,
+                })
         return result.deleted_count > 0
 
     # =========================================================================
@@ -133,10 +174,11 @@ class FileWatcherService:
         source_id = source_doc["_id"]
 
         # 1. Check Metadata (Size, Inode, Fingerprint)
+        qp = _q_linux(file_path)
         chk_cmd = (
-            f"stat -c '%s %i' {file_path}; echo '---SPLIT---'; head -c 50 {file_path}"
+            f"stat -c '%s %i' {qp}; echo '---SPLIT---'; head -c 50 {qp}"
         )
-        chk_result = await executor.run_command(chk_cmd)
+        chk_result = await executor.run_command(chk_cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
 
         if chk_result["status"] == "failed":
             await self._handle_file_error(source_id, error_count, file_path, db)
@@ -178,9 +220,9 @@ class FileWatcherService:
             limit = " -c 1000000"
 
         # Tail command logic
-        cmd = f"tail -c +{read_start + 1}{limit} {file_path}"
+        cmd = f"tail -c +{read_start + 1}{limit} {_q_linux(file_path)}"
 
-        read_result = await executor.run_command(cmd)
+        read_result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
         if read_result["status"] == "success":
             await self._save_logs(read_result["output"], source_doc, db, server)
             await db["log_sources"].update_one(
@@ -204,10 +246,14 @@ class FileWatcherService:
         source_id = source_doc["_id"]
 
         # 1. Check Metadata
-        # We use Get-Item for Size/Time and Get-Content for Header
-        ps_check = f" $f = Get-Item '{file_path}' -ErrorAction SilentlyContinue; if (!$f) {{ Write-Output 'MISSING' }} else {{ $header = Get-Content '{file_path}' -TotalCount 1 -Encoding UTF8; if ($header -and $header.Length -gt 50) {{ $header = $header.Substring(0,50) }}; Write-Output ($f.Length.ToString() + '|' + $f.CreationTimeUtc.Ticks.ToString() + '|' + $header) }}"
+        # We use Get-Item for Size/Time and Get-Content for Header.
+        # _q_windows() wraps the path in double-quotes with PS backtick-escaping
+        # so single-quotes, dollar signs, and backticks in the path are safe.
+        # -LiteralPath prevents PS from treating [ ] * ? as glob wildcards.
+        qp = _q_windows(file_path)
+        ps_check = f" $f = Get-Item -LiteralPath {qp} -ErrorAction SilentlyContinue; if (!$f) {{ Write-Output 'MISSING' }} else {{ $header = Get-Content -LiteralPath {qp} -TotalCount 1 -Encoding UTF8; if ($header -and $header.Length -gt 50) {{ $header = $header.Substring(0,50) }}; Write-Output ($f.Length.ToString() + '|' + $f.CreationTimeUtc.Ticks.ToString() + '|' + $header) }}"
 
-        chk_result = await executor.run_command(ps_check)
+        chk_result = await executor.run_command(ps_check, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
 
         if chk_result["status"] == "failed" or "MISSING" in chk_result.get(
             "output", ""
@@ -246,9 +292,9 @@ class FileWatcherService:
         if read_len > 1024 * 1024:
             read_len = 1024 * 1024  # Cap 1MB
 
-        ps_read = f" $path = '{file_path}'; $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite); $null = $stream.Seek({read_start}, [System.IO.SeekOrigin]::Begin); $buffer = New-Object byte[] {read_len}; $bytesRead = $stream.Read($buffer, 0, {read_len}); $stream.Close(); [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)"
+        ps_read = f" $path = {_q_windows(file_path)}; $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite); $null = $stream.Seek({read_start}, [System.IO.SeekOrigin]::Begin); $buffer = New-Object byte[] {read_len}; $bytesRead = $stream.Read($buffer, 0, {read_len}); $stream.Close(); [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)"
 
-        read_result = await executor.run_command(ps_read)
+        read_result = await executor.run_command(ps_read, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
         if read_result["status"] == "success":
             await self._save_logs(read_result["output"], source_doc, db, server)
 
@@ -359,7 +405,7 @@ class FileWatcherService:
                 print(f"⚠️ ES bulk index error (file_watcher): {e}")
 
         await AnalysisService().analyze_logs(new_logs)
-        event_bus.emit("servers.logs", "logs.ingested", {
+        event_bus.emit(f"servers.{server_id}.logs", "logs.ingested", {
             "server_id": server_id,
             "source_id": str(source_doc.get("_id", "")),
             "count": len(new_logs),

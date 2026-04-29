@@ -8,6 +8,8 @@ from bson import ObjectId
 from app.modules.automation.service import AutomationService
 from app.modules.notifications.service import NotificationService
 from app.modules.notifications.schemas import AlertPayload
+from app.modules.heuristics.service import HeuristicService
+from app.modules.anomalies.service import AnomaliesService
 from app.core.events import event_bus
 
 # ========================================================================
@@ -68,6 +70,8 @@ class AnalysisService:
     def __init__(self):
         self.automation_service = AutomationService()
         self.notification_service = NotificationService()
+        self.heuristic_service = HeuristicService()
+        self.anomalies_service = AnomaliesService()
 
     async def analyze_logs(self, logs: list[dict]):
         """
@@ -102,18 +106,25 @@ class AnalysisService:
             return
 
         new_incidents = []
+        # Tracks (server_id, rule_id) pairs already queued in this batch so
+        # identical L3 rule hits on subsequent log lines don't produce duplicates
+        # before the bulk insert runs. L1/L2 are inserted inline and are already
+        # covered by the DB dedup query.
+        _batch_l3_keys: set[tuple[str, str]] = set()
 
         # 3. The Matching Loop
         for log in logs:
             log_msg = log.get("message") or ""
+            matched_any = False  # tracked for Tier 2 heuristic fallback
 
             for rule_obj in active_rules:
                 rule = rule_obj["data"]
                 pattern = rule_obj["compiled_pattern"]
 
                 match = pattern.search(log_msg)
-                
+
                 if match:
+                    matched_any = True
                     # Extract named capture groups; always inject server metadata
                     extracted_context = match.groupdict() or {"raw_match": match.group(0)}
                     extracted_context.setdefault("hostname", server.get("hostname", ""))
@@ -197,6 +208,11 @@ class AnalysisService:
                                     "server_id": server_id_str,
                                     "reason": "remediation_exhausted",
                                 })
+                                event_bus.emit(f"servers.{server_id_str}.incidents", "incident.updated", {  # deprecated: remove when RBAC lands
+                                    "incident_id": str(existing_id),
+                                    "server_id": server_id_str,
+                                    "reason": "remediation_exhausted",
+                                })
                                 escalation_payload = AlertPayload(
                                     incident_id=str(existing_id),
                                     server_id=server_id_str,
@@ -226,6 +242,12 @@ class AnalysisService:
                                 }},
                             )
                             event_bus.emit("incidents", "incident.updated", {
+                                "incident_id": str(existing_id),
+                                "server_id": server_id_str,
+                                "reason": "remediation_retry",
+                                "attempt": attempts,
+                            })
+                            event_bus.emit(f"servers.{server_id_str}.incidents", "incident.updated", {  # deprecated: remove when RBAC lands
                                 "incident_id": str(existing_id),
                                 "server_id": server_id_str,
                                 "reason": "remediation_retry",
@@ -305,6 +327,13 @@ class AnalysisService:
                             "rule_name": rule["name"],
                             "action_level": action_level,
                         })
+                        event_bus.emit(f"servers.{server_id_str}.incidents", "incident.created", {  # deprecated: remove when RBAC lands
+                            "incident_id": incident_id,
+                            "server_id": server_id_str,
+                            "severity": rule["severity"],
+                            "rule_name": rule["name"],
+                            "action_level": action_level,
+                        })
                         event_bus.emit("dashboard.summary", "incident.created", {"incident_id": incident_id})
 
                         success = await self.automation_service.execute_remediation(
@@ -324,10 +353,10 @@ class AnalysisService:
                                 }},
                             )
 
-                        if action_level == 2:
-                            alert_payload.incident_id = incident_id
-                            alert_payload.remediation_status = "executed" if success else "failed"
-                            await self.notification_service.send_alert(alert_payload)
+                        # Alert on all action levels, success or failure.
+                        alert_payload.incident_id = incident_id
+                        alert_payload.remediation_status = "executed" if success else "failed"
+                        await self.notification_service.send_alert(alert_payload)
 
                     elif action_level in [1, 2] and skipped_reason:
                         # Script disabled/missing — degrade to alert-only.
@@ -343,14 +372,38 @@ class AnalysisService:
                             "rule_name": rule["name"],
                             "action_level": 3,
                         })
+                        event_bus.emit(f"servers.{server_id_str}.incidents", "incident.created", {  # deprecated: remove when RBAC lands
+                            "incident_id": incident_id,
+                            "server_id": server_id_str,
+                            "severity": rule["severity"],
+                            "rule_name": rule["name"],
+                            "action_level": 3,
+                        })
                         event_bus.emit("dashboard.summary", "incident.created", {"incident_id": incident_id})
                         alert_payload.incident_id = incident_id
                         alert_payload.remediation_status = "skipped"
                         await self.notification_service.send_alert(alert_payload)
 
                     else:
-                        # L3 (alert-only) or no script linked
-                        new_incidents.append(incident.model_dump())
+                        # L3 (alert-only) or no script linked.
+                        # Same-batch dedup: skip if this (server, rule) pair was
+                        # already queued earlier in this analyze_logs() call.
+                        dedup_key = (server_id_str, rule_id_str)
+                        if dedup_key not in _batch_l3_keys:
+                            _batch_l3_keys.add(dedup_key)
+                            new_incidents.append(incident.model_dump())
+
+            # ── Tier 2: heuristic fallback for logs that no rule matched ──
+            if not matched_any:
+                try:
+                    flags = await self.heuristic_service.evaluate(log, server)
+                    if flags:
+                        await self.anomalies_service.record_log_observation(
+                            log=log, server=server, flags=flags
+                        )
+                except Exception as e:
+                    # Heuristics must never break detection — log and move on
+                    print(f"⚠️ Heuristic evaluation failed: {e}")
 
         # 4. Bulk Save (for incidents that didn't run automation)
         if new_incidents:
@@ -358,9 +411,17 @@ class AnalysisService:
             print(f"💾 Saved {len(new_incidents)} new incidents.")
 
             for i, inc_data in enumerate(new_incidents):
+                _sid = inc_data["server_id"]
                 event_bus.emit("incidents", "incident.created", {
                     "incident_id": str(inc_results.inserted_ids[i]),
-                    "server_id": inc_data["server_id"],
+                    "server_id": _sid,
+                    "severity": inc_data.get("severity"),
+                    "rule_name": inc_data["description"].replace("Detected: ", ""),
+                    "action_level": 3,
+                })
+                event_bus.emit(f"servers.{_sid}.incidents", "incident.created", {  # deprecated: remove when RBAC lands
+                    "incident_id": str(inc_results.inserted_ids[i]),
+                    "server_id": _sid,
                     "severity": inc_data.get("severity"),
                     "rule_name": inc_data["description"].replace("Detected: ", ""),
                     "action_level": 3,

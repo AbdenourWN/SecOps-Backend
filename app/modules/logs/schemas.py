@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Any, Dict
 from datetime import datetime, timezone
 from enum import Enum
@@ -28,17 +28,46 @@ class LogSource(BaseModel):
     class Config:
         populate_by_name = True
 
+def _validate_file_path(v: str) -> str:
+    if not v or not v.strip():
+        raise ValueError("file_path cannot be empty")
+    if len(v) > 512:
+        raise ValueError("file_path too long (max 512 chars)")
+    # Null bytes and newlines never appear in real paths and would break
+    # the multi-line shell/PowerShell command strings we build at runtime.
+    if any(c in v for c in ('\x00', '\r', '\n')):
+        raise ValueError("file_path contains invalid characters (null byte or newline)")
+    # Reject path traversal components.
+    parts = v.replace('\\', '/').split('/')
+    if '..' in parts:
+        raise ValueError("file_path must not contain '..' path traversal")
+    return v
+
+
 class LogSourceCreate(BaseModel):
     server_id: str
     name: str
     file_path: str
     parser_type: LogParserType = LogParserType.RAW
 
+    @field_validator("file_path")
+    @classmethod
+    def validate_file_path(cls, v: str) -> str:
+        return _validate_file_path(v)
+
+
 class LogSourceUpdate(BaseModel):
     name: Optional[str] = None
     file_path: Optional[str] = None
     parser_type: Optional[LogParserType] = None
     is_active: Optional[bool] = None
+
+    @field_validator("file_path")
+    @classmethod
+    def validate_file_path(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_file_path(v)
 
 class LogSourceInDB(LogSource):
     id: str = Field(alias="_id")

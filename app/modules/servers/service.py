@@ -6,7 +6,7 @@ from app.core.database import get_database
 from app.modules.servers.schemas import ServerCreate, ServerInDB, CredentialInDB, ServerUpdate, ServerDelete, ServerStatus
 from app.core.security import encrypt_password, decrypt_password
 from bson import ObjectId
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from app.core.executors import get_server_executor, Chunk, ChunkDone
 # get_server_executor kept for health-check path (direct TCP, no pool)
 from app.core.rate_limit import check_rate_limit
@@ -60,28 +60,75 @@ class ServerService:
         print(f"🕵️  Starting Health Check Cycle...")
 
         sem = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
+        skipped_in_backoff = 0
+        skip_lock = asyncio.Lock()
 
         async def check_one(server):
+            nonlocal skipped_in_backoff
             server_id = str(server["_id"])
             previous_status = server.get("status")
+            now = datetime.now(timezone.utc)
+
+            # Adaptive backoff: persistently-offline hosts move to a longer
+            # cadence (5 min → 15 min → 60 min cap) so we stop hammering dead
+            # boxes every 60s. Online hosts are always checked.
+            next_check = server.get("next_health_check_at")
+            if (
+                next_check is not None
+                and next_check > now
+                and previous_status == ServerStatus.OFFLINE
+            ):
+                async with skip_lock:
+                    skipped_in_backoff += 1
+                return
+
             async with sem:
-                # Health check uses a direct TCP ping — no pooled session needed,
-                # no per-server lock needed (read-only probe, no auth collision).
+                # Health check uses a direct TCP banner-grab — no pooled session
+                # needed, no per-server lock needed (read-only probe, no auth
+                # collision).
                 executor = get_server_executor(server, plain_password="")
                 is_online = await executor.check_health()
                 new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
 
+                if is_online:
+                    update = {
+                        "status": new_status,
+                        "is_online": True,
+                        "last_health_check": now,
+                        "consecutive_offline_checks": 0,
+                        "next_health_check_at": None,
+                    }
+                else:
+                    n = (server.get("consecutive_offline_checks") or 0) + 1
+                    if n < 3:
+                        delay_s = 60
+                    elif n < 10:
+                        delay_s = 5 * 60
+                    elif n < 30:
+                        delay_s = 15 * 60
+                    else:
+                        delay_s = 60 * 60
+                    update = {
+                        "status": new_status,
+                        "is_online": False,
+                        "last_health_check": now,
+                        "consecutive_offline_checks": n,
+                        "next_health_check_at": now + timedelta(seconds=delay_s),
+                    }
+
                 await db["servers"].update_one(
                     {"_id": server["_id"]},
-                    {"$set": {
-                        "status": new_status,
-                        "is_online": is_online,
-                        "last_health_check": datetime.now(timezone.utc),
-                    }},
+                    {"$set": update},
                 )
 
                 if previous_status != new_status:
                     event_bus.emit("servers.status", "server.status_changed", {
+                        "server_id": server_id,
+                        "status": new_status,
+                        "previous_status": previous_status,
+                        "hostname": server.get("hostname"),
+                    })
+                    event_bus.emit(f"servers.{server_id}.status", "server.status_changed", {  # deprecated: remove when RBAC lands
                         "server_id": server_id,
                         "status": new_status,
                         "previous_status": previous_status,
@@ -94,7 +141,11 @@ class ServerService:
 
         tasks = [check_one(server) for server in servers]
         await asyncio.gather(*tasks, return_exceptions=True)
-        print(f"✅ Health Check Complete. Scanned {len(servers)} servers.")
+        scanned = len(servers) - skipped_in_backoff
+        print(
+            f"✅ Health Check Complete. Scanned {scanned}/{len(servers)} servers "
+            f"({skipped_in_backoff} in backoff window)."
+        )
     """ 
     🚀
     CRUD Operations 
@@ -148,8 +199,34 @@ class ServerService:
             credential_id=str(new_cred_id)
         )
 
-        # Save Server to "servers" collection
-        server_result = await db["servers"].insert_one(server_in_db.model_dump())
+        # Save Server to "servers" collection. Stamp the heuristic-Tier-2
+        # initial state inline so the analysis service has sane defaults from
+        # the very first log batch:
+        #   - pattern_warmup_until: user-chosen duration (minutes) during which
+        #     novel patterns are recorded silently. 0 minutes = no warm-up.
+        #   - business_hours: user-supplied if provided, else Mon-Fri 09-18 UTC
+        #   - log_rate_baseline: starts at 0; EMA learns it over the first
+        #     ~10-20 telemetry ticks
+        from datetime import datetime, timezone, timedelta
+        from app.modules.heuristics.service import DEFAULT_BUSINESS_HOURS
+
+        now = datetime.now(timezone.utc)
+        server_doc = server_in_db.model_dump()
+        warmup_min = server_data.warmup_minutes
+        server_doc["pattern_warmup_until"] = (
+            now - timedelta(seconds=1)
+            if warmup_min == 0
+            else now + timedelta(minutes=warmup_min)
+        )
+        server_doc["business_hours"] = (
+            server_data.business_hours.model_dump()
+            if server_data.business_hours is not None
+            else DEFAULT_BUSINESS_HOURS.copy()
+        )
+        server_doc["log_rate_baseline"] = 0.0
+        server_doc["log_rate_updated_at"] = None
+
+        server_result = await db["servers"].insert_one(server_doc)
 
         event_bus.emit("servers", "server.created", {
             "server_id": str(server_result.inserted_id),
@@ -209,13 +286,15 @@ class ServerService:
         # 2. Prepare Data to Update
         server_updates = {}
         if update_data.hostname: server_updates["hostname"] = update_data.hostname
-        if update_data.ip_address: 
+        if update_data.ip_address:
             # Check uniqueness if IP is changing
             dup = await db["servers"].find_one({"ip_address": update_data.ip_address, "_id": {"$ne": oid}})
             if dup: return {"status": "failed", "error": "IP already taken"}
             server_updates["ip_address"] = update_data.ip_address
         if update_data.os_type: server_updates["os_type"] = update_data.os_type
-        if update_data.port: server_updates["port"] = update_data.port 
+        if update_data.port: server_updates["port"] = update_data.port
+        if update_data.business_hours is not None:
+            server_updates["business_hours"] = update_data.business_hours.model_dump()
         
         # 3. Handle Credential Updates (If user wants to set a NEW password)
         if update_data.credential:
@@ -274,7 +353,78 @@ class ServerService:
         event_bus.emit("dashboard.summary", "server.deleted", {"server_id": str(oid)})
 
         return {"status": "success", "message": "Server and associated credentials deleted"}
-    
+
+    # --- Tier 2 anomaly maintenance ---
+
+    async def reset_pattern_warmup(
+        self,
+        server_id: str,
+        warmup_minutes: int = 60,
+        clear_known_patterns: bool = True,
+    ):
+        """
+        Restart the novel-pattern warm-up window with a user-chosen duration.
+
+          - warmup_minutes=0  → no warm-up; flag novel patterns immediately
+          - warmup_minutes=60 → 1 hour
+          - up to 525_600     → 1 year
+
+        clear_known_patterns wipes the seen-patterns set so warm-up is
+        meaningful (otherwise all current patterns are already marked seen
+        and would never flag again).
+        """
+        from datetime import datetime, timezone, timedelta
+        db = get_database()
+        try:
+            oid = ObjectId(server_id)
+        except Exception:
+            return {"status": "failed", "error": "Invalid Server ID"}
+
+        if not await db["servers"].find_one({"_id": oid}, {"_id": 1}):
+            return {"status": "failed", "error": "Server not found"}
+
+        if warmup_minutes < 0 or warmup_minutes > 525_600:
+            return {"status": "failed", "error": "warmup_minutes out of range (0..525600)"}
+
+        now = datetime.now(timezone.utc)
+        new_until = (
+            now - timedelta(seconds=1)
+            if warmup_minutes == 0
+            else now + timedelta(minutes=warmup_minutes)
+        )
+        await db["servers"].update_one(
+            {"_id": oid},
+            {"$set": {"pattern_warmup_until": new_until}},
+        )
+        if clear_known_patterns:
+            await db["server_log_patterns"].delete_many({"server_id": str(oid)})
+
+        event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
+        return {
+            "status": "success",
+            "message": f"Pattern warm-up restarted ({warmup_minutes} minutes)",
+            "warmup_minutes": warmup_minutes,
+            "warmup_until": new_until.isoformat(),
+        }
+
+    async def reset_log_rate_baseline(self, server_id: str):
+        """Reset the EMA log-rate baseline to 0 — next tick learns fresh."""
+        db = get_database()
+        try:
+            oid = ObjectId(server_id)
+        except Exception:
+            return {"status": "failed", "error": "Invalid Server ID"}
+
+        if not await db["servers"].find_one({"_id": oid}, {"_id": 1}):
+            return {"status": "failed", "error": "Server not found"}
+
+        await db["servers"].update_one(
+            {"_id": oid},
+            {"$set": {"log_rate_baseline": 0.0, "log_rate_updated_at": None}},
+        )
+        event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
+        return {"status": "success", "message": "Log rate baseline reset"}
+
 
 
     async def execute_command_by_id(
@@ -357,23 +507,10 @@ class ServerService:
 
         try:
             async with connection_pool.get(server_id) as executor:
-                try:
-                    result = await asyncio.wait_for(
-                        executor.run_command(command), timeout=effective_timeout
-                    )
-                except asyncio.TimeoutError:
-                    await write_audit(
-                        server_id=server_id, command=command, status="timeout",
-                        started_at=started_at, principal_id=principal_id,
-                        source_ip=source_ip, confirmed=confirmed,
-                        stderr=f"[timed out after {effective_timeout}s]",
-                    )
-                    return {
-                        "status": "timeout",
-                        "output": "",
-                        "error": f"Command exceeded {effective_timeout}s timeout.",
-                        "timeout_s": effective_timeout,
-                    }
+                # Timeout is enforced inside the executor — it kills the remote
+                # process when the deadline is reached and returns status="timeout".
+                # No outer asyncio.wait_for needed.
+                result = await executor.run_command(command, timeout_s=effective_timeout)
         except Exception as e:
             await write_audit(
                 server_id=server_id, command=command, status="error",

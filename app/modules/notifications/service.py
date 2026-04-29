@@ -87,10 +87,16 @@ class NotificationService:
         )
 
         if existing:
-            # Update existing
+            # Build update payload: omit None values so we never wipe fields
+            # the user didn't touch. smtp_password additionally skips empty
+            # strings — a blank field means "leave the stored password as-is."
+            update_payload = {
+                k: v for k, v in config_data.items()
+                if v is not None and not (k == "smtp_password" and v == "")
+            }
             await db["notification_configs"].update_one(
                 {"_id": existing["_id"]},
-                {"$set": config_data}
+                {"$set": update_payload},
             )
             return {"status": "updated", "channel": config_data.get("channel")}
         else:

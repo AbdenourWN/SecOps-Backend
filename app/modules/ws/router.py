@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from app.core.config import settings
 from app.core.events import event_bus
@@ -14,14 +15,24 @@ ALLOWED_TOPICS: set[str] = {
     "dashboard.summary",
     "servers.status",
     "automation.history",
-    # P7.5 Phase 2
     "servers",
-    "servers.metrics",
-    "servers.logs",
     "log.sources",
     "rules",
     "scripts",
+    # Phase 22 — Tier 2 heuristic anomalies
+    "anomalies",
+    # Note: "servers.metrics" and "servers.logs" removed — replaced by
+    # per-server topics validated by _SERVER_TOPIC_RE below.
 }
+
+# Matches per-server metric/log topics: "servers.<mongo-objectid>.metrics|logs"
+_SERVER_TOPIC_RE = re.compile(
+    r"^servers\.[0-9a-f]{24}\.(metrics|logs|incidents|status|automation|anomalies|log_sources)$"
+)
+
+
+def _is_allowed_topic(topic: str) -> bool:
+    return topic in ALLOWED_TOPICS or bool(_SERVER_TOPIC_RE.match(topic))
 
 
 async def _bridge(ws: WebSocket, queue: asyncio.Queue) -> None:
@@ -79,7 +90,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
             elif mtype == "subscribe":
                 topic = msg.get("topic")
-                if topic not in ALLOWED_TOPICS:
+                if not _is_allowed_topic(topic):
                     await ws.send_json({
                         "type": "error", "code": "unknown_topic",
                         "message": f"unknown topic: {topic}",

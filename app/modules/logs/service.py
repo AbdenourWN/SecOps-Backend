@@ -5,7 +5,7 @@ from typing import List
 from app.core.database import get_database
 from app.core.elasticsearch import get_elasticsearch
 from app.modules.logs.schemas import LogEntryInDB, map_priority_to_level
-from app.core.executors import get_server_executor
+from app.core.executors import get_server_executor, DEFAULT_COMMAND_TIMEOUT_S
 from app.core.security import decrypt_password
 from bson import ObjectId
 from app.modules.analysis.service import AnalysisService
@@ -127,7 +127,7 @@ class LogService:
         """
         cmd = 'journalctl --output=json --no-pager -p 4 --since "5 minutes ago"'
         
-        result = await executor.run_command(cmd)
+        result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
         
         if result["status"] == "failed":
             return {"status": "error", "error": "Could not fetch logs (journalctl failed)"}
@@ -211,7 +211,7 @@ class LogService:
             "Message=$m;ProviderName=$_.ProviderName}}|ConvertTo-Json -Compress"
         )
         
-        result = await executor.run_command(ps_script)
+        result = await executor.run_command(ps_script, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
         
         output = result.get("output", "")
         if not output: 

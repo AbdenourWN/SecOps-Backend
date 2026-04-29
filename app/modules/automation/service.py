@@ -1,11 +1,65 @@
 import re
+import shlex
 from app.core.database import get_database
+from app.core.executors import DEFAULT_COMMAND_TIMEOUT_S
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB, AutomationLog
 from app.core.executors import get_server_executor
 from app.core.security import decrypt_password
 from bson import ObjectId
 from datetime import datetime, timezone
 from app.core.events import event_bus
+
+
+# ---------------------------------------------------------------------------
+# Placeholder validation
+# ---------------------------------------------------------------------------
+
+# Known placeholder types → strict validation pattern.
+# None = trusted source (comes from the server doc, not log content).
+#
+# To relax username/service_name to allow apostrophes and accented chars,
+# swap the allowlist pattern for this denylist:
+#   re.compile(r"^[^;|&`$(){}<>!\n\r\x00]{1,64}$")
+# That rejects only shell metacharacters while permitting everything else.
+_PLACEHOLDER_VALIDATORS: dict[str, "re.Pattern | None"] = {
+    "source_ip":    re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$"),
+    "username":     re.compile(r"^[a-zA-Z0-9_\-\.@]{1,64}$"),
+    "service_name": re.compile(r"^[a-zA-Z0-9_\-\.@]{1,64}$"),
+    "process_id":   re.compile(r"^\d{1,7}$"),
+    "hostname":     None,   # from server doc — trusted
+    "os_type":      None,   # from server doc — trusted
+    "raw_match":    None,   # fallback key used in L3 alerts only, never in scripts
+}
+
+# Shell/PowerShell metacharacters that should never appear in an unknown
+# placeholder value captured from log content.
+_DANGEROUS_CHARS_RE = re.compile(r"[;|&`$(){}<>!\n\r\x00]")
+
+
+def _validate_placeholder_value(key: str, value: str) -> None:
+    """Raise ValueError if `value` is unsafe for placeholder `key`.
+
+    Known keys are validated against their strict type pattern.
+    Unknown keys (custom regex capture groups) are checked for shell/PS
+    metacharacters.
+    """
+    if key in _PLACEHOLDER_VALIDATORS:
+        pattern = _PLACEHOLDER_VALIDATORS[key]
+        if pattern is not None and not pattern.fullmatch(value):
+            raise ValueError(
+                f"Placeholder '{{{{{key}}}}}' value {value!r} failed type validation "
+                f"(expected: {pattern.pattern})"
+            )
+    else:
+        if _DANGEROUS_CHARS_RE.search(value):
+            raise ValueError(
+                f"Placeholder '{{{{{key}}}}}' value {value!r} contains unsafe characters"
+            )
+
+
+# Remediation scripts can run longer than a quick log-collection command.
+# Raise the cap to 2 min; still bounded so a hung script can't hold the pool.
+DEFAULT_REMEDIATION_TIMEOUT_S = 120
 
 
 class AutomationService:
@@ -171,19 +225,37 @@ class AutomationService:
             "success_rate": round((success / total) * 100, 1) if total > 0 else 0,
         }
 
-    def _substitute_variables(self, template: str, variables: dict) -> str:
-        """
-        Replaces {{key}} placeholders in the script content with actual values.
-        Example: "iptables -A INPUT -s {{source_ip}} -j DROP"
-                 with variables={"source_ip": "1.2.3.4"}
-                 becomes "iptables -A INPUT -s 1.2.3.4 -j DROP"
+    def _substitute_variables(
+        self, template: str, variables: dict, language: str = "bash"
+    ) -> str:
+        """Replace {{key}} placeholders with validated, OS-escaped values.
+
+        Raises ValueError if any placeholder value fails validation so the
+        caller can abort rather than execute a potentially injected command.
+
+        Defense-in-depth escaping is applied after validation:
+        - bash   → shlex.quote() handles all POSIX shell metacharacters
+        - other  → PS single-quoted string escape: ' → '' so an apostrophe
+                   in a value doesn't close the string and allow injection
         """
         if not variables:
             return template
 
-        def replacer(match):
+        def replacer(match: re.Match) -> str:
             key = match.group(1).strip()
-            return str(variables.get(key, match.group(0)))  # Keep original if key not found
+            raw = variables.get(key)
+            if raw is None:
+                return match.group(0)   # keep original placeholder
+
+            value = str(raw)
+            _validate_placeholder_value(key, value)
+
+            if language == "bash":
+                return shlex.quote(value)
+            else:
+                # PowerShell: escape ' → '' (literal single-quote inside
+                # single-quoted PS strings).
+                return value.replace("'", "''")
 
         return re.sub(r"\{\{(\s*\w+\s*)\}\}", replacer, template)
 
@@ -225,14 +297,37 @@ class AutomationService:
 
         print(f"🤖 AUTO-FIX: Executing '{script_doc['name']}' on {server['hostname']}...")
 
-        # 3. Variable Substitution
+        # 3. Variable Substitution (validated + OS-escaped)
         command = script_doc["content"]
-        command = self._substitute_variables(command, variables or {})
+        language = script_doc.get("language", "bash")
+        try:
+            command = self._substitute_variables(command, variables or {}, language)
+        except ValueError as exc:
+            print(f"🚫 Remediation aborted — unsafe placeholder value: {exc}")
+            await db["incidents"].update_one(
+                {"_id": ObjectId(incident_id)},
+                {"$set": {
+                    "automation_failure_reason": f"unsafe_placeholder: {exc}",
+                    "status": "open",
+                    "verification_until": None,
+                }},
+            )
+            event_bus.emit("incidents", "incident.updated", {
+                "incident_id": incident_id,
+                "server_id": server_id,
+                "reason": "unsafe_placeholder",
+            })
+            event_bus.emit(f"servers.{server_id}.incidents", "incident.updated", {  # deprecated: remove when RBAC lands
+                "incident_id": incident_id,
+                "server_id": server_id,
+                "reason": "unsafe_placeholder",
+            })
+            return False
 
         print(f"📝 Resolved Command: {command}")
 
-        # 4. Execute
-        result = await executor.run_command(command)
+        # 4. Execute (timeout enforced inside executor — kills remote process)
+        result = await executor.run_command(command, timeout_s=DEFAULT_REMEDIATION_TIMEOUT_S)
 
         status = "success" if result["status"] == "success" else "failed"
         output = result.get("output")
@@ -254,6 +349,13 @@ class AutomationService:
         log_result = await db["automation_logs"].insert_one(audit_log.model_dump())
 
         event_bus.emit("automation.history", "remediation.executed", {
+            "log_id": str(log_result.inserted_id),
+            "script_id": script_id,
+            "server_id": server_id,
+            "incident_id": incident_id,
+            "status": status,
+        })
+        event_bus.emit(f"servers.{server_id}.automation", "remediation.executed", {  # deprecated: remove when RBAC lands
             "log_id": str(log_result.inserted_id),
             "script_id": script_id,
             "server_id": server_id,

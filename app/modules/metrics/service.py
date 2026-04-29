@@ -2,7 +2,7 @@ from app.core.database import get_database
 from app.core.elasticsearch import get_elasticsearch
 from app.core.events import event_bus
 from app.modules.metrics.schemas import SystemMetric
-from app.core.executors import get_server_executor
+from app.core.executors import get_server_executor, DEFAULT_COMMAND_TIMEOUT_S
 from app.core.security import decrypt_password
 from bson import ObjectId
 from datetime import datetime, timezone
@@ -42,7 +42,7 @@ class MetricService:
                 "echo \"$cpu,$mem,$disk\""
             )
 
-        result = await executor.run_command(cmd)
+        result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
 
         if result["status"] == "failed":
             print(f"❌ Metrics failed for {server.get('hostname')}: {result.get('error')}")
@@ -82,7 +82,7 @@ class MetricService:
                 except Exception as e:
                     print(f"⚠️ Failed to index metric to ES: {e}")
 
-            event_bus.emit("servers.metrics", "metric.sampled", {
+            event_bus.emit(f"servers.{server_id}.metrics", "metric.sampled", {
                 "server_id": server_id,
                 "cpu_usage": metric_doc["cpu_usage"],
                 "ram_usage": metric_doc["ram_usage"],

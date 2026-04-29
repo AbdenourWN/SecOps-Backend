@@ -12,6 +12,11 @@ router = APIRouter()
 ai_service = AIService()
 
 
+def _bust_rule_cache() -> None:
+    from app.modules.analysis.service import _rule_cache
+    _rule_cache["loaded_at"] = 0
+
+
 # ── Rules CRUD ──
 
 @router.get("/rules")
@@ -67,6 +72,7 @@ async def create_rule(rule: DetectionRule):
     rule_data["created_at"] = now
     rule_data["updated_at"] = None
     result = await db["rules"].insert_one(rule_data)
+    _bust_rule_cache()
     event_bus.emit("rules", "rule.created", {"rule_id": str(result.inserted_id)})
     return {"status": "success", "id": str(result.inserted_id)}
 
@@ -89,11 +95,7 @@ async def update_rule(rule_id: str, updates: dict):
     update_data["updated_at"] = datetime.now(timezone.utc)
 
     await db["rules"].update_one({"_id": oid}, {"$set": update_data})
-
-    # Invalidate the rule cache so changes take effect immediately
-    from app.modules.analysis.service import _rule_cache
-    _rule_cache["loaded_at"] = 0
-
+    _bust_rule_cache()
     event_bus.emit("rules", "rule.updated", {"rule_id": str(oid)})
 
     return {"status": "success", "message": "Rule updated"}
@@ -110,9 +112,7 @@ async def delete_rule(rule_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Rule not found")
 
-    from app.modules.analysis.service import _rule_cache
-    _rule_cache["loaded_at"] = 0
-
+    _bust_rule_cache()
     event_bus.emit("rules", "rule.deleted", {"rule_id": str(oid)})
 
     return {"status": "success", "message": "Rule deleted"}

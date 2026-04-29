@@ -7,6 +7,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.core.config import settings
 from app.core.database import get_database
 from app.core.events import event_bus
+from app.modules.anomalies.service import AnomaliesService
+from app.modules.heuristics.service import HeuristicService
 from app.modules.logs.file_watcher import FileWatcherService
 from app.modules.logs.service import LogService
 from app.modules.metrics.service import MetricService
@@ -57,6 +59,8 @@ async def job_health_check():
 
 _metric_service = MetricService()
 _log_service = LogService()
+_heuristic_service = HeuristicService()
+_anomalies_service = AnomaliesService()
 
 
 async def _collect_telemetry_for_server(server: dict):
@@ -97,6 +101,29 @@ async def _collect_telemetry_for_server(server: dict):
                 await coro
             except Exception as e:
                 logger.error("[scheduler] %s collection error for %s: %s", label, hostname, e)
+
+    # Volume-spike check runs after collection (and outside the pool lock —
+    # it's a single ES count + Mongo update, doesn't need the executor).
+    # Re-fetch the server doc so we get the freshly-updated baseline for the
+    # NEXT call rather than racing with a stale one.
+    try:
+        from app.core.database import get_database
+        from bson import ObjectId
+        db = get_database()
+        fresh_server = await db["servers"].find_one({"_id": ObjectId(server_id)})
+        if fresh_server is not None:
+            spike = await _heuristic_service.check_volume_spike(fresh_server)
+            if spike is not None:
+                current, baseline, reason = spike
+                await _anomalies_service.record_volume_observation(
+                    server=fresh_server,
+                    current=current,
+                    baseline=baseline,
+                    reason=reason,
+                )
+                logger.info("[scheduler] volume spike on %s: %s", hostname, reason)
+    except Exception as e:
+        logger.error("[scheduler] volume spike check failed for %s: %s", hostname, e)
 
 
 async def job_collect_telemetry():
@@ -157,11 +184,18 @@ async def job_verify_remediation():
                     "description": inc.get("description", "") + " (Auto-Resolved)",
                 }},
             )
+            _sid = inc.get("server_id")
             event_bus.emit("incidents", "incident.resolved", {
                 "incident_id": str(inc["_id"]),
-                "server_id": inc.get("server_id"),
+                "server_id": _sid,
                 "auto": True,
             })
+            if _sid:
+                event_bus.emit(f"servers.{_sid}.incidents", "incident.resolved", {  # deprecated: remove when RBAC lands
+                    "incident_id": str(inc["_id"]),
+                    "server_id": _sid,
+                    "auto": True,
+                })
             event_bus.emit("dashboard.summary", "incident.resolved", {
                 "incident_id": str(inc["_id"]),
             })
@@ -178,17 +212,34 @@ async def job_verify_remediation():
 
 async def job_file_watcher():
     try:
+        db = get_database()
         service = FileWatcherService()
         sources = await service.get_all_sources()
         if not sources:
             return
 
+        # Same online-only policy as job_collect_telemetry — file-watcher
+        # commands run through the connection pool and would hang on dead
+        # hosts. Health check still flips servers back ONLINE on recovery.
+        online_ids = {
+            str(s["_id"])
+            for s in await db["servers"]
+            .find({"is_online": True}, {"_id": 1})
+            .to_list(length=10000)
+        }
+        active = [s for s in sources if str(s.get("server_id")) in online_ids]
+        skipped = len(sources) - len(active)
+
+        if not active:
+            logger.info("[scheduler] file_watcher: 0 active sources (%d offline-skipped)", skipped)
+            return
+
         t0 = asyncio.get_event_loop().time()
-        logger.info("[scheduler] file_watcher: %d sources", len(sources))
+        logger.info("[scheduler] file_watcher: %d sources (%d offline-skipped)", len(active), skipped)
 
         tasks = [
             _with_semaphore(service.process_file_source(source))
-            for source in sources
+            for source in active
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 

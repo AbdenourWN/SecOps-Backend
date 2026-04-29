@@ -2,7 +2,7 @@ import unicodedata
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field, field_validator
 from app.modules.servers.service import ServerService
-from app.modules.servers.schemas import ServerCreate, ServerResponse, ServerUpdate, ServerDelete, ServerStatus, OSType
+from app.modules.servers.schemas import ServerCreate, ServerResponse, ServerUpdate, ServerDelete, ServerStatus, OSType, WarmupResetRequest
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 
@@ -137,6 +137,39 @@ async def update_server(server_id: str, update_data: ServerUpdate):
         raise HTTPException(status_code=400, detail=result["error"])
         
     return result
+
+# 5b. Reset anomaly state (warmup / baseline) — Tier 2 maintenance ops
+@router.post("/{server_id}/reset-warmup")
+async def reset_pattern_warmup(
+    server_id: str,
+    body: WarmupResetRequest = WarmupResetRequest(),
+):
+    """
+    Restart the novel-pattern warm-up window with a user-chosen duration
+    (`warmup_minutes`, 0..525_600). Useful after a major config change on
+    the server when the historical pattern set is no longer representative.
+    """
+    result = await service.reset_pattern_warmup(
+        server_id,
+        warmup_minutes=body.warmup_minutes,
+        clear_known_patterns=body.clear_known_patterns,
+    )
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@router.post("/{server_id}/reset-baseline")
+async def reset_log_rate_baseline(server_id: str):
+    """
+    Reset the EMA baseline used by volume-spike detection to 0. The next
+    telemetry tick will start learning a fresh baseline.
+    """
+    result = await service.reset_log_rate_baseline(server_id)
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
 
 # 6. Delete Server
 @router.delete("/{server_id}")
