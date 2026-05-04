@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from bson import ObjectId
 
 from app.core.config import settings
 from app.core.database import get_database
@@ -20,7 +21,21 @@ scheduler = AsyncIOScheduler()
 
 # Global semaphore: cap how many servers run collection in parallel.
 # Per-server serialization is handled by connection_pool's per-entry lock.
-_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
+# `_concurrent_limit` is mutable — call set_concurrent_limit() to update at runtime.
+_concurrent_limit: int = settings.MAX_CONCURRENT_SERVERS
+_semaphore = asyncio.Semaphore(_concurrent_limit)
+
+
+def get_concurrent_limit() -> int:
+    return _concurrent_limit
+
+
+def set_concurrent_limit(n: int) -> None:
+    global _semaphore, _concurrent_limit
+    _concurrent_limit = n
+    _semaphore = asyncio.Semaphore(n)
+    logger.info("scheduler concurrent limit updated to %d", n)
+
 
 # Expose lock accessor for code that still imports it (e.g. health-check path in ServerService).
 # Health check creates a fresh executor (no pool), so it doesn't share the pool lock.
@@ -147,6 +162,9 @@ async def job_collect_telemetry():
         elapsed = asyncio.get_event_loop().time() - t0
         logger.info("[scheduler] telemetry complete in %.1fs", elapsed)
 
+        # One event per tick so the frontend refreshes last_metrics on all server cards.
+        event_bus.emit("servers", "servers.metrics_updated", {"count": len(online)})
+
     except Exception as e:
         logger.error("job_collect_telemetry failed: %s", e)
 
@@ -185,6 +203,12 @@ async def job_verify_remediation():
                 }},
             )
             _sid = inc.get("server_id")
+            if _sid:
+                await db["servers"].update_one(
+                    {"_id": ObjectId(_sid)},
+                    {"$inc": {"open_incidents_count": -1}},
+                )
+                event_bus.emit("servers", "server.updated", {"server_id": _sid})
             event_bus.emit("incidents", "incident.resolved", {
                 "incident_id": str(inc["_id"]),
                 "server_id": _sid,
@@ -289,7 +313,7 @@ def start_scheduler():
     scheduler.start()
     logger.info(
         "scheduler started (max_concurrent=%d, coalesce=True, staggered offsets 0/15/30/45s)",
-        settings.MAX_CONCURRENT_SERVERS,
+        _concurrent_limit,
     )
     print(f"⏰ Scheduler started — health@+0s, telemetry@+15s, verify@+30s, file_watcher@+45s "
-          f"(max {settings.MAX_CONCURRENT_SERVERS} concurrent)")
+          f"(max {_concurrent_limit} concurrent)")

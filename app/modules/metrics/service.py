@@ -82,6 +82,19 @@ class MetricService:
                 except Exception as e:
                     print(f"⚠️ Failed to index metric to ES: {e}")
 
+            # Cache the snapshot on the server document so the server list
+            # can display current metrics without querying Elasticsearch.
+            db = get_database()
+            await db["servers"].update_one(
+                {"_id": ObjectId(server_id)},
+                {"$set": {"last_metrics": {
+                    "cpu_usage": metric_doc["cpu_usage"],
+                    "ram_usage": metric_doc["ram_usage"],
+                    "disk_usage": metric_doc["disk_usage"],
+                    "collected_at": datetime.now(timezone.utc),
+                }}},
+            )
+
             event_bus.emit(f"servers.{server_id}.metrics", "metric.sampled", {
                 "server_id": server_id,
                 "cpu_usage": metric_doc["cpu_usage"],
@@ -112,30 +125,50 @@ class MetricService:
         executor.credential["username"] = cred["username"]
         return await self.collect_with(executor, server)
 
-    async def get_latest_metrics(self, server_id: str, limit: int = 20):
-        """Get history for charts from Elasticsearch"""
+    async def get_latest_metrics(
+        self,
+        server_id: str,
+        limit: int = 100,
+        from_date: str = None,
+        to_date: str = None,
+    ):
+        """Get history for charts from Elasticsearch, optionally filtered by date range."""
         es = get_elasticsearch()
         if not es:
             return []
-            
+
         try:
+            must = [{"term": {"server_id": server_id}}]
+            filter_clauses = []
+            if from_date or to_date:
+                date_range: dict = {}
+                if from_date:
+                    date_range["gte"] = from_date
+                if to_date:
+                    date_range["lte"] = to_date
+                filter_clauses.append({"range": {"timestamp": date_range}})
+
+            query = (
+                {"bool": {"must": must, "filter": filter_clauses}}
+                if filter_clauses
+                else {"term": {"server_id": server_id}}
+            )
+
             result = await es.search(
                 index="secops-metrics-*",
                 body={
-                    "query": {
-                        "term": {"server_id": server_id}
-                    },
+                    "query": query,
                     "sort": [{"timestamp": {"order": "desc"}}],
-                    "size": limit
-                }
+                    "size": min(limit, 2000),
+                },
             )
-            
+
             metrics = []
             for hit in result["hits"]["hits"]:
                 doc = hit["_source"]
                 doc["_id"] = hit["_id"]
                 metrics.append(doc)
-                
+
             return metrics
         except Exception as e:
             print(f"⚠️ ES search error: {e}")

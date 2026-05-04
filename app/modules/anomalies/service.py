@@ -218,6 +218,69 @@ class AnomaliesService:
             "results": results,
         }
 
+    async def get_by_id(self, observation_id: str) -> Optional[dict]:
+        db = get_database()
+        try:
+            oid = ObjectId(observation_id)
+        except Exception:
+            return None
+
+        obs = await db["log_observations"].find_one({"_id": oid})
+        if not obs:
+            return None
+
+        obs["_id"] = str(obs["_id"])
+        obs["server_hostname"] = ""
+        server_id = obs.get("server_id")
+        if server_id:
+            try:
+                server = await db["servers"].find_one(
+                    {"_id": ObjectId(server_id)},
+                    {"hostname": 1},
+                )
+                if server:
+                    obs["server_hostname"] = server.get("hostname", "")
+            except Exception:
+                pass
+
+        return obs
+
+    async def analyze_with_ai(self, observation_id: str) -> Optional[str]:
+        obs = await self.get_by_id(observation_id)
+        if not obs:
+            return None
+
+        from app.modules.analysis.ai_service import AIService
+
+        analysis = await AIService().analyze_anomaly(obs)
+        now = datetime.now(timezone.utc)
+
+        db = get_database()
+        try:
+            oid = ObjectId(observation_id)
+        except Exception:
+            return None
+
+        await db["log_observations"].update_one(
+            {"_id": oid},
+            {"$set": {"ai_analysis": analysis, "ai_analyzed_at": now}},
+        )
+
+        server_id = obs.get("server_id")
+        event_bus.emit("anomalies", "anomaly.updated", {
+            "observation_id": observation_id,
+            "server_id": server_id,
+            "reason": "ai_analysis",
+        })
+        if server_id:
+            event_bus.emit(f"servers.{server_id}.anomalies", "anomaly.updated", {  # deprecated: remove when RBAC lands
+                "observation_id": observation_id,
+                "server_id": server_id,
+                "reason": "ai_analysis",
+            })
+
+        return analysis
+
     async def stats(self) -> dict:
         db = get_database()
         pipeline = [
@@ -330,6 +393,12 @@ class AnomaliesService:
         )
         inc_result = await db["incidents"].insert_one(incident.model_dump())
         incident_id = str(inc_result.inserted_id)
+        from bson import ObjectId as _OID
+        await db["servers"].update_one(
+            {"_id": _OID(obs["server_id"])},
+            {"$inc": {"open_incidents_count": 1}},
+        )
+        event_bus.emit("servers", "server.updated", {"server_id": obs["server_id"]})
 
         await db["log_observations"].update_one(
             {"_id": oid},

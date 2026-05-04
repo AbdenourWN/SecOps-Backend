@@ -20,7 +20,9 @@ from app.modules.notifications.router import router as notifications_router
 from app.modules.anomalies.router import router as anomalies_router
 from app.modules.ws.router import router as ws_router
 from app.modules.ws.terminal_router import router as terminal_ws_router
-from app.core.connection_pool import connection_pool
+from app.modules.settings.router import router as settings_router
+from app.modules.settings.service import load_system_settings
+from app.core.connection_pool import connection_pool, terminal_pool
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 
@@ -81,11 +83,15 @@ async def lifespan(app: FastAPI):
     await connect_to_elasticsearch()
 
     # Seeding is manual only — run `python seed.py` to populate defaults.
-    # Start connection pool idle sweeper
+    # Start connection pools — main pool for scheduler, terminal pool for human commands
     await connection_pool.start()
+    await terminal_pool.start()
 
     # All MongoDB indexes (idempotent — safe to re-run on every boot)
     await _ensure_indexes()
+
+    # Apply any runtime overrides stored in DB (e.g. max_concurrent_servers)
+    await load_system_settings()
 
     # Start the scheduler (health, telemetry, file_watcher jobs)
     start_scheduler()
@@ -94,6 +100,7 @@ async def lifespan(app: FastAPI):
 
     # -- Shutdown --
     await connection_pool.close_all(grace_s=5)
+    await terminal_pool.close_all(grace_s=5)
     await close_elasticsearch()
     await close_mongo_connection()
 
@@ -137,6 +144,7 @@ app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"]
 app.include_router(test_router, prefix="/api/test", tags=["Test & Simulation"])
 app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(anomalies_router, prefix="/api/anomalies", tags=["Anomalies"])
+app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
 app.include_router(ws_router, prefix="/api", tags=["WebSocket"])
 app.include_router(terminal_ws_router, prefix="/api", tags=["Terminal WebSocket"])
 

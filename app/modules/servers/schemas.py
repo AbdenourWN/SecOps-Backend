@@ -53,6 +53,14 @@ class CredentialUpdate(BaseModel):
     passphrase: Optional[str] = None
 
 
+# --- Cached last metric snapshot (written by MetricService every 60s) ---
+class LastMetrics(BaseModel):
+    cpu_usage: float = 0.0
+    ram_usage: float = 0.0
+    disk_usage: float = 0.0
+    collected_at: Optional[datetime] = None
+
+
 # --- Anomaly Tier 2: business hours config ---
 class BusinessHours(BaseModel):
     """
@@ -67,6 +75,64 @@ class BusinessHours(BaseModel):
     tz: str = "UTC"
 
 
+# --- Detection algorithm tunables (per-server overrides) ---
+class DetectionConfig(BaseModel):
+    """
+    Per-server overrides for the detection and remediation algorithm.
+    All fields are optional — omitted fields fall back to the global defaults
+    defined as constants in analysis/service.py.
+    """
+    verification_window_minutes: int = Field(
+        default=10, ge=1, le=120,
+        description=(
+            "Minutes to watch for rule recurrence after a remediation script runs. "
+            "If the same rule fires again within this window the fix is considered failed "
+            "and a retry is triggered. Raise for critical servers (longer observation); "
+            "lower for noisy servers (faster cycle)."
+        ),
+    )
+    max_remediation_attempts: int = Field(
+        default=3, ge=1, le=10,
+        description=(
+            "Maximum number of times the remediation script is retried before giving up "
+            "and sending an escalation alert. Higher = more persistent automation. "
+            "Lower = faster human escalation."
+        ),
+    )
+    incident_lookback_minutes: int = Field(
+        default=30, ge=5, le=1440,
+        description=(
+            "How far back (minutes) to look for an existing OPEN/VERIFYING incident "
+            "when deduplicating. Incidents older than this are treated as stale and a "
+            "fresh incident is opened."
+        ),
+    )
+    recurrence_streak_threshold: int = Field(
+        default=3, ge=2, le=20,
+        description=(
+            "How many consecutive times the same script must appear to succeed then have "
+            "the problem come back before automation is paused and an alert is sent. "
+            "Lower = more aggressive pause. Higher = more tolerance for flapping."
+        ),
+    )
+    recurrence_lookback_hours: float = Field(
+        default=2.0, ge=0.25, le=24.0,
+        description=(
+            "How recent (hours) a previous auto-resolved incident must be to count as "
+            "part of the recurrence chain. If the last resolution was older, the streak "
+            "resets to 0 and automation runs normally."
+        ),
+    )
+    volume_spike_multiplier: float = Field(
+        default=10.0, ge=2.0, le=100.0,
+        description=(
+            "Trigger a volume-spike anomaly when the current log rate exceeds this "
+            "multiple of the server's rolling baseline. Lower = more sensitive. "
+            "Higher = only flag extreme spikes."
+        ),
+    )
+
+
 # --- Server Schemas ---
 class ServerBase(BaseModel):
     hostname: str
@@ -75,6 +141,9 @@ class ServerBase(BaseModel):
     port: Optional[int] = None
     # Tier 2 anomaly preferences (optional on create — service applies defaults)
     business_hours: Optional[BusinessHours] = None
+    # Detection algorithm tunables (optional — global defaults apply when None)
+    detection_config: Optional[DetectionConfig] = None
+    
 
 class ServerCreate(ServerBase):
     credential: CredentialInput
@@ -104,10 +173,13 @@ class ServerResponse(TimestampModel, ServerBase):
 
     status: ServerStatus = ServerStatus.UNKNOWN
     last_health_check: Optional[datetime] = None
-
-    # Adaptive health-check backoff (read-only; informational)
     consecutive_offline_checks: int = 0
-    next_health_check_at: Optional[datetime] = None
+
+    # Denormalised counters — maintained by incident write paths, not computed on demand
+    open_incidents_count: int = 0
+
+    # Cached last metric snapshot — updated by MetricService every 60s
+    last_metrics: Optional[LastMetrics] = None
 
     # Tier 2 anomaly read-only state (informational; not directly editable)
     pattern_warmup_until: Optional[datetime] = None
@@ -123,6 +195,7 @@ class ServerUpdate(BaseModel):
     os_type: Optional[OSType] = None
     port: Optional[int] = None
     business_hours: Optional[BusinessHours] = None
+    detection_config: Optional[DetectionConfig] = None
 
     # Allow updating the stored credential (e.g., changing the password)
     credential: Optional[CredentialUpdate] = None

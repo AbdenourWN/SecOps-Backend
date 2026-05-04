@@ -2,7 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.modules.anomalies.schemas import LogObservationListResponse
+from app.modules.anomalies.schemas import LogObservationListResponse, LogObservationResponse
 from app.modules.anomalies.service import AnomaliesService
 
 router = APIRouter()
@@ -36,6 +36,36 @@ async def list_observations(
         severity=severity,
         type_=type,
     )
+
+
+@router.get("/{observation_id}", response_model=LogObservationResponse)
+async def get_observation(observation_id: str):
+    """Get one anomaly observation with detail-page enrichment."""
+    observation = await service.get_by_id(observation_id)
+    if not observation:
+        raise HTTPException(status_code=404, detail="Observation not found")
+    return observation
+
+
+@router.post("/{observation_id}/analyze")
+async def analyze_observation(observation_id: str):
+    """
+    Generate and persist an AI analysis for a Tier 2 anomaly observation.
+    Uses the existing local Ollama-backed AI service for now.
+    """
+    try:
+        analysis = await service.analyze_with_ai(observation_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    if analysis is None:
+        raise HTTPException(status_code=404, detail="Observation not found")
+
+    return {
+        "status": "success",
+        "observation_id": observation_id,
+        "ai_analysis": analysis,
+    }
 
 
 @router.patch("/{observation_id}/dismiss")

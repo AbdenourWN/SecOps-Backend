@@ -13,7 +13,7 @@ from app.core.rate_limit import check_rate_limit
 from app.modules.servers.guardrails import check_command
 from app.modules.servers.audit import write_audit
 from app.core.events import event_bus
-from app.core.connection_pool import connection_pool
+from app.core.connection_pool import connection_pool, terminal_pool
 
 
 DEFAULT_COMMAND_TIMEOUT_S = 60
@@ -57,35 +57,16 @@ class ServerService:
 
         db = get_database()
         servers = await db["servers"].find().to_list(length=10000)
-        print(f"🕵️  Starting Health Check Cycle...")
+        print(f"🕵️  Starting Health Check Cycle ({len(servers)} servers)...")
 
         sem = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
-        skipped_in_backoff = 0
-        skip_lock = asyncio.Lock()
 
         async def check_one(server):
-            nonlocal skipped_in_backoff
             server_id = str(server["_id"])
             previous_status = server.get("status")
             now = datetime.now(timezone.utc)
 
-            # Adaptive backoff: persistently-offline hosts move to a longer
-            # cadence (5 min → 15 min → 60 min cap) so we stop hammering dead
-            # boxes every 60s. Online hosts are always checked.
-            next_check = server.get("next_health_check_at")
-            if (
-                next_check is not None
-                and next_check > now
-                and previous_status == ServerStatus.OFFLINE
-            ):
-                async with skip_lock:
-                    skipped_in_backoff += 1
-                return
-
             async with sem:
-                # Health check uses a direct TCP banner-grab — no pooled session
-                # needed, no per-server lock needed (read-only probe, no auth
-                # collision).
                 executor = get_server_executor(server, plain_password="")
                 is_online = await executor.check_health()
                 new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
@@ -96,24 +77,14 @@ class ServerService:
                         "is_online": True,
                         "last_health_check": now,
                         "consecutive_offline_checks": 0,
-                        "next_health_check_at": None,
                     }
                 else:
                     n = (server.get("consecutive_offline_checks") or 0) + 1
-                    if n < 3:
-                        delay_s = 60
-                    elif n < 10:
-                        delay_s = 5 * 60
-                    elif n < 30:
-                        delay_s = 15 * 60
-                    else:
-                        delay_s = 60 * 60
                     update = {
                         "status": new_status,
                         "is_online": False,
                         "last_health_check": now,
                         "consecutive_offline_checks": n,
-                        "next_health_check_at": now + timedelta(seconds=delay_s),
                     }
 
                 await db["servers"].update_one(
@@ -139,13 +110,8 @@ class ServerService:
                         "status": new_status,
                     })
 
-        tasks = [check_one(server) for server in servers]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        scanned = len(servers) - skipped_in_backoff
-        print(
-            f"✅ Health Check Complete. Scanned {scanned}/{len(servers)} servers "
-            f"({skipped_in_backoff} in backoff window)."
-        )
+        await asyncio.gather(*[check_one(s) for s in servers], return_exceptions=True)
+        print(f"✅ Health Check Complete. Scanned {len(servers)} servers.")
     """ 
     🚀
     CRUD Operations 
@@ -223,6 +189,12 @@ class ServerService:
             if server_data.business_hours is not None
             else DEFAULT_BUSINESS_HOURS.copy()
         )
+        from app.modules.servers.schemas import DetectionConfig
+        server_doc["detection_config"] = (
+            server_data.detection_config.model_dump()
+            if server_data.detection_config is not None
+            else DetectionConfig().model_dump()
+        )
         server_doc["log_rate_baseline"] = 0.0
         server_doc["log_rate_updated_at"] = None
 
@@ -295,7 +267,9 @@ class ServerService:
         if update_data.port: server_updates["port"] = update_data.port
         if update_data.business_hours is not None:
             server_updates["business_hours"] = update_data.business_hours.model_dump()
-        
+        if update_data.detection_config is not None:
+            server_updates["detection_config"] = update_data.detection_config.model_dump()
+
         # 3. Handle Credential Updates (If user wants to set a NEW password)
         if update_data.credential:
             cred_updates = {}
@@ -321,8 +295,9 @@ class ServerService:
             server_updates["updated_at"] = datetime.now(timezone.utc)
             await db["servers"].update_one({"_id": oid}, {"$set": server_updates})
 
-        # Evict from connection pool so the next access picks up fresh credentials/config
+        # Evict from both pools so the next access picks up fresh credentials/config
         connection_pool.evict(str(oid))
+        terminal_pool.evict(str(oid))
 
         event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
 
@@ -346,8 +321,9 @@ class ServerService:
         # 2. DELETE EVERYTHING (Cascade)
         await db["servers"].delete_one({"_id": oid})
         await db["credentials"].delete_one({"_id": cred_id})
-        # Evict from connection pool — releases the cached session immediately
+        # Evict from both pools — releases all cached sessions immediately
         connection_pool.evict(str(oid))
+        terminal_pool.evict(str(oid))
 
         event_bus.emit("servers", "server.deleted", {"server_id": str(oid)})
         event_bus.emit("dashboard.summary", "server.deleted", {"server_id": str(oid)})
@@ -425,7 +401,30 @@ class ServerService:
         event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
         return {"status": "success", "message": "Log rate baseline reset"}
 
+    async def recalculate_server_stats(self, server_id: str):
+        """
+        Recompute open_incidents_count from actual incident documents.
+        Use this to heal any counter drift caused by missed write paths.
+        """
+        db = get_database()
+        try:
+            oid = ObjectId(server_id)
+        except Exception:
+            return {"status": "failed", "error": "Invalid Server ID"}
 
+        if not await db["servers"].find_one({"_id": oid}, {"_id": 1}):
+            return {"status": "failed", "error": "Server not found"}
+
+        active_count = await db["incidents"].count_documents({
+            "server_id": server_id,
+            "status": {"$in": ["open", "verifying", "investigating"]},
+        })
+
+        await db["servers"].update_one(
+            {"_id": oid},
+            {"$set": {"open_incidents_count": active_count}},
+        )
+        return {"status": "success", "open_incidents_count": active_count}
 
     async def execute_command_by_id(
         self,
@@ -506,7 +505,7 @@ class ServerService:
             max(1, min(MAX_COMMAND_TIMEOUT_S, int(timeout_s)))
 
         try:
-            async with connection_pool.get(server_id) as executor:
+            async with terminal_pool.get(server_id) as executor:
                 # Timeout is enforced inside the executor — it kills the remote
                 # process when the deadline is reached and returns status="timeout".
                 # No outer asyncio.wait_for needed.
@@ -618,10 +617,10 @@ class ServerService:
             else max(1, min(MAX_COMMAND_TIMEOUT_S, int(timeout_s)))
         )
 
-        # Acquire the pooled executor — holds the per-server lock for the full
-        # streaming duration, serialising terminal and scheduler on this server.
+        # Acquire the terminal pool executor — separate from the scheduler pool so
+        # long-running terminal sessions never block metric/log collection.
         try:
-            _pool_ctx = connection_pool.get(server_id)
+            _pool_ctx = terminal_pool.get(server_id)
             executor = await _pool_ctx.__aenter__()
         except Exception as exc:
             yield {"type": "error", "command_id": None, "code": "internal",

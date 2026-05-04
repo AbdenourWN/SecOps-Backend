@@ -1,7 +1,14 @@
 from app.core.database import get_database
 from app.modules.incidents.schemas import IncidentStatus
+from app.core.events import event_bus
 from bson import ObjectId
 from datetime import datetime, timezone
+
+_ACTIVE_STATUSES = {
+    IncidentStatus.OPEN.value,
+    IncidentStatus.VERIFYING.value,
+    IncidentStatus.INVESTIGATING.value,
+}
 
 
 class IncidentService:
@@ -80,6 +87,26 @@ class IncidentService:
             update_fields["resolved_at"] = datetime.now(timezone.utc)
 
         await db["incidents"].update_one({"_id": oid}, {"$set": update_fields})
+
+        # Adjust server open_incidents_count based on active→terminal or terminal→active
+        old_status = incident.get("status")
+        new_status_val = new_status.value
+        server_id = incident.get("server_id")
+        if server_id:
+            was_active = old_status in _ACTIVE_STATUSES
+            now_active = new_status_val in _ACTIVE_STATUSES
+            if was_active and not now_active:
+                await db["servers"].update_one(
+                    {"_id": ObjectId(server_id)},
+                    {"$inc": {"open_incidents_count": -1}},
+                )
+            elif not was_active and now_active:
+                await db["servers"].update_one(
+                    {"_id": ObjectId(server_id)},
+                    {"$inc": {"open_incidents_count": 1}},
+                )
+            if was_active != now_active:
+                event_bus.emit("servers", "server.updated", {"server_id": server_id})
 
         # Return updated document
         updated = await db["incidents"].find_one({"_id": oid})

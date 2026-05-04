@@ -44,6 +44,9 @@ class LogObservationInDB(BaseModel):
     status: LogObservationStatus = LogObservationStatus.PENDING_REVIEW
     promoted_incident_id: Optional[str] = None
 
+    ai_analysis: Optional[str] = None
+    ai_analyzed_at: Optional[datetime] = None
+
     detected_at: datetime = Field(default_factory=utc_now)
     reviewed_at: Optional[datetime] = None
 

@@ -62,6 +62,10 @@ class IncidentInDB(BaseModel):
     last_remediation_at: Optional[datetime] = None
     verification_until: Optional[datetime] = None
 
+    # Recurrence tracking — counts consecutive auto-resolve → recurrence cycles
+    # for the same (server, rule) chain. Resets when an operator manually resolves.
+    recurrence_streak: int = 0
+
     class Config:
         populate_by_name = True
 

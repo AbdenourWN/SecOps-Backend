@@ -171,6 +171,19 @@ async def reset_log_rate_baseline(server_id: str):
     return result
 
 
+@router.post("/{server_id}/recalculate-stats")
+async def recalculate_server_stats(server_id: str):
+    """
+    Recount open incidents from the incidents collection and write the
+    corrected value to open_incidents_count on the server document.
+    Use this to fix any counter drift.
+    """
+    result = await service.recalculate_server_stats(server_id)
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
 # 6. Delete Server
 @router.delete("/{server_id}")
 async def delete_server(server_id: str, delete_data: ServerDelete):

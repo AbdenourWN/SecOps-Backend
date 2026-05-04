@@ -1,14 +1,24 @@
 """
 Per-server connection pool for SSH (Paramiko) and WinRM sessions.
 
-Design rules:
+Two singletons are exported:
+  connection_pool  — used exclusively by the scheduler (try_get, skips if busy).
+  terminal_pool    — used exclusively by human terminal commands (get, waits).
+
+Separating the pools means long-running terminal sessions never block metric/log
+collection: the scheduler always has its own lock to acquire, and terminal users
+always have their own lock to wait on. Both can run simultaneously on the same
+server — SSH natively supports concurrent sessions; WinRM uses separate Protocol
+objects per pool so NTLM tokens don't collide.
+
+Design rules (per pool):
 - One PoolEntry per server_id. Each entry holds a live executor + asyncio.Lock.
-- The lock serializes ALL access to a server (scheduler + terminals share it).
 - Scheduler uses try_get(timeout) → skips the tick if the server is busy.
 - Terminals use get() → wait until the lock is available.
 - Credential freshness check runs on every get/try_get (1 small DB query).
 - Liveness probe runs if connection was idle >10 s.
 - Background sweeper closes idle connections (>5 min).
+- On server delete or credential change: evict from BOTH pools.
 """
 from __future__ import annotations
 
@@ -194,5 +204,8 @@ class ConnectionPool:
                 self.evict(sid)
 
 
-# Module-level singleton used by scheduler + service layer
+# Scheduler pool — telemetry/log collection (try_get, skips on contention)
 connection_pool = ConnectionPool()
+# Terminal pool — human command execution (get, waits for lock)
+# Kept separate so terminals never block scheduler collection.
+terminal_pool = ConnectionPool()

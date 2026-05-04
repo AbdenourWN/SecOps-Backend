@@ -23,6 +23,15 @@ from app.core.database import get_database
 from app.modules.heuristics.keywords import DEFAULT_KEYWORDS, SENSITIVE_KEYWORDS
 
 
+def _to_utc(dt: "datetime | None") -> "datetime | None":
+    """Attach UTC tzinfo to a naive datetime returned by MongoDB."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 # ────────────────────────────────────────────────────────────────────────
 # Keyword regex (compiled once at import)
 # ────────────────────────────────────────────────────────────────────────
@@ -174,7 +183,7 @@ class HeuristicService:
         is_novel = await self._check_and_record_pattern(
             server_id=str(server["_id"]),
             msg=msg,
-            in_warmup=bool(warmup_until and warmup_until > datetime.now(timezone.utc)),
+            in_warmup=bool(warmup_until and _to_utc(warmup_until) > datetime.now(timezone.utc)),
         )
         if is_novel:
             flags.append(("novel_pattern", 2))
@@ -268,16 +277,17 @@ class HeuristicService:
         # 2. Read existing baseline (and check for staleness)
         now = datetime.now(timezone.utc)
         baseline = float(server.get("log_rate_baseline") or 0.0)
-        last_updated = server.get("log_rate_updated_at")
+        last_updated = _to_utc(server.get("log_rate_updated_at"))
         if last_updated and (now - last_updated).total_seconds() > self.BASELINE_RESET_AFTER_S:
             baseline = 0.0  # stale — start fresh
 
         # 3. Decide flag BEFORE updating baseline (so a single spike
         #    doesn't poison its own comparison)
+        multiplier = (server.get("detection_config") or {}).get("volume_spike_multiplier") or self.SPIKE_MULTIPLIER
         spike: Optional[Tuple[int, float, str]] = None
         if (
             baseline >= self.BASELINE_MIN
-            and current > self.SPIKE_MULTIPLIER * baseline
+            and current > multiplier * baseline
         ):
             spike = (
                 current,

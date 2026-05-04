@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from typing import List
+from typing import List, Optional
 from app.modules.metrics.service import MetricService
 from app.modules.metrics.schemas import MetricResponse
 
@@ -12,5 +12,10 @@ async def trigger_collection(server_id: str):
     return {"status": "success" if success else "failed"}
 
 @router.get("/{server_id}", response_model=List[MetricResponse])
-async def get_metrics(server_id: str, limit: int = 20):
-    return await service.get_latest_metrics(server_id, limit)
+async def get_metrics(
+    server_id: str,
+    limit: int = 100,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+):
+    return await service.get_latest_metrics(server_id, limit, from_date, to_date)

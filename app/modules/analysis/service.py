@@ -12,18 +12,30 @@ from app.modules.heuristics.service import HeuristicService
 from app.modules.anomalies.service import AnomaliesService
 from app.core.events import event_bus
 
+
+def _to_utc(dt: "datetime | None") -> "datetime | None":
+    """Attach UTC tzinfo to a naive datetime returned by MongoDB."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 # ========================================================================
-# Remediation Verification Tunables
+# Remediation / Detection Tunables — GLOBAL DEFAULTS
+# All of these can be overridden per-server via DetectionConfig.
 # ========================================================================
-# After a remediation runs we wait this long before declaring success.
-# If the same rule re-fires on the same server within this window, the
-# remediation didn't work.
-VERIFICATION_WINDOW_MINUTES = 10
-# How many times we retry the same script before giving up and escalating.
-MAX_REMEDIATION_ATTEMPTS = 3
-# An open/verifying incident older than this is considered stale; a new
-# incident is opened instead of being treated as a recurrence.
-RECENT_INCIDENT_LOOKBACK_MINUTES = 30
+VERIFICATION_WINDOW_MINUTES = 10      # watch window after script runs
+MAX_REMEDIATION_ATTEMPTS = 3          # retries before escalation
+RECENT_INCIDENT_LOOKBACK_MINUTES = 30 # dedup lookback for OPEN/VERIFYING
+RECURRENCE_STREAK_THRESHOLD = 3       # consecutive "fix → recur" before pausing automation
+RECURRENCE_LOOKBACK_HOURS = 2         # how recent last resolution must be to count as chain
+
+
+def _cfg(server: dict) -> dict:
+    """Return the server's detection_config dict, falling back to empty."""
+    return server.get("detection_config") or {}
 
 # ========================================================================
 # OPT-4: RULE CACHE
@@ -158,7 +170,9 @@ class AnalysisService:
                     #   3. If nothing found → fresh detection: create incident
                     #      and (for L1/L2) run script, mark VERIFYING.
                     # ========================================================
-                    lookback_cutoff = now - timedelta(minutes=RECENT_INCIDENT_LOOKBACK_MINUTES)
+                    lookback_cutoff = now - timedelta(
+                        minutes=_cfg(server).get("incident_lookback_minutes") or RECENT_INCIDENT_LOOKBACK_MINUTES
+                    )
                     existing = await db["incidents"].find_one(
                         {
                             "server_id": server_id_str,
@@ -179,7 +193,7 @@ class AnalysisService:
                         if existing.get("automation_failure_reason") == "remediation_exhausted":
                             continue
 
-                        verification_until = existing.get("verification_until")
+                        verification_until = _to_utc(existing.get("verification_until"))
                         in_verification_window = (
                             existing.get("status") == IncidentStatus.VERIFYING.value
                             and verification_until is not None
@@ -189,9 +203,10 @@ class AnalysisService:
                         if in_verification_window:
                             # Re-trigger inside the verification window → previous remediation FAILED.
                             attempts = existing.get("remediation_attempts", 0) + 1
-                            print(f"🔁 Rule '{rule['name']}' re-fired during verification — attempt {attempts}/{MAX_REMEDIATION_ATTEMPTS}")
+                            max_attempts = _cfg(server).get("max_remediation_attempts") or MAX_REMEDIATION_ATTEMPTS
+                            print(f"🔁 Rule '{rule['name']}' re-fired during verification — attempt {attempts}/{max_attempts}")
 
-                            if attempts >= MAX_REMEDIATION_ATTEMPTS:
+                            if attempts >= max_attempts:
                                 # Give up — mark exhausted, escalate, do NOT re-run.
                                 await db["incidents"].update_one(
                                     {"_id": existing_id},
@@ -237,7 +252,7 @@ class AnalysisService:
                                 {"$set": {
                                     "remediation_attempts": attempts,
                                     "last_remediation_at": now,
-                                    "verification_until": now + timedelta(minutes=VERIFICATION_WINDOW_MINUTES),
+                                    "verification_until": now + timedelta(minutes=_cfg(server).get("verification_window_minutes") or VERIFICATION_WINDOW_MINUTES),
                                     "status": IncidentStatus.VERIFYING.value,
                                 }},
                             )
@@ -292,6 +307,32 @@ class AnalysisService:
                         elif not script_doc.get("enabled", True):
                             skipped_reason = "script_disabled"
 
+                    # Recurrence check — has the same script "fixed" this on this server
+                    # repeatedly without lasting effect? Count consecutive auto-resolved
+                    # → recurrence cycles. When the streak reaches the threshold, pause
+                    # automation and alert (treated as skipped_reason path).
+                    recurrence_streak = 0
+                    if action_level in [1, 2] and candidate_script_id and not skipped_reason:
+                        recurrence_threshold = _cfg(server).get("recurrence_streak_threshold") or RECURRENCE_STREAK_THRESHOLD
+                        recurrence_lookback_h = _cfg(server).get("recurrence_lookback_hours") or RECURRENCE_LOOKBACK_HOURS
+                        recurrence_cutoff = now - timedelta(hours=recurrence_lookback_h)
+
+                        last_resolved = await db["incidents"].find_one(
+                            {
+                                "server_id": server_id_str,
+                                "rule_id": rule_id_str,
+                                "status": IncidentStatus.RESOLVED.value,
+                                "detected_at": {"$gte": recurrence_cutoff},
+                            },
+                            sort=[("detected_at", -1)],
+                        )
+                        if last_resolved:
+                            recurrence_streak = (last_resolved.get("recurrence_streak") or 0) + 1
+
+                        if recurrence_streak >= recurrence_threshold:
+                            skipped_reason = "recurrence_detected"
+                            print(f"🔄 Recurrence streak {recurrence_streak}/{recurrence_threshold} for '{rule['name']}' on {server.get('hostname')} — pausing automation")
+
                     alert_payload = AlertPayload(
                         incident_id="",
                         server_id=server_id_str,
@@ -316,9 +357,15 @@ class AnalysisService:
                         incident_data["status"] = IncidentStatus.VERIFYING.value
                         incident_data["remediation_attempts"] = 1
                         incident_data["last_remediation_at"] = now
-                        incident_data["verification_until"] = now + timedelta(minutes=VERIFICATION_WINDOW_MINUTES)
+                        incident_data["verification_until"] = now + timedelta(minutes=_cfg(server).get("verification_window_minutes") or VERIFICATION_WINDOW_MINUTES)
+                        incident_data["recurrence_streak"] = recurrence_streak
                         inc_result = await db["incidents"].insert_one(incident_data)
                         incident_id = str(inc_result.inserted_id)
+                        await db["servers"].update_one(
+                            {"_id": ObjectId(server_id_str)},
+                            {"$inc": {"open_incidents_count": 1}},
+                        )
+                        event_bus.emit("servers", "server.updated", {"server_id": server_id_str})
 
                         event_bus.emit("incidents", "incident.created", {
                             "incident_id": incident_id,
@@ -343,14 +390,14 @@ class AnalysisService:
                             variables=extracted_context,
                         )
 
-                        # Hard execution failure (exit != 0) — drop verification, surface as OPEN.
+                        # Execution failure — keep VERIFYING + window intact so the retry
+                        # path fires if the rule re-triggers within the window. Clearing
+                        # VERIFYING here would permanently block retries (Bug 2).
+                        # Annotate the failure reason for operator visibility.
                         if not success:
                             await db["incidents"].update_one(
                                 {"_id": inc_result.inserted_id},
-                                {"$set": {
-                                    "status": IncidentStatus.OPEN.value,
-                                    "verification_until": None,
-                                }},
+                                {"$set": {"automation_failure_reason": "execution_failed"}},
                             )
 
                         # Alert on all action levels, success or failure.
@@ -359,11 +406,17 @@ class AnalysisService:
                         await self.notification_service.send_alert(alert_payload)
 
                     elif action_level in [1, 2] and skipped_reason:
-                        # Script disabled/missing — degrade to alert-only.
+                        # Script disabled/missing/recurrence_detected — degrade to alert-only.
                         incident_data = incident.model_dump()
                         incident_data["automation_skipped_reason"] = skipped_reason
+                        incident_data["recurrence_streak"] = recurrence_streak
                         inc_result = await db["incidents"].insert_one(incident_data)
                         incident_id = str(inc_result.inserted_id)
+                        await db["servers"].update_one(
+                            {"_id": ObjectId(server_id_str)},
+                            {"$inc": {"open_incidents_count": 1}},
+                        )
+                        event_bus.emit("servers", "server.updated", {"server_id": server_id_str})
                         print(f"⚠️ Automation skipped ({skipped_reason}) for rule: {rule['name']}")
                         event_bus.emit("incidents", "incident.created", {
                             "incident_id": incident_id,
@@ -391,7 +444,9 @@ class AnalysisService:
                         dedup_key = (server_id_str, rule_id_str)
                         if dedup_key not in _batch_l3_keys:
                             _batch_l3_keys.add(dedup_key)
-                            new_incidents.append(incident.model_dump())
+                            inc_data = incident.model_dump()
+                            inc_data["recurrence_streak"] = 0  # L3 never runs a script
+                            new_incidents.append(inc_data)
 
             # ── Tier 2: heuristic fallback for logs that no rule matched ──
             if not matched_any:
@@ -409,6 +464,17 @@ class AnalysisService:
         if new_incidents:
             inc_results = await db["incidents"].insert_many(new_incidents)
             print(f"💾 Saved {len(new_incidents)} new incidents.")
+
+            # Increment open_incidents_count per server (one $inc per distinct server_id)
+            _sid_counts: dict[str, int] = {}
+            for inc_data in new_incidents:
+                _sid_counts[inc_data["server_id"]] = _sid_counts.get(inc_data["server_id"], 0) + 1
+            for _sid_str, _delta in _sid_counts.items():
+                await db["servers"].update_one(
+                    {"_id": ObjectId(_sid_str)},
+                    {"$inc": {"open_incidents_count": _delta}},
+                )
+                event_bus.emit("servers", "server.updated", {"server_id": _sid_str})
 
             for i, inc_data in enumerate(new_incidents):
                 _sid = inc_data["server_id"]
