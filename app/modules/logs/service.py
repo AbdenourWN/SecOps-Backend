@@ -7,6 +7,7 @@ from app.core.elasticsearch import get_elasticsearch
 from app.modules.logs.schemas import LogEntryInDB, map_priority_to_level
 from app.core.executors import get_server_executor, DEFAULT_COMMAND_TIMEOUT_S
 from app.core.security import decrypt_password
+from app.core.datetime_utils import utc_now
 from bson import ObjectId
 from app.modules.analysis.service import AnalysisService
 from app.modules.logs.schemas import LogLevel
@@ -14,12 +15,7 @@ from elasticsearch.helpers import async_bulk
 
 
 def _get_log_index_name():
-    """
-    Returns the current index name based on the month.
-    Example: "secops-logs-2026.03"
-    """
-    now = datetime.now(timezone.utc)
-    return f"secops-logs-{now.strftime('%Y.%m')}"
+    return f"secops-logs-{utc_now().strftime('%Y.%m')}"
 
 
 class LogService:
@@ -176,7 +172,7 @@ class LogService:
                 "os_type": "linux",
                 "source": "journalctl",
                 "log_source": "system",
-                "ingested_at": datetime.now(timezone.utc).isoformat(),
+                "ingested_at": utc_now().isoformat(),
             }
 
             new_logs.append(log_doc)
@@ -206,7 +202,7 @@ class LogService:
             "%{$m=$_.Message;"
             "if(-not $m){$m=($_.Properties.Value|?{$_ -is [string]})-join' '};"
             "if(-not $m){$m=\"EventId=$($_.Id)\"};"
-            "[PSCustomObject]@{TimeCreated=$_.TimeCreated.ToString('o');"
+            "[PSCustomObject]@{TimeCreated=$_.TimeCreated.ToUniversalTime().ToString('o');"
             "Id=$_.Id;LevelDisplayName=$_.LevelDisplayName;"
             "Message=$m;ProviderName=$_.ProviderName}}|ConvertTo-Json -Compress"
         )
@@ -242,9 +238,9 @@ class LogService:
 
             tc = entry.get("TimeCreated") or ""
             try:
-                timestamp = datetime.fromisoformat(tc.replace("Z", "+00:00")) if tc else datetime.now(timezone.utc)
+                timestamp = datetime.fromisoformat(tc.replace("Z", "+00:00")).astimezone(timezone.utc) if tc else utc_now()
             except (ValueError, AttributeError):
-                timestamp = datetime.now(timezone.utc)
+                timestamp = utc_now()
             ts_iso = timestamp.isoformat()
 
             # OPT-3: Skip if we already have this timestamp
@@ -264,7 +260,7 @@ class LogService:
                 "os_type": "windows",
                 "source": "winevent",
                 "log_source": "system",
-                "ingested_at": datetime.now(timezone.utc).isoformat(),
+                "ingested_at": utc_now().isoformat(),
             }
 
             new_logs.append(log_doc)

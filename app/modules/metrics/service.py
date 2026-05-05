@@ -6,11 +6,11 @@ from app.core.executors import get_server_executor, DEFAULT_COMMAND_TIMEOUT_S
 from app.core.security import decrypt_password
 from bson import ObjectId
 from datetime import datetime, timezone
+from app.core.datetime_utils import utc_now
 import uuid
 
 def _get_metric_index_name():
-    now = datetime.now(timezone.utc)
-    return f"secops-metrics-{now.strftime('%Y.%m')}"
+    return f"secops-metrics-{utc_now().strftime('%Y.%m')}"
 
 class MetricService:
     
@@ -68,7 +68,7 @@ class MetricService:
                 "ram_usage": round(ram_val, 2),
                 "disk_usage": round(disk_val, 2),
                 "raw_data": output,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": utc_now().isoformat(),
             }
 
             es = get_elasticsearch()
@@ -91,7 +91,7 @@ class MetricService:
                     "cpu_usage": metric_doc["cpu_usage"],
                     "ram_usage": metric_doc["ram_usage"],
                     "disk_usage": metric_doc["disk_usage"],
-                    "collected_at": datetime.now(timezone.utc),
+                    "collected_at": utc_now(),
                 }}},
             )
 

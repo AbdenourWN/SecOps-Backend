@@ -11,15 +11,7 @@ from app.modules.notifications.schemas import AlertPayload
 from app.modules.heuristics.service import HeuristicService
 from app.modules.anomalies.service import AnomaliesService
 from app.core.events import event_bus
-
-
-def _to_utc(dt: "datetime | None") -> "datetime | None":
-    """Attach UTC tzinfo to a naive datetime returned by MongoDB."""
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+from app.core.datetime_utils import to_utc
 
 
 # ========================================================================
@@ -193,7 +185,7 @@ class AnalysisService:
                         if existing.get("automation_failure_reason") == "remediation_exhausted":
                             continue
 
-                        verification_until = _to_utc(existing.get("verification_until"))
+                        verification_until = to_utc(existing.get("verification_until"))
                         in_verification_window = (
                             existing.get("status") == IncidentStatus.VERIFYING.value
                             and verification_until is not None

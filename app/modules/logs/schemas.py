@@ -1,10 +1,8 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Any, Dict
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
-
-def utc_now():
-    return datetime.now(timezone.utc)
+from app.core.datetime_utils import utc_now
 
 class LogParserType(str, Enum):
     RAW = "raw"

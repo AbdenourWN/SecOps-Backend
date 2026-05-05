@@ -1,14 +1,12 @@
 from pydantic import BaseModel, Field, BeforeValidator, ConfigDict
 from typing import List, Optional, Annotated
 from enum import Enum
-from datetime import datetime ,timezone
+from datetime import datetime
+from app.core.datetime_utils import utc_now
 
 # --- Helpers ---
 # This tells Pydantic: "If you see an ObjectId, turn it into a string"
 PyObjectId = Annotated[str, BeforeValidator(str)]
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 # --- Shared Logic ---
@@ -22,6 +20,7 @@ class OSType(str, Enum):
 
 class ServerStatus(str, Enum):
     ONLINE = "online"
+    REACHABLE = "reachable"   # TCP ok, credentials broken
     OFFLINE = "offline"
     UNKNOWN = "unknown"
     WARNING = "warning"
@@ -158,7 +157,9 @@ class ServerInDB(TimestampModel, ServerBase):
     credential_id: str
 
     status: ServerStatus = ServerStatus.UNKNOWN
+    is_online: bool = False
     last_health_check: Optional[datetime] = None
+    auth_failure_reason: Optional[str] = None
 
     # Adaptive health-check backoff (internal scheduling state, written by
     # `update_all_server_statuses`).
@@ -172,6 +173,7 @@ class ServerResponse(TimestampModel, ServerBase):
     id: PyObjectId = Field(alias="_id")
 
     status: ServerStatus = ServerStatus.UNKNOWN
+    auth_failure_reason: Optional[str] = None
     last_health_check: Optional[datetime] = None
     consecutive_offline_checks: int = 0
 

@@ -1,9 +1,23 @@
 import logging
 import traceback
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+import fastapi.encoders as _fe
+
+# Ensure every datetime serialised by FastAPI includes a UTC offset.
+# PyMongo strips tzinfo on round-trip, so naive datetimes (which are always
+# UTC in this codebase) must be re-labelled before being sent to clients.
+_orig_dt_encoder = _fe.ENCODERS_BY_TYPE.get(datetime, str)
+
+def _utc_datetime_encoder(v: datetime) -> str:
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    return v.isoformat()
+
+_fe.ENCODERS_BY_TYPE[datetime] = _utc_datetime_encoder
 from contextlib import asynccontextmanager
 from app.core.database import connect_to_mongo, close_mongo_connection
 from app.core.elasticsearch import connect_to_elasticsearch, close_elasticsearch

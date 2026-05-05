@@ -6,6 +6,7 @@ from app.core.executors import DEFAULT_COMMAND_TIMEOUT_S
 from app.core.elasticsearch import get_elasticsearch
 from app.core.events import event_bus
 from app.modules.logs.schemas import LogLevel
+from app.modules.logs.parsers import parse_log_line
 from bson import ObjectId
 from datetime import datetime, timezone
 from elasticsearch.helpers import async_bulk
@@ -363,26 +364,28 @@ class FileWatcherService:
         server_id = source_doc["server_id"]
         hostname = (server or {}).get("hostname") or server_id
         os_type = (server or {}).get("os_type", "linux")
-        now = datetime.now(timezone.utc)
+        parser_type = source_doc.get("parser_type", "raw")
+        ingestion_time = datetime.now(timezone.utc)
 
         lines = raw_data.split("\n")
         new_logs = []
         for line in lines:
             if not line.strip():
                 continue
+            parsed = parse_log_line(line, parser_type, ingestion_time)
             doc_id = str(uuid.uuid4())
             new_logs.append({
                 "_id": doc_id,
                 "server_id": server_id,
                 "hostname": hostname,
-                "timestamp": now.isoformat(),
-                "message": line.strip(),
+                "timestamp": parsed["timestamp"].isoformat(),
+                "message": parsed["message"],
                 "service": source_doc["name"],
-                "level": LogLevel.INFO.value,
+                "level": parsed["level"].upper(),
                 "os_type": os_type,
                 "source": "file_watcher",
                 "log_source": source_doc.get("name", "file"),
-                "ingested_at": now.isoformat(),
+                "ingested_at": ingestion_time.isoformat(),
             })
 
         if not new_logs:

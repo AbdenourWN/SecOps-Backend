@@ -1,7 +1,8 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
+from app.core.datetime_utils import utc_now
 
 # Re-export incident schemas from their new home for backward compatibility
 from app.modules.incidents.schemas import (
@@ -10,9 +11,6 @@ from app.modules.incidents.schemas import (
     IncidentInDB,
     ActionLevel,
 )
-
-def utc_now():
-    return datetime.now(timezone.utc)
 
 class RuleOSType(str, Enum):
     LINUX = "linux"

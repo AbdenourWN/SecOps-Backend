@@ -7,6 +7,7 @@ from app.modules.servers.schemas import ServerCreate, ServerInDB, CredentialInDB
 from app.core.security import encrypt_password, decrypt_password
 from bson import ObjectId
 from datetime import datetime, timedelta, timezone
+from app.core.datetime_utils import utc_now
 from app.core.executors import get_server_executor, Chunk, ChunkDone
 # get_server_executor kept for health-check path (direct TCP, no pool)
 from app.core.rate_limit import check_rate_limit
@@ -64,28 +65,66 @@ class ServerService:
         async def check_one(server):
             server_id = str(server["_id"])
             previous_status = server.get("status")
-            now = datetime.now(timezone.utc)
+            now = utc_now()
 
             async with sem:
-                executor = get_server_executor(server, plain_password="")
-                is_online = await executor.check_health()
-                new_status = ServerStatus.ONLINE if is_online else ServerStatus.OFFLINE
+                # ── Tier 1: TCP / banner-grab (no credentials needed) ──
+                tcp_executor = get_server_executor(server, plain_password="")
+                reachable = await tcp_executor.check_health()
 
-                if is_online:
-                    update = {
-                        "status": new_status,
-                        "is_online": True,
-                        "last_health_check": now,
-                        "consecutive_offline_checks": 0,
-                    }
-                else:
+                if not reachable:
                     n = (server.get("consecutive_offline_checks") or 0) + 1
                     update = {
-                        "status": new_status,
+                        "status": ServerStatus.OFFLINE,
                         "is_online": False,
                         "last_health_check": now,
                         "consecutive_offline_checks": n,
+                        "auth_failure_reason": None,
                     }
+                else:
+                    # ── Tier 2: auth probe — run cheap command with real credentials ──
+                    auth_ok = False
+                    fail_reason = None
+                    try:
+                        cred = await db["credentials"].find_one(
+                            {"_id": ObjectId(server["credential_id"])}
+                        )
+                        if cred:
+                            plain_secret = decrypt_password(cred["encrypted_secret"])
+                            auth_executor = get_server_executor(server, plain_secret)
+                            auth_executor.credential["username"] = cred["username"]
+                            probe_cmd = (
+                                "[System.Environment]::UserName"
+                                if server.get("os_type") == "windows"
+                                else "whoami"
+                            )
+                            result = await auth_executor.run_command(
+                                probe_cmd, timeout_s=8
+                            )
+                            auth_ok = result.get("status") == "success"
+                            if not auth_ok:
+                                fail_reason = result.get("error") or "command_failed"
+                        else:
+                            fail_reason = "no_credentials"
+                    except Exception as e:
+                        fail_reason = str(e)[:120]
+
+                    if auth_ok:
+                        update = {
+                            "status": ServerStatus.ONLINE,
+                            "is_online": True,
+                            "last_health_check": now,
+                            "consecutive_offline_checks": 0,
+                            "auth_failure_reason": None,
+                        }
+                    else:
+                        update = {
+                            "status": ServerStatus.REACHABLE,
+                            "is_online": False,
+                            "last_health_check": now,
+                            "consecutive_offline_checks": 0,
+                            "auth_failure_reason": fail_reason,
+                        }
 
                 await db["servers"].update_one(
                     {"_id": server["_id"]},

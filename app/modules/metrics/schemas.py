@@ -1,9 +1,7 @@
 from pydantic import BaseModel, Field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
-
-def utc_now():
-    return datetime.now(timezone.utc)
+from app.core.datetime_utils import utc_now
 
 class SystemMetric(BaseModel):
     server_id: str

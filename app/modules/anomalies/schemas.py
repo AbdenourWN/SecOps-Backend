@@ -1,15 +1,12 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Annotated, List, Optional
 
 from pydantic import BaseModel, BeforeValidator, Field
 
+from app.core.datetime_utils import utc_now
 
 PyObjectId = Annotated[str, BeforeValidator(str)]
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
 
 
 class AnomalyType(str, Enum):

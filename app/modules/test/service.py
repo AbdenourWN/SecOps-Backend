@@ -1,8 +1,9 @@
 from app.core.database import get_database
 from app.core.executors import get_server_executor, DEFAULT_COMMAND_TIMEOUT_S
 from app.core.security import decrypt_password
+from app.core.datetime_utils import utc_now
 from bson import ObjectId
-from datetime import datetime, timezone
+from datetime import timedelta
 
 
 # ============================================================
@@ -91,21 +92,102 @@ WINDOWS_SYSTEM_SCENARIOS = [
     },
 ]
 
-# Application-level fake log lines (for file-based injection)
-FAKE_APP_LOG_LINES = [
-    # SQL Injection attempts
-    'GET /search?q=1+OR+1%3D1 HTTP/1.1" 200 1234',
-    'POST /login?user=admin" union select 1,2,3-- HTTP/1.1" 200 567',
-    # Web server errors
-    'GET /api/data HTTP/1.1" 500 0',
-    'GET /api/users HTTP/1.1" 502 0',
-    'POST /api/submit HTTP/1.1" 503 0',
-    # Simulated attack marker (matches the test rule)
-    "Hacking Attempt detected from 10.99.99.5",
-    # Normal looking logs (should NOT trigger rules)
-    'GET /index.html HTTP/1.1" 200 4523',
-    'GET /static/style.css HTTP/1.1" 200 1234',
-]
+# ─── File-log line generators (called at simulation time so timestamps are live) ─────
+
+def _nginx_lines(now):
+    """Nginx combined log format — timestamps with explicit tz offset."""
+    entries = [
+        # 5 minutes ago — SQL injection attempt → should trigger rule, 200 (info level)
+        (now - timedelta(minutes=5), "GET", '/search?q=1+OR+1%3D1', 200, 512),
+        # 4 min ago — union select injection, 200
+        (now - timedelta(minutes=4), "POST", '/login?user=admin"+union+select+1,2,3--', 200, 234),
+        # 3 min ago — internal server error → error level
+        (now - timedelta(minutes=3), "GET", '/api/data', 500, 0),
+        # 2 min ago — bad gateway → error level
+        (now - timedelta(minutes=2), "GET", '/api/users', 502, 0),
+        # 1 min ago — service unavailable → error level
+        (now - timedelta(minutes=1), "POST", '/api/submit', 503, 0),
+        # 30s ago — normal request → info level
+        (now - timedelta(seconds=30), "GET", '/index.html', 200, 4523),
+        # now — normal request
+        (now, "GET", '/static/style.css', 200, 1234),
+    ]
+    lines = []
+    for ts, method, path, status, size in entries:
+        ts_str = ts.strftime("%d/%b/%Y:%H:%M:%S +0000")
+        lines.append(
+            f'10.99.99.5 - - [{ts_str}] "{method} {path} HTTP/1.1" {status} {size} "-" "secops-test/1.0"'
+        )
+    return lines
+
+
+def _apache_lines(now):
+    """Apache combined log format — same structure as nginx."""
+    entries = [
+        (now - timedelta(minutes=6), "GET", '/admin/config', 403, 0),
+        (now - timedelta(minutes=5), "POST", '/wp-login.php', 200, 1024),
+        (now - timedelta(minutes=3), "GET", '/api/v1/users', 500, 0),
+        (now - timedelta(minutes=2), "GET", '/api/v1/data', 502, 0),
+        (now - timedelta(minutes=1), "GET", '/health', 200, 18),
+    ]
+    lines = []
+    for ts, method, path, status, size in entries:
+        ts_str = ts.strftime("%d/%b/%Y:%H:%M:%S +0000")
+        lines.append(
+            f'10.99.99.6 - testuser [{ts_str}] "{method} {path} HTTP/1.1" {status} {size}'
+        )
+    return lines
+
+
+def _json_lines(now):
+    """Structured JSON logs — timestamp, level, message fields."""
+    import json
+    entries = [
+        (now - timedelta(minutes=5), "error",    "SQL injection attempt detected from 10.99.99.5"),
+        (now - timedelta(minutes=4), "warning",  "Failed password for admin from 10.99.99.1"),
+        (now - timedelta(minutes=3), "error",    "Uncaught exception: NullPointerException in PaymentService"),
+        (now - timedelta(minutes=2), "critical", "Out of memory: Kill process 9821 (java)"),
+        (now - timedelta(minutes=1), "warning",  "sudo: hacker : user NOT in sudoers"),
+        (now - timedelta(seconds=30),"info",     "Health check OK"),
+        (now,                        "info",     "Request handled in 12ms"),
+    ]
+    lines = []
+    for ts, level, message in entries:
+        lines.append(json.dumps({
+            "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+            "level": level,
+            "message": message,
+            "service": "secops-test",
+            "host": "test-server",
+        }))
+    return lines
+
+
+def _raw_lines(now):
+    """Syslog-style raw lines (RFC 3164 prefix: MMM DD HH:MM:SS)."""
+    entries = [
+        (now - timedelta(minutes=5), "sshd",    "Failed password for admin from 10.99.99.1 port 22 ssh2"),
+        (now - timedelta(minutes=4), "sshd",    "Failed password for root from 10.99.99.1 port 22 ssh2"),
+        (now - timedelta(minutes=3), "sshd",    "Accepted password for root from 10.99.99.2 port 22 ssh2"),
+        (now - timedelta(minutes=2), "kernel",  "Out of memory: Kill process 5678 (java)"),
+        (now - timedelta(minutes=1), "useradd", "new user: name=backdoor_user, UID=1337, GID=1337"),
+        (now - timedelta(seconds=45),"sudo",    "hacker : user NOT in sudoers"),
+        (now,                        "sshd",    "session opened for user operator"),
+    ]
+    lines = []
+    for ts, process, message in entries:
+        ts_str = ts.strftime("%b %d %H:%M:%S").replace("  ", " ")  # single-digit day pad
+        lines.append(f"{ts_str} testserver {process}[1234]: {message}")
+    return lines
+
+
+# Map parser_type → (generator_fn, file_suffix, log_source_name)
+_PARSER_CONFIGS = {
+    "nginx":  (_nginx_lines,  "nginx",  "SecOps Test — Nginx",  "nginx"),
+    "apache": (_apache_lines, "apache", "SecOps Test — Apache", "apache"),
+    "json":   (_json_lines,   "json",   "SecOps Test — JSON",   "json"),
+    "raw":    (_raw_lines,    "raw",    "SecOps Test — Syslog", "raw"),
+}
 
 
 class SimulationService:
@@ -134,7 +216,8 @@ class SimulationService:
             {"name": s["name"], "description": s["description"], "triggers_rule": s["triggers_rule"]}
             for s in WINDOWS_SYSTEM_SCENARIOS
         ]
-        return {"linux": linux, "windows": windows}
+        file_log_parsers = list(_PARSER_CONFIGS.keys()) + ["all"]
+        return {"linux": linux, "windows": windows, "file_log_parsers": file_log_parsers}
 
     async def simulate_system_logs(self, server_id: str = None, scenario: str = None):
         """
@@ -144,7 +227,6 @@ class SimulationService:
         """
         db = get_database()
 
-        # Fetch target servers
         if server_id:
             try:
                 server = await db["servers"].find_one({"_id": ObjectId(server_id)})
@@ -165,13 +247,11 @@ class SimulationService:
             os_type = server.get("os_type", "linux")
             hostname = server.get("hostname", server.get("ip_address"))
 
-            # Pick scenarios based on OS
             if os_type == "windows":
                 scenarios = WINDOWS_SYSTEM_SCENARIOS
             else:
                 scenarios = LINUX_SYSTEM_SCENARIOS
 
-            # Filter to specific scenario if requested
             if scenario:
                 scenarios = [s for s in scenarios if s["name"] == scenario]
                 if not scenarios:
@@ -182,7 +262,6 @@ class SimulationService:
                     })
                     continue
 
-            # Get executor
             executor = await self._get_server_executor(server)
             if not executor:
                 results.append({
@@ -192,7 +271,6 @@ class SimulationService:
                 })
                 continue
 
-            # Execute all commands
             server_result = {
                 "server": hostname,
                 "os_type": os_type,
@@ -220,15 +298,16 @@ class SimulationService:
             "results": results,
         }
 
-    async def simulate_file_logs(self, server_id: str = None):
+    async def simulate_file_logs(self, server_id: str = None, parser_type: str = "nginx"):
         """
-        Step 2 & 3: Creates a test log file on each server,
-        writes fake application logs to it, and auto-registers
-        a logSource so the FileWatcher picks it up.
+        Writes fake log files to each server and registers a LogSource with the
+        matching parser_type so the FileWatcher uses the correct timestamp parser.
+
+        parser_type: "nginx" | "apache" | "json" | "raw" | "all"
+          - "all" creates one file + LogSource per parser type in a single call.
         """
         db = get_database()
 
-        # Fetch target servers
         if server_id:
             try:
                 server = await db["servers"].find_one({"_id": ObjectId(server_id)})
@@ -243,6 +322,14 @@ class SimulationService:
         if not servers:
             return {"status": "failed", "error": "No servers registered"}
 
+        pt = parser_type.lower()
+        if pt not in _PARSER_CONFIGS and pt != "all":
+            return {
+                "status": "failed",
+                "error": f"Unknown parser_type '{parser_type}'. Use: nginx, apache, json, raw, all",
+            }
+
+        parsers_to_run = list(_PARSER_CONFIGS.keys()) if pt == "all" else [pt]
         results = []
 
         for server in servers:
@@ -250,80 +337,86 @@ class SimulationService:
             hostname = server.get("hostname", server.get("ip_address"))
             sid = str(server["_id"])
 
-            # Determine test file path based on OS
-            if os_type == "windows":
-                test_file = "C:\\\\Temp\\\\secops_test.log"
-                # PowerShell: create directory if needed, then append lines
-                lines_escaped = "`n".join(FAKE_APP_LOG_LINES)
-                cmd = (
-                    f"New-Item -ItemType Directory -Force -Path 'C:\\Temp' | Out-Null; "
-                    f"Add-Content -Path '{test_file}' -Value '{lines_escaped}'; "
-                    f"Write-Output 'Written {len(FAKE_APP_LOG_LINES)} lines'"
-                )
-            else:
-                test_file = "/tmp/secops_test.log"
-                # Bash: append each line
-                lines_cmd = " && ".join(
-                    [f'echo "{line}" >> {test_file}' for line in FAKE_APP_LOG_LINES]
-                )
-                cmd = lines_cmd + f" && echo 'Written {len(FAKE_APP_LOG_LINES)} lines'"
-
-            # Get executor
             executor = await self._get_server_executor(server)
             if not executor:
-                results.append({
-                    "server": hostname,
-                    "status": "failed",
-                    "error": "Could not build executor",
-                })
+                results.append({"server": hostname, "status": "failed", "error": "Could not build executor"})
                 continue
 
-            # Write the file
-            write_result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
+            now = utc_now()
+            server_result = {"server": hostname, "os_type": os_type, "sources": []}
 
-            if write_result["status"] == "failed":
-                results.append({
-                    "server": hostname,
-                    "status": "failed",
-                    "error": write_result.get("error"),
+            for ptype in parsers_to_run:
+                gen_fn, file_suffix, source_name, _ = _PARSER_CONFIGS[ptype]
+                lines = gen_fn(now)
+
+                # Determine file path per OS
+                if os_type == "windows":
+                    test_file = f"C:\\\\Temp\\\\secops_test_{file_suffix}.log"
+                    lines_ps = "`n".join(line.replace("'", "''") for line in lines)
+                    cmd = (
+                        f"New-Item -ItemType Directory -Force -Path 'C:\\Temp' | Out-Null; "
+                        f"Set-Content -Path '{test_file}' -Value '{lines_ps}'; "
+                        f"Write-Output 'Written {len(lines)} lines'"
+                    )
+                else:
+                    test_file = f"/tmp/secops_test_{file_suffix}.log"
+                    # Use printf to avoid echo mangling special chars
+                    escaped = "\n".join(line.replace("'", "'\\''") for line in lines)
+                    cmd = f"printf '%s\\n' '{escaped}' > {test_file} && echo 'Written {len(lines)} lines'"
+
+                write_result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
+
+                if write_result["status"] == "failed":
+                    server_result["sources"].append({
+                        "parser_type": ptype,
+                        "status": "failed",
+                        "error": write_result.get("error"),
+                    })
+                    continue
+
+                # Register or update the LogSource with the correct parser_type
+                existing = await db["log_sources"].find_one({
+                    "server_id": sid,
+                    "file_path": test_file,
                 })
-                continue
 
-            # Auto-register logSource (if not already registered)
-            existing = await db["log_sources"].find_one({
-                "server_id": sid,
-                "file_path": test_file,
-            })
+                # Always delete and recreate so offset, inode and error_count are clean
+                if existing:
+                    await db["log_sources"].delete_one({"_id": existing["_id"]})
 
-            if not existing:
                 log_source = {
                     "server_id": sid,
-                    "name": "SecOps Test Log",
+                    "name": source_name,
                     "file_path": test_file,
-                    "parser_type": "raw",
+                    "parser_type": ptype,
                     "last_offset": 0,
                     "last_inode": None,
                     "last_header": None,
                     "error_count": 0,
                     "is_active": True,
-                    "created_at": datetime.now(timezone.utc),
+                    "created_at": now,
                 }
                 await db["log_sources"].insert_one(log_source)
-                source_status = "created"
-            else:
-                source_status = "already_exists"
+                source_status = "replaced" if existing else "created"
 
-            results.append({
-                "server": hostname,
-                "os_type": os_type,
-                "status": "success",
-                "file_path": test_file,
-                "lines_written": len(FAKE_APP_LOG_LINES),
-                "log_source": source_status,
-            })
+                server_result["sources"].append({
+                    "parser_type": ptype,
+                    "file_path": test_file,
+                    "lines_written": len(lines),
+                    "log_source": source_status,
+                    "status": "success",
+                })
+
+            results.append(server_result)
 
         return {
             "status": "success",
-            "message": "Test files written and logSources registered. Wait ~60s for the FileWatcher to pick them up.",
+            "message": (
+                "Test files written and LogSources registered. "
+                "Wait ~60s for the FileWatcher to pick them up. "
+                "Timestamps in each file are set to real past times so the parser "
+                "extracts the event time rather than the ingestion time."
+            ),
+            "parsers_tested": parsers_to_run,
             "results": results,
         }
