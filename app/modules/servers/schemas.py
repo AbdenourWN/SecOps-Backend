@@ -130,6 +130,31 @@ class DetectionConfig(BaseModel):
             "Higher = only flag extreme spikes."
         ),
     )
+    anomaly_dedup_window_hours: float = Field(
+        default=2.0, ge=0.25, le=24.0,
+        description=(
+            "How long (hours) identical anomaly observations are aggregated into "
+            "one row instead of creating new rows. Repeated detections within this "
+            "window just bump the occurrence count. Shorter = more rows but finer "
+            "time slices; longer = fewer rows but each may span a wide window."
+        ),
+    )
+    anomaly_suppression_ttl_hours: float = Field(
+        default=24.0, ge=1.0, le=168.0,
+        description=(
+            "How long (hours) a dismissed anomaly fingerprint suppresses new "
+            "detections of the same pattern. 24h = dismiss once, silent for a day. "
+            "Raise for chronic noisy patterns; lower if you want to see them again sooner."
+        ),
+    )
+    anomaly_auto_promote: bool = Field(
+        default=False,
+        description=(
+            "Automatically promote observations to incidents when severity=high "
+            "and occurrence_count≥3 and the fingerprint is not suppressed. "
+            "Disable on noisy servers until the keyword/pattern tuning is dialled in."
+        ),
+    )
 
 
 # --- Server Schemas ---
@@ -142,6 +167,9 @@ class ServerBase(BaseModel):
     business_hours: Optional[BusinessHours] = None
     # Detection algorithm tunables (optional — global defaults apply when None)
     detection_config: Optional[DetectionConfig] = None
+    # Windows Event Log filters (ignored on Linux servers)
+    windows_event_ids: Optional[List[int]] = None           # allowlist; None = all
+    windows_event_ids_exclude: Optional[List[int]] = None   # denylist applied after allowlist
     
 
 class ServerCreate(ServerBase):
@@ -198,6 +226,8 @@ class ServerUpdate(BaseModel):
     port: Optional[int] = None
     business_hours: Optional[BusinessHours] = None
     detection_config: Optional[DetectionConfig] = None
+    windows_event_ids: Optional[List[int]] = None
+    windows_event_ids_exclude: Optional[List[int]] = None
 
     # Allow updating the stored credential (e.g., changing the password)
     credential: Optional[CredentialUpdate] = None

@@ -196,9 +196,25 @@ class LogService:
         # is irrelevant and TimeCreated is ISO-8601.  The $m fallback pulls the
         # raw substitution strings when the source has no registered message DLL
         # (the common case for custom Write-EventLog sources).
+        # Build EventID allowlist / denylist from server config
+        event_id_allow = server.get("windows_event_ids") or []
+        event_id_exclude = server.get("windows_event_ids_exclude") or []
+
+        filter_ht = "@{LogName='System','Security','Application';Level=1,2,3;StartTime=(Get-Date).AddMinutes(-5)"
+        if event_id_allow:
+            ids_str = ",".join(str(i) for i in event_id_allow)
+            filter_ht += f";Id={ids_str}"
+        filter_ht += "}"
+
+        # Client-side exclude filter (Get-WinEvent has no native exclude)
+        if event_id_exclude:
+            exc_str = "@(" + ",".join(str(i) for i in event_id_exclude) + ")"
+            where_clause = f"|?{{$_.Id -notin {exc_str}}}"
+        else:
+            where_clause = ""
+
         ps_script = (
-            "Get-WinEvent -FilterHashTable @{LogName='System','Security','Application';"
-            "Level=1,2,3;StartTime=(Get-Date).AddMinutes(-5)} -EA SilentlyContinue|"
+            f"Get-WinEvent -FilterHashTable {filter_ht} -EA SilentlyContinue{where_clause}|"
             "%{$m=$_.Message;"
             "if(-not $m){$m=($_.Properties.Value|?{$_ -is [string]})-join' '};"
             "if(-not $m){$m=\"EventId=$($_.Id)\"};"

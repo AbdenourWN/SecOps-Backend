@@ -50,11 +50,39 @@ async def _ensure_indexes():
     db = get_database()
 
     # ── log_observations (Tier 2 anomaly) ────────────────────────────────────
-    # List page (newest first per server) + pending queue + 30-day TTL
+    # List page (newest first), pending queue
     await db["log_observations"].create_index([("server_id", 1), ("detected_at", -1)])
     await db["log_observations"].create_index([("status", 1), ("detected_at", -1)])
+    # Dedup upsert lookup: (server_id, fingerprint, last_seen_at) — most critical new index
     await db["log_observations"].create_index(
-        "detected_at", expireAfterSeconds=30 * 24 * 3600
+        [("server_id", 1), ("fingerprint", 1), ("last_seen_at", -1)],
+        name="idx_obs_dedup_lookup",
+    )
+    # TTL on last_seen_at so actively-firing anomalies survive (don't use detected_at TTL)
+    await db["log_observations"].create_index(
+        "last_seen_at",
+        expireAfterSeconds=30 * 24 * 3600,
+        name="idx_obs_ttl",
+    )
+
+    # ── dismissed_fingerprints (B1 learned suppression) ──────────────────────
+    await db["dismissed_fingerprints"].create_index(
+        [("server_id", 1), ("fingerprint", 1)],
+        unique=True,
+        name="idx_dismissed_fp_unique",
+    )
+    # TTL on expires_at — records vanish automatically after suppression window
+    await db["dismissed_fingerprints"].create_index(
+        "expires_at",
+        expireAfterSeconds=0,
+        name="idx_dismissed_fp_ttl",
+    )
+
+    # ── reason_stats (B3 dismissal-feedback score weighting) ─────────────────
+    await db["reason_stats"].create_index(
+        [("reason", 1)],
+        unique=True,
+        name="idx_reason_stats_reason",
     )
 
     # ── server_log_patterns (Tier 2 novel-pattern dedup) ─────────────────────
@@ -62,6 +90,13 @@ async def _ensure_indexes():
         [("server_id", 1), ("pattern_hash", 1)], unique=True
     )
     await db["server_log_patterns"].create_index([("server_id", 1), ("first_seen_at", 1)])
+    # B4: TTL on last_seen_at — dormant patterns expire after 90 days so they
+    # re-register as novel if they reappear after a long absence.
+    await db["server_log_patterns"].create_index(
+        "last_seen_at",
+        expireAfterSeconds=90 * 24 * 3600,
+        name="idx_patterns_ttl",
+    )
 
     # ── incidents ─────────────────────────────────────────────────────────────
     # Dedup lookup: runs on every log line in analyze_logs() — most critical index.
@@ -87,7 +122,47 @@ async def _ensure_indexes():
     # Per-server lookup: used by get_sources_by_server.
     await db["log_sources"].create_index([("server_id", 1)], name="idx_log_sources_server")
 
-    print("✅ Indexes ensured (incidents, rules, log_sources, log_observations, server_log_patterns)")
+    print("✅ Indexes ensured (incidents, rules, log_sources, log_observations, server_log_patterns, dismissed_fingerprints, reason_stats)")
+
+
+async def _migrate_legacy_observations():
+    """
+    One-shot idempotent backfill for log_observations rows that pre-date
+    the fingerprinted-aggregation rewrite.  Adds missing fields so the
+    dedup upsert index can function on existing data.
+    """
+    from app.core.database import get_database
+    from app.modules.anomalies.fingerprint import compute_fingerprint
+    db = get_database()
+
+    # Only touch rows that are missing the new fields
+    cursor = db["log_observations"].find(
+        {"fingerprint": {"$exists": False}},
+        {"_id": 1, "server_id": 1, "type": 1, "log_message": 1, "reasons": 1, "detected_at": 1},
+    )
+    updated = 0
+    async for row in cursor:
+        fp = compute_fingerprint(
+            row.get("server_id", ""),
+            row.get("type", "log"),
+            row.get("log_message") or "",
+            row.get("reasons") or [],
+        )
+        ts = row.get("detected_at")
+        await db["log_observations"].update_one(
+            {"_id": row["_id"]},
+            {"$set": {
+                "fingerprint": fp,
+                "occurrence_count": 1,
+                "first_seen_at": ts,
+                "last_seen_at": ts,
+                "sample_log_ids": [],
+            }},
+        )
+        updated += 1
+
+    if updated:
+        print(f"✅ Migrated {updated} legacy log_observation rows (fingerprint/aggregation fields)")
 
 
 @asynccontextmanager
@@ -103,6 +178,8 @@ async def lifespan(app: FastAPI):
 
     # All MongoDB indexes (idempotent — safe to re-run on every boot)
     await _ensure_indexes()
+    # Backfill legacy anomaly rows missing aggregation fields
+    await _migrate_legacy_observations()
 
     # Apply any runtime overrides stored in DB (e.g. max_concurrent_servers)
     await load_system_settings()

@@ -98,3 +98,27 @@ async def promote_observation(observation_id: str):
         "observation_id": observation_id,
         "incident_id": incident_id,
     }
+
+
+@router.post("/{observation_id}/auto-promote")
+async def auto_promote_observation(observation_id: str):
+    """
+    Attempt auto-promotion: promotes only if severity==high, occurrence_count>=3,
+    and the fingerprint is not in the dismissed suppression list.
+    Returns 409 if conditions are not met.
+    Does NOT require ANOMALY_AUTO_PROMOTE env var — that flag only controls
+    the background auto-promotion. This endpoint always tries.
+    """
+    obs = await service.get_by_id(observation_id)
+    if not obs:
+        raise HTTPException(status_code=404, detail="Observation not found")
+
+    promoted = await service.maybe_auto_promote(
+        observation_id, obs.get("server_id", ""), force=True
+    )
+    if not promoted:
+        raise HTTPException(
+            status_code=409,
+            detail="Auto-promotion conditions not met (severity<high, count<3, or suppressed)",
+        )
+    return {"status": "auto_promoted", "observation_id": observation_id}

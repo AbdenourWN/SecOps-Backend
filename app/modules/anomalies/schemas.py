@@ -30,9 +30,14 @@ class LogObservationInDB(BaseModel):
     server_id: str
     type: AnomalyType
 
-    log_id: Optional[str] = None
+    # Content fingerprint used for dedup aggregation
+    fingerprint: str = ""
+
+    log_id: Optional[str] = None           # first log that triggered this
+    last_log_id: Optional[str] = None      # most recent triggering log
     log_message: Optional[str] = None
     log_timestamp: Optional[datetime] = None
+    sample_log_ids: List[str] = []         # up to 5 most recent log IDs
 
     reasons: List[str] = []
     score: int = 0
@@ -40,6 +45,11 @@ class LogObservationInDB(BaseModel):
 
     status: LogObservationStatus = LogObservationStatus.PENDING_REVIEW
     promoted_incident_id: Optional[str] = None
+
+    # Aggregation counters
+    occurrence_count: int = 1
+    first_seen_at: datetime = Field(default_factory=utc_now)
+    last_seen_at: datetime = Field(default_factory=utc_now)
 
     ai_analysis: Optional[str] = None
     ai_analyzed_at: Optional[datetime] = None

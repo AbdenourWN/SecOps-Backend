@@ -205,14 +205,16 @@ class HeuristicService:
         # Atomic upsert. setOnInsert sets first_seen_at; $inc bumps the counter.
         # We need to know whether this was a brand-new doc → use the Mongo
         # "upserted" return value rather than a separate find first.
+        now = datetime.now(timezone.utc)
         result = await db["server_log_patterns"].update_one(
             {"server_id": server_id, "pattern_hash": h},
             {
                 "$setOnInsert": {
                     "server_id": server_id,
                     "pattern_hash": h,
-                    "first_seen_at": datetime.now(timezone.utc),
+                    "first_seen_at": now,
                 },
+                "$set": {"last_seen_at": now},
                 "$inc": {"seen_count": 1},
             },
             upsert=True,
