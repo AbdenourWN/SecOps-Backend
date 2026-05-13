@@ -18,6 +18,10 @@ class OSType(str, Enum):
     LINUX = "linux"
     WINDOWS = "windows"
 
+class AIAutonomyLevel(str, Enum):
+    READ_ONLY = "read_only"  # agent investigates only; output is suggestions
+    SUGGEST   = "suggest"    # agent proposes mutations; operator approves each one
+
 class ServerStatus(str, Enum):
     ONLINE = "online"
     REACHABLE = "reachable"   # TCP ok, credentials broken
@@ -170,6 +174,8 @@ class ServerBase(BaseModel):
     # Windows Event Log filters (ignored on Linux servers)
     windows_event_ids: Optional[List[int]] = None           # allowlist; None = all
     windows_event_ids_exclude: Optional[List[int]] = None   # denylist applied after allowlist
+    # AI agent autonomy level (defaults to read_only — safest)
+    ai_autonomy_level: AIAutonomyLevel = AIAutonomyLevel.READ_ONLY
     
 
 class ServerCreate(ServerBase):
@@ -228,6 +234,7 @@ class ServerUpdate(BaseModel):
     detection_config: Optional[DetectionConfig] = None
     windows_event_ids: Optional[List[int]] = None
     windows_event_ids_exclude: Optional[List[int]] = None
+    ai_autonomy_level: Optional[AIAutonomyLevel] = None
 
     # Allow updating the stored credential (e.g., changing the password)
     credential: Optional[CredentialUpdate] = None

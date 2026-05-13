@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import BaseModel, BeforeValidator, Field
 
@@ -51,8 +51,13 @@ class LogObservationInDB(BaseModel):
     first_seen_at: datetime = Field(default_factory=utc_now)
     last_seen_at: datetime = Field(default_factory=utc_now)
 
-    ai_analysis: Optional[str] = None
+    ai_analysis: Optional[str] = None               # legacy string field — kept for backward compat
     ai_analyzed_at: Optional[datetime] = None
+    ai_analysis_latest_id: Optional[str] = None      # → ai_analysis._id
+    ai_analysis_count: int = 0
+    ai_analysis_in_progress: bool = False            # True while triage agent is running
+    ai_promotion_recommendation: Optional[str] = None
+    ai_manual_commands: Optional[List[Dict[str, Any]]] = None  # sudo/TTY commands from triage
 
     detected_at: datetime = Field(default_factory=utc_now)
     reviewed_at: Optional[datetime] = None

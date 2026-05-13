@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, BeforeValidator
-from typing import Optional, Dict, Any, Annotated
+from typing import Optional, Dict, Any, List, Annotated
 from datetime import datetime
 from enum import Enum
 from app.core.datetime_utils import utc_now
@@ -48,7 +48,11 @@ class IncidentInDB(BaseModel):
 
     # Extracted context from regex match (e.g., {"source_ip": "1.2.3.4", "username": "root"})
     context: Optional[Dict[str, Any]] = None
-    ai_analysis: Optional[str] = None
+    ai_analysis: Optional[str] = None           # legacy string field — kept for backward compat
+    ai_analysis_latest_id: Optional[str] = None  # → ai_analysis._id (latest triage run)
+    ai_analysis_count: int = 0
+    ai_analysis_in_progress: bool = False        # True while triage agent is running
+    ai_manual_commands: Optional[List[Dict[str, Any]]] = None  # sudo/TTY commands from triage
     # Set when a rule's linked script was disabled/missing at fire time
     automation_skipped_reason: Optional[str] = None
     # Set when remediation was attempted but failed in a structural way
@@ -71,6 +75,7 @@ class IncidentInDB(BaseModel):
 class IncidentResponse(IncidentInDB):
     """Response model that converts MongoDB _id to string."""
     id: PyObjectId = Field(alias="_id")
+    server_hostname: Optional[str] = None
 
 
 class IncidentStatusUpdate(BaseModel):

@@ -21,13 +21,15 @@ ALLOWED_TOPICS: set[str] = {
     "scripts",
     # Phase 22 — Tier 2 heuristic anomalies
     "anomalies",
+    # Phase 28.1 — AI actions global inbox (pending actions + commands)
+    "ai_actions",
     # Note: "servers.metrics" and "servers.logs" removed — replaced by
     # per-server topics validated by _SERVER_TOPIC_RE below.
 }
 
-# Matches per-server metric/log topics: "servers.<mongo-objectid>.metrics|logs"
+# Matches per-server topics: "servers.<mongo-objectid>.<subtopic>"
 _SERVER_TOPIC_RE = re.compile(
-    r"^servers\.[0-9a-f]{24}\.(metrics|logs|incidents|status|automation|anomalies|log_sources)$"
+    r"^servers\.[0-9a-f]{24}\.(metrics|logs|incidents|status|automation|anomalies|log_sources|ai)$"
 )
 
 

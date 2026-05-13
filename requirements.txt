@@ -3,8 +3,8 @@ fastapi==0.109.0         # The API builder (High performance)
 uvicorn[standard]==0.27.0 # The server that runs FastAPI
 
 # --- The Data ---
-pydantic==2.6.0          # Data validation (Ensures data is correct)
-pydantic-settings==2.1.0 # Manage configuration (API Keys)
+pydantic>=2.7.4,<3.0.0   # Data validation — >=2.7.4 required by langchain-core>=1.3
+pydantic-settings>=2.1.0,<3.0.0  # Manage configuration (API Keys)
 motor==3.4.0             # Async driver for MongoDB (The Database)
 pymongo==4.7.2 
 elasticsearch[async]>=8.0.0,<9.0.0  # Must match ES server version (8.13)
@@ -12,7 +12,7 @@ elasticsearch[async]>=8.0.0,<9.0.0  # Must match ES server version (8.13)
 # --- The Utilities ---
 paramiko==4.0.0          # SSH Client (To talk to Linux Servers)
 python-dotenv==1.0.1     # Reads .env files (For security)
-httpx==0.26.0            # For making web requests (if needed)
+httpx>=0.27,<1.0         # For making web requests (if needed)
 
 cryptography==46.0.4
 
@@ -22,3 +22,11 @@ pywinrm
 
 # --- Notifications ---
 aiosmtplib==3.0.1        # Async SMTP client for email alerts
+
+# --- AI / LangChain stack (exact pins to avoid resolver backtracking) ---
+langchain-core==1.3.3
+langchain==1.2.17
+langgraph==1.1.10
+langchain-openai==1.1.10
+langchain-anthropic==1.4.3
+# langchain-ollama==1.1.0  # PARKED — install manually when reviving Ollama support

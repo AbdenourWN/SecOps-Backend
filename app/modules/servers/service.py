@@ -308,6 +308,12 @@ class ServerService:
             server_updates["business_hours"] = update_data.business_hours.model_dump()
         if update_data.detection_config is not None:
             server_updates["detection_config"] = update_data.detection_config.model_dump()
+        if update_data.ai_autonomy_level is not None:
+            server_updates["ai_autonomy_level"] = update_data.ai_autonomy_level
+        if update_data.windows_event_ids is not None:
+            server_updates["windows_event_ids"] = update_data.windows_event_ids
+        if update_data.windows_event_ids_exclude is not None:
+            server_updates["windows_event_ids_exclude"] = update_data.windows_event_ids_exclude
 
         # 3. Handle Credential Updates (If user wants to set a NEW password)
         if update_data.credential:

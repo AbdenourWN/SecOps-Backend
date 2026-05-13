@@ -2,14 +2,12 @@ import re as re_mod
 
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
-from app.modules.analysis.ai_service import AIService
 from app.modules.analysis.schemas import DetectionRule
 from app.core.database import get_database
 from app.core.events import event_bus
 from bson import ObjectId
 
 router = APIRouter()
-ai_service = AIService()
 
 
 def _bust_rule_cache() -> None:
@@ -123,46 +121,55 @@ async def delete_rule(rule_id: str):
 @router.post("/{incident_id}/analyze")
 async def analyze_incident_with_ai(incident_id: str):
     """
-    Triggers the AI to look at a specific incident and related logs.
+    Run the LangGraph triage agent on an incident. Fetches its own evidence
+    via tools, produces a structured analysis, and saves ai_analysis to DB.
     """
-    db = get_database()
+    from app.modules.ai.triage_graph import run_triage
 
-    # 1. Fetch Incident
+    db = get_database()
     try:
         inc_oid = ObjectId(incident_id)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    incident = await db["incidents"].find_one({"_id": inc_oid})
-    if not incident:
+    if not await db["incidents"].find_one({"_id": inc_oid}, {"_id": 1}):
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    # 2. Fetch Related Logs (The Context)
-    logs_cursor = db["logs"].find(
-        {"server_id": incident["server_id"]}
-    ).sort("timestamp", -1).limit(20)
-
-    logs = await logs_cursor.to_list(length=20)
-
-    # Extract just the message text for the AI
-    log_messages = [log.get("message", "") for log in logs]
-    # Reverse so they are in chronological order (Oldest -> Newest) for the AI
-    log_messages.reverse()
-
-    # 3. Ask Llama 3
-    analysis_result = await ai_service.analyze_incident(
-        incident_description=incident["description"],
-        logs=log_messages
-    )
-
-    # 4. Save the Result to DB (So we don't have to ask AI twice)
+    # Mark analysis as in-progress so any page showing this incident
+    # can immediately reflect the loading state (persisted across navigation).
     await db["incidents"].update_one(
         {"_id": inc_oid},
-        {"$set": {"ai_analysis": analysis_result}}
+        {"$set": {"ai_analysis_in_progress": True}},
+    )
+
+    try:
+        result = await run_triage(incident_id)
+    except Exception as exc:
+        await db["incidents"].update_one(
+            {"_id": inc_oid},
+            {"$set": {"ai_analysis_in_progress": False}},
+        )
+        raise HTTPException(status_code=503, detail=f"AI triage failed: {exc}")
+
+    await db["incidents"].update_one(
+        {"_id": inc_oid},
+        {"$set": {
+            "ai_analysis": result["markdown"],
+            "ai_analyzed_at": result["analyzed_at"],
+            "ai_analysis_in_progress": False,
+            "ai_manual_commands": result["manual_commands"],
+        }},
     )
 
     return {
         "status": "success",
         "incident_id": incident_id,
-        "ai_analysis": analysis_result
+        "analysis_id": result["analysis_id"],
+        "run_id": result["run_id"],
+        "ai_analysis": result["markdown"],
+        "suggested_command_ids": result["suggested_command_ids"],
+        "manual_commands": result["manual_commands"],
+        "pending_action_ids": result["pending_action_ids"],
+        "confidence": result["confidence"],
+        "analyzed_at": result["analyzed_at"],
     }

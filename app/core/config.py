@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
-from typing import Optional
+from pydantic import SecretStr
+from typing import Optional, Literal
 
 class Settings(BaseSettings):
     MONGO_URI: str
@@ -18,6 +19,22 @@ class Settings(BaseSettings):
     ALERT_RECIPIENTS: str = ""  # Comma-separated: "a@x.com,b@x.com"
 
     ALLOWED_ORIGINS: str = "*"  # Comma-separated: "https://security.ctt.tn,https://other.com"
+
+    # LLM / AI
+    LLM_PROVIDER: Literal["openrouter", "anthropic", "openai", "ollama"] = "openrouter"
+    LLM_MODEL: str = "anthropic/claude-sonnet-4-6"
+    LLM_TEMPERATURE: float = 0.2
+    LLM_MAX_TOKENS: int = 2048
+    # OpenRouter (primary gateway — one API key → ~300 models)
+    OPENROUTER_API_KEY: Optional[SecretStr] = None
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_SITE_URL: str = "https://secops-platform"
+    OPENROUTER_SITE_NAME: str = "SecOps"
+    # Direct providers (fallbacks; only required if LLM_PROVIDER=anthropic|openai)
+    ANTHROPIC_API_KEY: Optional[SecretStr] = None
+    OPENAI_API_KEY: Optional[SecretStr] = None
+    # Ollama (local; only required if LLM_PROVIDER=ollama)
+    OLLAMA_URL: str = "http://localhost:11434"
 
     # WebSocket
     WS_PING_INTERVAL: int = 20

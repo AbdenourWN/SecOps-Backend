@@ -50,21 +50,60 @@ async def get_observation(observation_id: str):
 @router.post("/{observation_id}/analyze")
 async def analyze_observation(observation_id: str):
     """
-    Generate and persist an AI analysis for a Tier 2 anomaly observation.
-    Uses the existing local Ollama-backed AI service for now.
+    Run the LangGraph anomaly triage agent on a Tier 2 observation.
+    Saves ai_analysis + promotion_recommendation to the observation document.
     """
-    try:
-        analysis = await service.analyze_with_ai(observation_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    from app.modules.ai.anomaly_graph import run_anomaly_triage
+    from app.core.database import get_database
+    from bson import ObjectId
 
-    if analysis is None:
+    db = get_database()
+    try:
+        oid = ObjectId(observation_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID")
+
+    if not await db["log_observations"].find_one({"_id": oid}, {"_id": 1}):
         raise HTTPException(status_code=404, detail="Observation not found")
+
+    await db["log_observations"].update_one(
+        {"_id": oid},
+        {"$set": {"ai_analysis_in_progress": True}},
+    )
+
+    try:
+        result = await run_anomaly_triage(observation_id)
+    except Exception as exc:
+        await db["log_observations"].update_one(
+            {"_id": oid},
+            {"$set": {"ai_analysis_in_progress": False}},
+        )
+        raise HTTPException(status_code=503, detail=f"AI triage failed: {exc}")
+
+    # Keep legacy fields for backward compat
+    await db["log_observations"].update_one(
+        {"_id": oid},
+        {"$set": {
+            "ai_analysis": result["markdown"],
+            "ai_promotion_recommendation": result["promotion_recommendation"],
+            "ai_analyzed_at": result["analyzed_at"],
+            "ai_analysis_in_progress": False,
+            "ai_manual_commands": result["manual_commands"],
+        }},
+    )
 
     return {
         "status": "success",
         "observation_id": observation_id,
-        "ai_analysis": analysis,
+        "analysis_id": result["analysis_id"],
+        "run_id": result["run_id"],
+        "ai_analysis": result["markdown"],
+        "promotion_recommendation": result["promotion_recommendation"],
+        "suggested_command_ids": result["suggested_command_ids"],
+        "manual_commands": result["manual_commands"],
+        "pending_action_ids": result["pending_action_ids"],
+        "confidence": result["confidence"],
+        "analyzed_at": result["analyzed_at"],
     }
 
 

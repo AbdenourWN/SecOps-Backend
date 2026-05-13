@@ -374,42 +374,6 @@ class AnomaliesService:
 
         return obs
 
-    async def analyze_with_ai(self, observation_id: str) -> Optional[str]:
-        obs = await self.get_by_id(observation_id)
-        if not obs:
-            return None
-
-        from app.modules.analysis.ai_service import AIService
-
-        analysis = await AIService().analyze_anomaly(obs)
-        now = utc_now()
-
-        db = get_database()
-        try:
-            oid = ObjectId(observation_id)
-        except Exception:
-            return None
-
-        await db["log_observations"].update_one(
-            {"_id": oid},
-            {"$set": {"ai_analysis": analysis, "ai_analyzed_at": now}},
-        )
-
-        server_id = obs.get("server_id")
-        event_bus.emit("anomalies", "anomaly.updated", {
-            "observation_id": observation_id,
-            "server_id": server_id,
-            "reason": "ai_analysis",
-        })
-        if server_id:
-            event_bus.emit(f"servers.{server_id}.anomalies", "anomaly.updated", {
-                "observation_id": observation_id,
-                "server_id": server_id,
-                "reason": "ai_analysis",
-            })
-
-        return analysis
-
     async def stats(self) -> dict:
         db = get_database()
         pipeline = [
@@ -477,6 +441,7 @@ class AnomaliesService:
         obs_reasons = obs.get("reasons", []) if obs else []
 
         # B3: Record dismissal feedback for each reason
+        global _reason_weight_cache_ts
         for reason in obs_reasons:
             await db["reason_stats"].update_one(
                 {"reason": reason},
@@ -551,6 +516,7 @@ class AnomaliesService:
         )
 
         # B3: Record promotion feedback for each reason
+        global _reason_weight_cache_ts
         for reason in obs.get("reasons", []):
             await db["reason_stats"].update_one(
                 {"reason": reason},

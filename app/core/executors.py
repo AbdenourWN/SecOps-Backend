@@ -502,16 +502,26 @@ class WindowsExecutor(BaseExecutor):
         out = "".join(stdout_parts).strip()
         err = "".join(stderr_parts).strip()
         status = done.status if done else "failed"
+        exit_code = done.exit_code if done else None
 
         if status == "success":
             if err:
-                return {"status": "error", "output": out, "error": err}
-            return {"status": "success", "output": out}
+                return {"status": "error", "output": out, "error": err, "exit_code": 0}
+            return {"status": "success", "output": out, "exit_code": 0}
         if status == "timeout":
-            return {"status": "timeout", "output": out, "error": err or "Timed out"}
+            return {"status": "timeout", "output": out, "error": err or "Timed out", "exit_code": exit_code}
         if status == "aborted":
-            return {"status": "aborted", "output": out, "error": err}
-        return {"status": "failed", "output": out, "error": err or "Command failed"}
+            return {"status": "aborted", "output": out, "error": err, "exit_code": exit_code}
+        # Failed — non-zero exit or connection problem.
+        # If stderr was entirely CLIXML (filtered away) and nothing was written to stdout,
+        # synthesize a message so the caller always has context.
+        if not err:
+            err = (
+                f"PowerShell exited with code {exit_code}"
+                if exit_code is not None
+                else "Command failed (no output; PowerShell may have written only CLIXML host-formatting noise, which is filtered)"
+            )
+        return {"status": "failed", "output": out, "error": err, "exit_code": exit_code}
 
     async def check_health(self) -> bool:
         """WinRM HTTP probe — independent of the pooled connection.

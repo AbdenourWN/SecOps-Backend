@@ -57,6 +57,8 @@ _LINUX_BLOCK = _compile([
 ])
 
 _LINUX_CONFIRM = _compile([
+    (r"^\s*sudo\b",
+     "sudo requires an interactive terminal — run the command directly without sudo over SSH."),
     (r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*)\b",
      "Recursive delete requires confirmation."),
     (r"\bkill\s+-9\b",

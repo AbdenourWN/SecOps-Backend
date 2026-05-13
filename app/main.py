@@ -35,6 +35,7 @@ from app.modules.anomalies.router import router as anomalies_router
 from app.modules.ws.router import router as ws_router
 from app.modules.ws.terminal_router import router as terminal_ws_router
 from app.modules.settings.router import router as settings_router
+from app.modules.ai.router import router as ai_router
 from app.modules.settings.service import load_system_settings
 from app.core.connection_pool import connection_pool, terminal_pool
 from fastapi.middleware.cors import CORSMiddleware
@@ -122,47 +123,31 @@ async def _ensure_indexes():
     # Per-server lookup: used by get_sources_by_server.
     await db["log_sources"].create_index([("server_id", 1)], name="idx_log_sources_server")
 
-    print("✅ Indexes ensured (incidents, rules, log_sources, log_observations, server_log_patterns, dismissed_fingerprints, reason_stats)")
+    # ── ai_analysis (unified AI analysis collection — all types) ─────────────
+    await db["ai_analysis"].create_index([("source_type", 1), ("source_id", 1), ("created_at", -1)], name="idx_ai_analysis_source")
+    await db["ai_analysis"].create_index([("server_id", 1), ("analysis_type", 1), ("created_at", -1)], name="idx_ai_analysis_server")
+    await db["ai_analysis"].create_index([("run_id", 1)], name="idx_ai_analysis_run")
+    await db["ai_analysis"].create_index("created_at", expireAfterSeconds=90 * 24 * 3600, name="idx_ai_analysis_ttl")
 
+    # ── ai_command (per-command execution lifecycle) ──────────────────────────
+    await db["ai_command"].create_index([("status", 1), ("created_at", -1)], name="idx_ai_cmd_status")
+    await db["ai_command"].create_index([("server_id", 1), ("created_at", -1)], name="idx_ai_cmd_server")
+    await db["ai_command"].create_index([("source_id", 1), ("created_at", -1)], name="idx_ai_cmd_source")
+    await db["ai_command"].create_index([("analysis_id", 1)], name="idx_ai_cmd_analysis")
+    await db["ai_command"].create_index([("batch_id", 1)], name="idx_ai_cmd_batch")
+    await db["ai_command"].create_index("created_at", expireAfterSeconds=90 * 24 * 3600, name="idx_ai_cmd_ttl")
 
-async def _migrate_legacy_observations():
-    """
-    One-shot idempotent backfill for log_observations rows that pre-date
-    the fingerprinted-aggregation rewrite.  Adds missing fields so the
-    dedup upsert index can function on existing data.
-    """
-    from app.core.database import get_database
-    from app.modules.anomalies.fingerprint import compute_fingerprint
-    db = get_database()
-
-    # Only touch rows that are missing the new fields
-    cursor = db["log_observations"].find(
-        {"fingerprint": {"$exists": False}},
-        {"_id": 1, "server_id": 1, "type": 1, "log_message": 1, "reasons": 1, "detected_at": 1},
+    # ── ai_actions (suggest-level queued mutations, operator-approved) ────────
+    await db["ai_actions"].create_index([("status", 1), ("created_at", -1)], name="idx_ai_actions_status")
+    # TTL: auto-delete terminal (approved/rejected) rows after 7 days
+    await db["ai_actions"].create_index(
+        "created_at",
+        expireAfterSeconds=7 * 24 * 3600,
+        partialFilterExpression={"status": {"$in": ["approved", "rejected"]}},
+        name="idx_ai_actions_ttl",
     )
-    updated = 0
-    async for row in cursor:
-        fp = compute_fingerprint(
-            row.get("server_id", ""),
-            row.get("type", "log"),
-            row.get("log_message") or "",
-            row.get("reasons") or [],
-        )
-        ts = row.get("detected_at")
-        await db["log_observations"].update_one(
-            {"_id": row["_id"]},
-            {"$set": {
-                "fingerprint": fp,
-                "occurrence_count": 1,
-                "first_seen_at": ts,
-                "last_seen_at": ts,
-                "sample_log_ids": [],
-            }},
-        )
-        updated += 1
 
-    if updated:
-        print(f"✅ Migrated {updated} legacy log_observation rows (fingerprint/aggregation fields)")
+    print("✅ Indexes ensured (incidents, rules, log_sources, log_observations, server_log_patterns, dismissed_fingerprints, reason_stats, ai_actions, ai_analysis, ai_command)")
 
 
 @asynccontextmanager
@@ -178,8 +163,6 @@ async def lifespan(app: FastAPI):
 
     # All MongoDB indexes (idempotent — safe to re-run on every boot)
     await _ensure_indexes()
-    # Backfill legacy anomaly rows missing aggregation fields
-    await _migrate_legacy_observations()
 
     # Apply any runtime overrides stored in DB (e.g. max_concurrent_servers)
     await load_system_settings()
@@ -236,6 +219,7 @@ app.include_router(test_router, prefix="/api/test", tags=["Test & Simulation"])
 app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(anomalies_router, prefix="/api/anomalies", tags=["Anomalies"])
 app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
+app.include_router(ai_router, prefix="/api/ai-actions", tags=["AI Actions"])
 app.include_router(ws_router, prefix="/api", tags=["WebSocket"])
 app.include_router(terminal_ws_router, prefix="/api", tags=["Terminal WebSocket"])
 

@@ -61,8 +61,20 @@ class IncidentService:
             return None
 
         incident = await db["incidents"].find_one({"_id": oid})
-        if incident:
-            incident["_id"] = str(incident["_id"])
+        if not incident:
+            return None
+
+        incident["_id"] = str(incident["_id"])
+
+        server_id = incident.get("server_id")
+        if server_id:
+            try:
+                srv = await db["servers"].find_one(
+                    {"_id": ObjectId(server_id)}, {"hostname": 1}
+                )
+                incident["server_hostname"] = srv.get("hostname", "") if srv else ""
+            except Exception:
+                incident["server_hostname"] = ""
 
         return incident
 
