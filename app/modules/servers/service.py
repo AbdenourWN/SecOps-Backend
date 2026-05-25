@@ -83,13 +83,18 @@ class ServerService:
                     }
                 else:
                     # ── Tier 2: auth probe — run cheap command with real credentials ──
+                    # The goal here is to always surface a *real* reason string when
+                    # the probe fails, so the UI can show the operator what actually
+                    # came back from the OS. No opaque sentinels.
                     auth_ok = False
                     fail_reason = None
                     try:
                         cred = await db["credentials"].find_one(
                             {"_id": ObjectId(server["credential_id"])}
                         )
-                        if cred:
+                        if not cred:
+                            fail_reason = "No credentials configured for this server"
+                        else:
                             plain_secret = decrypt_password(cred["encrypted_secret"])
                             auth_executor = get_server_executor(server, plain_secret)
                             auth_executor.credential["username"] = cred["username"]
@@ -103,11 +108,28 @@ class ServerService:
                             )
                             auth_ok = result.get("status") == "success"
                             if not auth_ok:
-                                fail_reason = result.get("error") or "command_failed"
-                        else:
-                            fail_reason = "no_credentials"
+                                # Build the reason out of whatever the executor gave
+                                # us — stderr, status, and exit code — so the UI
+                                # shows the real OS-level message verbatim.
+                                err_text = (result.get("error") or "").strip()
+                                exit_code = result.get("exit_code")
+                                status_str = result.get("status") or "failed"
+                                if err_text:
+                                    fail_reason = err_text
+                                elif exit_code is not None:
+                                    fail_reason = (
+                                        f"Auth probe exited with code {exit_code} "
+                                        f"(no error output captured)"
+                                    )
+                                else:
+                                    fail_reason = (
+                                        f"Auth probe returned status={status_str} "
+                                        f"with no error output"
+                                    )
                     except Exception as e:
-                        fail_reason = str(e)[:120]
+                        # Surface the exception class + message so it is identifiable
+                        # (e.g. "SpnegoError: Server returned ...", "AuthenticationException: ...").
+                        fail_reason = f"{type(e).__name__}: {e}"
 
                     if auth_ok:
                         update = {
@@ -131,6 +153,7 @@ class ServerService:
                     {"$set": update},
                 )
 
+                new_status = update["status"]
                 if previous_status != new_status:
                     event_bus.emit("servers.status", "server.status_changed", {
                         "server_id": server_id,
@@ -314,6 +337,14 @@ class ServerService:
             server_updates["windows_event_ids"] = update_data.windows_event_ids
         if update_data.windows_event_ids_exclude is not None:
             server_updates["windows_event_ids_exclude"] = update_data.windows_event_ids_exclude
+        # Phase 28.5 — per-server library mode selectors. The allowed-fields
+        # list is explicit, so without these two branches the schema accepts
+        # the values, the frontend sends them, but they get silently dropped
+        # before the $set write.
+        if update_data.rule_library_mode is not None:
+            server_updates["rule_library_mode"] = update_data.rule_library_mode
+        if update_data.script_library_mode is not None:
+            server_updates["script_library_mode"] = update_data.script_library_mode
 
         # 3. Handle Credential Updates (If user wants to set a NEW password)
         if update_data.credential:

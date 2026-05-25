@@ -19,6 +19,8 @@ class IncidentService:
         severity: str = None,
         status: str = None,
         search: str = None,
+        from_date: str = None,
+        to_date: str = None,
         page: int = 1,
         page_size: int = 20,
     ):
@@ -35,6 +37,21 @@ class IncidentService:
         if search:
             pattern = re.compile(re.escape(search), re.IGNORECASE)
             query["$or"] = [{"description": pattern}, {"rule_id": pattern}]
+        # Date range — applies on `detected_at`. Bad input silently ignored so
+        # a malformed URL param doesn't 500 the page.
+        date_range: dict = {}
+        if from_date:
+            try:
+                date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if to_date:
+            try:
+                date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if date_range:
+            query["detected_at"] = date_range
 
         total = await db["incidents"].count_documents(query)
         skip = (page - 1) * page_size
@@ -75,6 +92,41 @@ class IncidentService:
                 incident["server_hostname"] = srv.get("hostname", "") if srv else ""
             except Exception:
                 incident["server_hostname"] = ""
+
+        # Phase 28.4 — denormalise the most recent automation run for this incident
+        # onto the response so the detail page can render the Auto-fix Review block
+        # without a second round-trip. Cheap query: `automation_logs` is indexed by
+        # incident_id implicitly via the natural insert order; we just need newest.
+        try:
+            latest = await db["automation_logs"].find_one(
+                {"incident_id": incident_id},
+                sort=[("executed_at", -1)],
+            )
+            if latest:
+                script_name = None
+                script_id = latest.get("script_id")
+                if script_id:
+                    try:
+                        s_doc = await db["scripts"].find_one(
+                            {"_id": ObjectId(script_id)}, {"name": 1}
+                        )
+                        script_name = (s_doc or {}).get("name")
+                    except Exception:
+                        script_name = None
+                incident["latest_remediation"] = {
+                    "automation_log_id": str(latest["_id"]),
+                    "script_id": script_id,
+                    "script_name": script_name,
+                    "status": latest.get("status"),
+                    "executed_at": latest.get("executed_at"),
+                    "output": (latest.get("output") or "")[:2000] if latest.get("output") else None,
+                    "error": (latest.get("error") or "")[:1000] if latest.get("error") else None,
+                    "ai_review_id": latest.get("ai_review_id"),
+                    "ai_review_verdict": latest.get("ai_review_verdict"),
+                    "ai_review_summary": latest.get("ai_review_summary"),
+                }
+        except Exception:
+            pass
 
         return incident
 

@@ -283,7 +283,10 @@ class AnomaliesService:
         status: Optional[str] = None,
         severity: Optional[str] = None,
         type_: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
     ) -> dict:
+        from datetime import datetime
         q: dict = {}
         if server_id:
             q["server_id"] = server_id
@@ -293,6 +296,21 @@ class AnomaliesService:
             q["severity"] = severity
         if type_ and type_ != "all":
             q["type"] = type_
+        # Date range — applies on `last_seen_at` (the field the list sorts by).
+        # Bad input silently ignored.
+        date_range: dict = {}
+        if from_date:
+            try:
+                date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if to_date:
+            try:
+                date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if date_range:
+            q["last_seen_at"] = date_range
         return q
 
     async def list(
@@ -303,9 +321,11 @@ class AnomaliesService:
         status: Optional[str] = None,
         severity: Optional[str] = None,
         type_: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
     ):
         db = get_database()
-        q = self._build_filter(server_id, status, severity, type_)
+        q = self._build_filter(server_id, status, severity, type_, from_date, to_date)
 
         total = await db["log_observations"].count_documents(q)
         skip = (page - 1) * page_size

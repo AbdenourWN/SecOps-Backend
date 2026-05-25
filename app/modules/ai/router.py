@@ -32,6 +32,13 @@ from app.modules.ai.tools_mutate import (
     _execute_dismiss_anomaly,
     _execute_promote_anomaly,
     _execute_mark_incident_false_positive,
+    _execute_disable_script_for_server,
+    _execute_disable_rule_for_server,
+    _execute_suggest_manual_remediation,
+    # Phase 28.5 — per-server library actions
+    _execute_create_server_rule,
+    _execute_create_server_script,
+    _execute_swap_remediation_script,
 )
 from app.modules.ai.command_store import (
     approve_commands,
@@ -69,28 +76,86 @@ def _fmt(doc: dict) -> dict:
 async def list_ai_actions(
     status: Optional[str] = Query(None, description="pending | approved | rejected | all"),
     server_id: Optional[str] = Query(None),
+    source_type: Optional[str] = Query(None, description="incident | anomaly | all"),
+    source_id: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None, description="ISO datetime — filter on created_at >= this time"),
+    to_date: Optional[str] = Query(None, description="ISO datetime — filter on created_at <= this time"),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
 ):
-    """List AI pending/completed actions, newest first."""
+    """List AI pending/completed actions, newest first. Enriched with server_hostname."""
     db = get_database()
     query: dict = {}
     if status and status != "all":
         query["status"] = status
     else:
         query["status"] = {"$in": ["pending", "approved", "rejected"]}
+    if server_id:
+        query["server_id"] = server_id
+    if source_type and source_type != "all":
+        query["source_type"] = source_type
+    if source_id:
+        query["source_id"] = source_id
+    date_range: dict = {}
+    if from_date:
+        try:
+            date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if to_date:
+        try:
+            date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if date_range:
+        query["created_at"] = date_range
 
     total = await db["ai_actions"].count_documents(query)
     skip = (page - 1) * page_size
-    docs = await db["ai_actions"].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(length=page_size)
-    return {"total": total, "page": page, "page_size": page_size, "results": [_fmt(d) for d in docs]}
+    # For decided rows we want "most recently decided" at the top; for pending,
+    # the only meaningful timestamp is created_at. decided_at is null for pending,
+    # so this composite sort lands on the right answer in both filters.
+    docs = await db["ai_actions"].find(query).sort([
+        ("decided_at", -1),
+        ("created_at", -1),
+    ]).skip(skip).limit(page_size).to_list(length=page_size)
+
+    # Batch-enrich with server hostname so the UI doesn't need a second round-trip per row
+    server_ids = list({d.get("server_id") for d in docs if d.get("server_id")})
+    hostname_map: dict = {}
+    if server_ids:
+        try:
+            srv_cursor = db["servers"].find(
+                {"_id": {"$in": [ObjectId(sid) for sid in server_ids if ObjectId.is_valid(sid)]}},
+                {"hostname": 1},
+            )
+            srv_docs = await srv_cursor.to_list(length=len(server_ids))
+            hostname_map = {str(s["_id"]): s.get("hostname", "") for s in srv_docs}
+        except Exception:
+            hostname_map = {}
+
+    out = []
+    for d in docs:
+        d = _fmt(d)
+        d["server_hostname"] = hostname_map.get(d.get("server_id", ""), "")
+        out.append(d)
+
+    return {"total": total, "page": page, "page_size": page_size, "results": out}
 
 
 @router.get("/count")
-async def pending_action_count():
-    """Count of pending (unresolved) AI actions — used for sidebar badge."""
+async def pending_action_count(
+    source_type: Optional[str] = Query(None),
+    source_id: Optional[str] = Query(None),
+):
+    """Count of pending (unresolved) AI actions — used for sidebar badge and per-source counters."""
     db = get_database()
-    count = await db["ai_actions"].count_documents({"status": "pending"})
+    query: dict = {"status": "pending"}
+    if source_type and source_type != "all":
+        query["source_type"] = source_type
+    if source_id:
+        query["source_id"] = source_id
+    count = await db["ai_actions"].count_documents(query)
     return {"pending": count}
 
 
@@ -139,15 +204,19 @@ async def list_ai_commands(
     server_id: Optional[str] = Query(None),
     source_id: Optional[str] = Query(None),
     source_type: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
 ):
-    """List ai_command rows with optional filters."""
+    """List ai_command rows with optional filters. Date filter applies on `created_at`."""
     return await list_commands(
         status=status,
         server_id=server_id,
         source_id=source_id,
         source_type=source_type,
+        from_date=from_date,
+        to_date=to_date,
         page=page,
         page_size=page_size,
     )
@@ -189,23 +258,86 @@ async def list_ai_analyses(
     source_id: Optional[str] = Query(None),
     server_id: Optional[str] = Query(None),
     analysis_type: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None, description="ISO datetime — filter on created_at >= this time"),
+    to_date: Optional[str] = Query(None, description="ISO datetime — filter on created_at <= this time"),
+    page: Optional[int] = Query(None, ge=1),
+    page_size: Optional[int] = Query(None, ge=1, le=100),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List ai_analysis rows. Filter by source or server."""
-    if source_id and source_type:
-        return await list_analyses_for_source(source_type, source_id, analysis_type, limit)
-    if server_id:
-        return await list_server_analyses(server_id, analysis_type, limit)
-    # Return recent analyses if no filter given
+    """
+    List ai_analysis rows.
+
+    Two call shapes are supported:
+      - Legacy (no `page`): returns a flat list, length capped by `limit`.
+        Kept so existing source-detail panels keep working unchanged.
+      - Paginated (`page` provided): returns
+        `{total, page, page_size, results}` with rows enriched with
+        `server_hostname` (batched). Used by the new /ai-analyses index page.
+    Date filters apply on `created_at`.
+    """
     db = get_database()
+    paginated = page is not None
+
     query: dict = {}
-    if analysis_type:
+    if source_type and source_type != "all":
+        query["source_type"] = source_type
+    if source_id:
+        query["source_id"] = source_id
+    if server_id:
+        query["server_id"] = server_id
+    if analysis_type and analysis_type != "all":
         query["analysis_type"] = analysis_type
-    cursor = db["ai_analysis"].find(query).sort("created_at", -1).limit(limit)
-    docs = await cursor.to_list(length=limit)
+    date_range: dict = {}
+    if from_date:
+        try:
+            date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if to_date:
+        try:
+            date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if date_range:
+        query["created_at"] = date_range
+
+    if not paginated:
+        # Legacy unpaginated shape — preserved for existing callers
+        if source_id and source_type:
+            return await list_analyses_for_source(source_type, source_id, analysis_type, limit)
+        if server_id:
+            return await list_server_analyses(server_id, analysis_type, limit)
+        cursor = db["ai_analysis"].find(query).sort("created_at", -1).limit(limit)
+        docs = await cursor.to_list(length=limit)
+        for d in docs:
+            d["_id"] = str(d["_id"])
+        return docs
+
+    size = page_size or 25
+    total = await db["ai_analysis"].count_documents(query)
+    skip = (page - 1) * size
+    docs = await db["ai_analysis"].find(query).sort("created_at", -1).skip(skip).limit(size).to_list(length=size)
+
+    # Batch-enrich with server hostname so the list page doesn't need N round-trips
+    server_ids = list({d.get("server_id") for d in docs if d.get("server_id")})
+    hostname_map: dict = {}
+    if server_ids:
+        try:
+            srv_cursor = db["servers"].find(
+                {"_id": {"$in": [ObjectId(sid) for sid in server_ids if ObjectId.is_valid(sid)]}},
+                {"hostname": 1},
+            )
+            srv_docs = await srv_cursor.to_list(length=len(server_ids))
+            hostname_map = {str(s["_id"]): s.get("hostname", "") for s in srv_docs}
+        except Exception:
+            hostname_map = {}
+
+    out = []
     for d in docs:
-        d["_id"] = str(d["_id"])
-    return docs
+        d = _fmt(d)
+        d["server_hostname"] = hostname_map.get(d.get("server_id", ""), "")
+        out.append(d)
+    return {"total": total, "page": page, "page_size": size, "results": out}
 
 
 @router.get("/analysis/{analysis_id}")
@@ -243,6 +375,62 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
             outcome = await _execute_promote_anomaly(payload["observation_id"])
         elif action_type == "mark_incident_false_positive":
             outcome = await _execute_mark_incident_false_positive(payload["incident_id"], payload.get("reason", ""))
+        elif action_type == "disable_script_for_server":
+            outcome = await _execute_disable_script_for_server(
+                payload.get("server_id", ""),
+                payload.get("script_id", ""),
+                payload.get("reason", ""),
+            )
+        elif action_type == "disable_rule_for_server":
+            outcome = await _execute_disable_rule_for_server(
+                payload.get("server_id", ""),
+                payload.get("rule_id", ""),
+                payload.get("reason", ""),
+            )
+        elif action_type == "suggest_manual_remediation":
+            outcome = await _execute_suggest_manual_remediation(
+                payload.get("incident_id", ""),
+                payload.get("manual_commands", []) or [],
+                payload.get("reason", ""),
+                payload.get("automation_log_id", "") or "",
+            )
+        # Phase 28.5 — per-server library actions
+        elif action_type == "create_server_rule":
+            outcome = await _execute_create_server_rule(
+                server_id=payload.get("server_id", ""),
+                name=payload.get("name", ""),
+                pattern=payload.get("pattern", ""),
+                severity=payload.get("severity", "medium"),
+                action_level=int(payload.get("action_level", 3) or 3),
+                description=payload.get("description", ""),
+                os_type=payload.get("os_type", "linux"),
+                tags=payload.get("tags") or [],
+                remediation_script_id=payload.get("remediation_script_id"),
+                reason=payload.get("reason", ""),
+                ai_analysis_id=payload.get("ai_analysis_id"),
+            )
+        elif action_type == "create_server_script":
+            outcome = await _execute_create_server_script(
+                server_id=payload.get("server_id", ""),
+                name=payload.get("name", ""),
+                description=payload.get("description", ""),
+                language=payload.get("language", "bash"),
+                content=payload.get("content", ""),
+                target_os=payload.get("target_os", "linux"),
+                category=payload.get("category", "recovery"),
+                reason=payload.get("reason", ""),
+                ai_analysis_id=payload.get("ai_analysis_id"),
+            )
+        elif action_type == "swap_remediation_script":
+            outcome = await _execute_swap_remediation_script(
+                server_id=payload.get("server_id", ""),
+                rule_id=payload.get("rule_id", ""),
+                new_script_content=payload.get("new_script_content", ""),
+                language=payload.get("language", "bash"),
+                target_os=payload.get("target_os", "linux"),
+                reason=payload.get("reason", ""),
+                ai_analysis_id=payload.get("ai_analysis_id"),
+            )
     except Exception as exc:
         outcome = {"executed": False, "error": str(exc)}
 

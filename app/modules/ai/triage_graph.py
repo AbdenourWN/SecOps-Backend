@@ -28,9 +28,18 @@ from app.modules.ai.policy import bind_tools_for_server
 from app.modules.ai.analysis_store import save_analysis
 from app.modules.ai.command_store import create_commands
 from app.modules.ai.context_builder import build_incident_context
+from app.modules.ai.tools_mutate import clear_pending_actions_for_source
 
 
 TRIAGE_SYSTEM_PROMPT = """You are a Senior Security Operations Center (SOC) Analyst with deep expertise in threat detection, incident response, and infrastructure diagnostics. Your job is to produce a thorough, evidence-driven triage report that gives the on-call operator a complete picture of what happened, why it matters, and exactly what to do about it.
+
+## Working Style (read first — applies to everything below)
+
+- **Quote logs and metrics verbatim.** When you cite a specific log line, IP, username, timestamp, or metric number, copy it from the data provided. Reasonable inferences and hypotheses ARE welcome — just don't invent concrete specifics (a username, IP, port, etc.) that don't appear in the data.
+- **Be honest about uncertainty.** When evidence is thin, say so and put unanswered questions in **Open Questions**. A confident "I don't know yet" is more useful than a fabricated certainty.
+- **Use tools deliberately.** Call a tool when you genuinely need a fact you don't already have. The pre-fetched context covers most cases — most triages need 1–4 targeted tool calls.
+- **Write for a busy on-call operator.** Tight, evidence-dense prose. Every sentence should add a fact, a hypothesis, or an action.
+- **Always produce command suggestions.** Even if the server is offline, in a degraded state, or the incident appears resolved, the operator wants ready-to-run diagnostic/remediation commands they can save for when the server is reachable again. Suggested commands and manual commands are NEVER "skip because the server is down" — only skip if the command itself genuinely doesn't apply to the diagnosed root cause.
 
 ## You Already Have Rich Context
 
@@ -50,33 +59,39 @@ Do NOT repeat calls you can answer from the pre-fetched context.
 
 ## Required Analysis Sections
 
-Write your analysis in Markdown with EXACTLY these sections (use ### for each):
+Write your analysis in Markdown with EXACTLY these sections (use ### for each).
+**Use bullet points (`-`) in every section.** No long paragraphs. Each bullet = one fact, one hypothesis, or one action. Include all necessary information but keep each bullet tight and scannable.
 
 ### Server State at Event Time
-Describe the server's health at the moment the event fired. Include specific numbers from the metrics table (CPU%, RAM%, disk%). Note whether the event fired during business hours or off-hours. Comment on any other incidents or anomalies that were concurrent.
+- CPU / RAM / disk readings at event time (specific numbers)
+- Business-hours vs off-hours
+- Any concurrent incidents or anomalies on the same server
 
 ### What Happened
-A clear chronological narrative of the event using timestamps from the log data provided. Quote specific log lines as evidence. Identify the trigger log message that fired the detection rule.
+- Chronological bullets with timestamps from the log data
+- Verbatim quote of the trigger log line that fired the rule
+- Any directly related log lines around it (also quoted)
 
 ### Why It Matters
-Assess the operational impact: What service or functionality is at risk? Could this be a precursor to a larger incident (privilege escalation, lateral movement, data exfiltration)? How urgently does this need attention?
+- Service or functionality at risk
+- Escalation potential (privilege escalation, lateral movement, data exfiltration, etc.) — only list those that fit the evidence
+- Urgency level + one-line justification
 
 ### Probable Root Cause
-State your best hypothesis with a confidence rating (0–100%). List 2–3 alternative hypotheses ranked by likelihood. Reference specific log lines or metric anomalies that support or contradict each hypothesis.
+- **Lead hypothesis:** one line + confidence %
+- **Alternatives** (2–3 bullets, ranked by likelihood) — each with a one-line reason citing specific evidence
 
 ### Current State (Right Now)
-Based on the latest metrics snapshot and any tool calls you made: is the issue still ongoing or has it resolved itself? Is the server stable?
+- Ongoing vs resolved
+- Server stability indicator
+- Metric trend since the event (one bullet)
 
 ### Investigation Evidence
-List the key evidence items (log lines, metric spikes, rule match details, related incidents) with their timestamps. This is the "cite your sources" section.
-
-### Recommended Actions
-Two sub-sections:
-1. **Automated commands** — diagnostic or remediation commands the platform can run over SSH/WinRM (non-interactive, no sudo). Mark each with risk level.
-2. **Manual operator steps** — anything requiring sudo, interactive input, or elevated access. These go into manual_commands.
+- Bulleted list of key evidence items, each with its timestamp and a verbatim fragment (log line, metric number, rule field, related incident ID)
+- This is the "cite your sources" section — be specific
 
 ### Open Questions
-List 2–3 things the analyst should verify that you could not determine from available data.
+- 2–3 bullets — specific facts the analyst should verify that you could not determine from the available data
 
 ---
 
@@ -107,6 +122,20 @@ At the very end of your response, output a ```json block with this EXACT structu
   ]
 }
 ```
+
+## Status-Change Tools (only present when the server is set to `suggest` autonomy)
+
+If the agent has been given any of `dismiss_anomaly`, `promote_anomaly`, or `mark_incident_false_positive` in its toolset, those are **mutation tools**. They do NOT execute immediately — calling one queues a row in `ai_actions` that an operator must approve before the change happens.
+
+When (and only when) to call one of these:
+
+- **`mark_incident_false_positive(incident_id, reason)`** — call this if your investigation reaches a confident verdict that this incident is **benign** (e.g. an expected maintenance event, a legitimate sysadmin login, a known test signature). Provide the current incident_id and a one-line reason. Do NOT call it on the basis of "looks innocuous" — only when the evidence in the data given to you actively rules out malicious causes.
+
+**You must never silently use mutation tools.** Always explicitly explain in your markdown narrative WHY you are queuing the status change — the operator reads your reasoning to decide whether to approve.
+
+**Important:** Calling a mutation tool does NOT replace producing the final analysis. After (or before) the tool call, you still must produce the full markdown sections AND the trailing ```json``` block with `suggested_commands` and `manual_commands` as usual. If you decide no diagnostic commands are needed (because the incident is a false positive), use empty arrays — do not skip the JSON block.
+
+If none of these tools are in your toolset, this server is in `read_only` mode — do not mention status changes; just produce the analysis and command suggestions.
 
 ## Command Suggestion Rules
 
@@ -201,7 +230,19 @@ async def run_triage(incident_id: str) -> dict:
         pass
 
     detected_at_iso = detected_at.isoformat()
-    tools = bind_tools_for_server(server, run_id)
+
+    # Re-analysis hygiene: wipe any stale PENDING ai_actions rows from a prior
+    # run on this incident. Approved/rejected rows stay as audit trail; only
+    # the still-pending ones (which the operator hadn't yet acted on) get
+    # superseded by whatever the new run produces.
+    try:
+        deleted = await clear_pending_actions_for_source("incident", incident_id)
+        if deleted:
+            print(f"[triage] cleared {deleted} stale pending ai_actions row(s) for incident {incident_id}")
+    except Exception as e:
+        print(f"[triage] clear_pending_actions failed for incident {incident_id}: {e}")
+
+    tools = bind_tools_for_server(server, run_id, source_type="incident", source_id=incident_id)
     model = get_chat_model()
     server_id = server.get("_id", "")
 
@@ -229,6 +270,12 @@ async def run_triage(incident_id: str) -> dict:
     turn_count = 0
     # Fallback: accumulate all streamed tokens in case on_chain_end doesn't fire cleanly
     stream_buffer: list[str] = []
+    # Snapshot of stream_buffer length at the start of each model turn — lets the
+    # on_chat_model_end handler detect whether the model actually streamed (token
+    # events fired) or just dropped a full response in the end event (non-streaming
+    # providers). When the buffer didn't grow during the turn, we harvest content
+    # from on_chat_model_end so the analysis isn't silently empty.
+    buffer_size_at_turn_start = 0
 
     _emit_ws(server_id, "ai_analysis_token", {
         "run_id": run_id, "source_type": "incident", "source_id": incident_id, "token": ""
@@ -268,6 +315,35 @@ async def run_triage(incident_id: str) -> dict:
 
             elif etype == "on_chat_model_end":
                 turn_count += 1
+                # Robustness: some models (or some langchain providers) don't emit
+                # on_chat_model_stream chunks at all — they only fire on_chat_model_end
+                # with the full message. When stream_buffer didn't grow during this
+                # turn, harvest the content from data.output and push it as one
+                # synthetic token so the frontend sees the analysis.
+                streamed_this_turn = len(stream_buffer) > buffer_size_at_turn_start
+                if not streamed_this_turn:
+                    output = ev.get("data", {}).get("output")
+                    output_content = ""
+                    if output is not None:
+                        raw = getattr(output, "content", None)
+                        if isinstance(raw, str):
+                            output_content = raw
+                        elif isinstance(raw, list):
+                            try:
+                                output_content = "".join(
+                                    p.get("text", "") if isinstance(p, dict) else str(p)
+                                    for p in raw
+                                )
+                            except Exception:
+                                output_content = ""
+                    if output_content:
+                        _emit_ws(server_id, "ai_analysis_token", {
+                            "run_id": run_id,
+                            "source_type": "incident",
+                            "source_id": incident_id,
+                            "token": output_content,
+                        })
+                        stream_buffer.append(output_content)
                 # Insert a paragraph break between agent turns so reasoning phases
                 # don't smoosh together ("Let me check X" + "Now let me check Y" → two lines)
                 if stream_buffer and not stream_buffer[-1].endswith("\n\n"):
@@ -279,6 +355,8 @@ async def run_triage(incident_id: str) -> dict:
                         "source_id": incident_id,
                         "token": separator,
                     })
+                # Snapshot for the next turn
+                buffer_size_at_turn_start = len(stream_buffer)
 
             elif etype == "on_chain_end":
                 # Accept any chain_end that carries messages; keep the one with most (outermost graph)
@@ -303,6 +381,23 @@ async def run_triage(incident_id: str) -> dict:
     elapsed = time.monotonic() - t0
     print(f"[ai_triage] incident={incident_id} run={run_id} elapsed={elapsed:.2f}s turns={turn_count}")
 
+    # If the agent produced nothing at all — no messages AND no streamed tokens
+    # — surface the failure to the caller so the router returns 503 instead of
+    # silently saving an empty analysis row.
+    if not final_messages and not stream_buffer:
+        _emit_ws(server_id, "ai_analysis_complete", {
+            "run_id": run_id,
+            "source_type": "incident",
+            "source_id": incident_id,
+            "analysis_id": None,
+            "error": "agent_produced_no_output",
+        })
+        raise RuntimeError(
+            f"Triage agent produced no output for incident {incident_id} "
+            f"(run {run_id}, elapsed {elapsed:.2f}s). Check the [triage] log lines above "
+            f"for the underlying exception."
+        )
+
     # 5. Parse structured output
     #
     # Two sources of truth:
@@ -319,13 +414,18 @@ async def run_triage(incident_id: str) -> dict:
     raw_text_messages = _extract_final_text(final_messages)
     full_stream = "".join(stream_buffer)
 
-    # Choose display text
-    if raw_text_messages and "need more steps" not in raw_text_messages.lower()[:80]:
-        raw_text = raw_text_messages
-    elif full_stream:
+    # Choose display text. Prefer the full streamed buffer because it contains
+    # EVERY token the model emitted — including analysis sections produced in
+    # the same AIMessage as a tool call. `_extract_final_text` only returns
+    # messages with no tool_calls, which means it drops mid-stream sections
+    # when the model interleaves analysis with tool use. The buffer is what
+    # the user saw streaming, so the saved version should match that.
+    if full_stream and "need more steps" not in full_stream.lower()[:80]:
         raw_text = full_stream
+    elif raw_text_messages:
+        raw_text = raw_text_messages
     else:
-        raw_text = raw_text_messages  # error text is still better than nothing
+        raw_text = ""
 
     # Extract JSON — try the clean message first, then the full stream as fallback
     # (stream always contains the last ```json``` block the model wrote)

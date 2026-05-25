@@ -30,17 +30,22 @@ async def list_incidents(
     severity: Optional[str] = Query(None, description="Filter: critical, high, medium, low"),
     status: Optional[str] = Query(None, description="Filter: open, investigating, resolved, false_positive"),
     search: Optional[str] = Query(None, description="Search in description and rule_id"),
+    from_date: Optional[str] = Query(None, description="ISO datetime — only incidents detected at/after this time"),
+    to_date: Optional[str] = Query(None, description="ISO datetime — only incidents detected at/before this time"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
 ):
     """
     List all incidents with optional filters. Sorted newest first.
+    Date filters apply on `detected_at`.
     """
     return await service.get_all(
         server_id=server_id,
         severity=severity,
         status=status,
         search=search,
+        from_date=from_date,
+        to_date=to_date,
         page=page,
         page_size=page_size,
     )

@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "anthropic/claude-sonnet-4-6"
     LLM_TEMPERATURE: float = 0.2
     LLM_MAX_TOKENS: int = 2048
+    # Server-overview analyses cover 6 evidence sources over up to 24h, so the
+    # report tends to need 2-3× the budget of a single-incident triage. Tune
+    # independently from `LLM_MAX_TOKENS` so triage stays cheap while overviews
+    # have room to breathe through the full markdown + JSON commands block.
+    # Set the env var of the same name to override the default.
+    LLM_MAX_TOKENS_SERVER_OVERVIEW: int = 4096
     # OpenRouter (primary gateway — one API key → ~300 models)
     OPENROUTER_API_KEY: Optional[SecretStr] = None
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"

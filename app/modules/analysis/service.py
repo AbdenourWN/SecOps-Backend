@@ -1,6 +1,7 @@
 import re
 import time
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from app.core.database import get_database
 from app.modules.analysis.schemas import IncidentInDB, ActionLevel, IncidentStatus
 from app.modules.logs.schemas import LogEntryInDB
@@ -69,6 +70,85 @@ async def _get_cached_rules():
     return _rule_cache["rules"]
 
 
+# ========================================================================
+# Phase 28.5 — Per-server library scoping
+# Each server independently picks which slice of the global+private library
+# it sees. This is a pure-Python filter on top of the existing global cache;
+# no extra DB calls, no cache-per-server. Switching a server's mode is
+# non-destructive — private rules/scripts stay in the DB and just become
+# inactive until the mode includes them again.
+# ========================================================================
+def _rules_for_server(all_rules: list[dict], server_doc: dict) -> list[dict]:
+    """Filter the cached rule list by the server's `rule_library_mode`."""
+    mode = server_doc.get("rule_library_mode", "global")
+    sid = str(server_doc["_id"])
+
+    if mode == "global":
+        return [r for r in all_rules if r["data"].get("owner_type", "global") == "global"]
+    if mode == "server":
+        return [
+            r for r in all_rules
+            if r["data"].get("owner_type") == "server" and r["data"].get("owner_id") == sid
+        ]
+    # mode == "both"
+    return [
+        r for r in all_rules
+        if r["data"].get("owner_type", "global") == "global"
+        or (r["data"].get("owner_type") == "server" and r["data"].get("owner_id") == sid)
+    ]
+
+
+async def _resolve_script_id(rule: dict, server: dict, server_os: str, db) -> Optional[str]:
+    """
+    Phase 28.5 — script resolution with name-match auto-override.
+
+      - global mode: return the rule's OS-appropriate script id as-is.
+      - server/both mode: look up the candidate's name and prefer a server-owned
+        script with the same name. In `server` mode, if no server-owned twin
+        exists, return None (no fallback to global). In `both` mode, fall back
+        to the global candidate.
+    """
+    if server_os == "windows" and rule.get("remediation_script_id_windows"):
+        candidate_id = rule["remediation_script_id_windows"]
+    else:
+        candidate_id = rule.get("remediation_script_id")
+
+    if not candidate_id:
+        return None
+
+    mode = server.get("script_library_mode", "global")
+    if mode == "global":
+        return candidate_id
+
+    sid = str(server["_id"])
+
+    try:
+        candidate = await db["scripts"].find_one(
+            {"_id": ObjectId(candidate_id)}, {"name": 1}
+        )
+    except Exception:
+        candidate = None
+    if not candidate:
+        # Broken pointer — let the downstream `script_missing` path surface it.
+        return candidate_id
+
+    server_match = await db["scripts"].find_one(
+        {
+            "owner_type": "server",
+            "owner_id": sid,
+            "name": candidate["name"],
+            "enabled": True,
+        },
+        {"_id": 1},
+    )
+
+    if server_match:
+        return str(server_match["_id"])
+    if mode == "server":
+        return None
+    return candidate_id
+
+
 class AnalysisService:
 
     def __init__(self):
@@ -99,6 +179,10 @@ class AnalysisService:
 
         # 2. OPT-4: Get rules from cache (no DB query if cache is fresh)
         all_rules = await _get_cached_rules()
+
+        # Phase 28.5: filter by the server's library mode (global/server/both)
+        # before OS filtering. Pure-Python, no extra DB call.
+        all_rules = _rules_for_server(all_rules, server)
 
         # Filter by OS (pure Python, no DB)
         active_rules = [
@@ -138,13 +222,20 @@ class AnalysisService:
                     rule_id_str = str(rule["_id"])
                     now = datetime.now(timezone.utc)
 
+                    # Phase 28.4 — per-server rule disable (operator approved an
+                    # AI suggestion to silence this rule on this server). Treated
+                    # as no-match so neither incident nor anomaly fallback fires.
+                    if server_id_str in (rule.get("disabled_for_servers") or []):
+                        matched_any = False  # let heuristics try their luck
+                        continue
+
                     action_level = rule.get("action_level", 3)
 
-                    # Pick OS-appropriate script ID
-                    if server_os == "windows" and rule.get("remediation_script_id_windows"):
-                        candidate_script_id = rule["remediation_script_id_windows"]
-                    else:
-                        candidate_script_id = rule.get("remediation_script_id")
+                    # Phase 28.5: OS-aware pick + name-match auto-override for
+                    # server/both library modes. Falls back to the rule's
+                    # OS-appropriate script id in global mode (zero behaviour
+                    # change there).
+                    candidate_script_id = await _resolve_script_id(rule, server, server_os, db)
 
                     # ========================================================
                     # State-machine dedup (replaces the old 5-min hard dedup):
@@ -298,6 +389,12 @@ class AnalysisService:
                             skipped_reason = "script_missing"
                         elif not script_doc.get("enabled", True):
                             skipped_reason = "script_disabled"
+                        elif server_id_str in (script_doc.get("disabled_for_servers") or []):
+                            # Phase 28.4 — operator approved an AI suggestion to
+                            # disable this script on this server only. Rule still
+                            # fires (so the operator sees the incident), but
+                            # automation is skipped and the rule degrades to alert.
+                            skipped_reason = "script_disabled_for_server"
 
                     # Recurrence check — has the same script "fixed" this on this server
                     # repeatedly without lasting effect? Count consecutive auto-resolved

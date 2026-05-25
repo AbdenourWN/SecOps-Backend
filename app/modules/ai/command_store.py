@@ -130,9 +130,12 @@ async def list_commands(
     server_id: Optional[str] = None,
     source_id: Optional[str] = None,
     source_type: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
     page: int = 1,
     page_size: int = 25,
 ) -> dict:
+    from datetime import datetime
     db = get_database()
     query: dict = {}
     if status and status != "all":
@@ -143,6 +146,19 @@ async def list_commands(
         query["source_id"] = source_id
     if source_type and source_type != "all":
         query["source_type"] = source_type
+    date_range: dict = {}
+    if from_date:
+        try:
+            date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if to_date:
+        try:
+            date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    if date_range:
+        query["created_at"] = date_range
 
     total = await db["ai_command"].count_documents(query)
     skip = (page - 1) * page_size

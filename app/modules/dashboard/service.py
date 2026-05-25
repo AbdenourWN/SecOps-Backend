@@ -45,8 +45,13 @@ class DashboardService:
         db = get_database()
 
         # --- Counts ---
+        # Server status is tri-state since Phase 26:
+        #   online    — TCP reachable AND credentials work (full health)
+        #   reachable — TCP reachable BUT credentials/auth probe failed
+        #   offline   — TCP/banner-grab failed
         total_servers = await db["servers"].count_documents({})
         online_servers = await db["servers"].count_documents({"status": "online"})
+        reachable_servers = await db["servers"].count_documents({"status": "reachable"})
         offline_servers = await db["servers"].count_documents({"status": "offline"})
         total_rules = await db["rules"].count_documents({"enabled": True})
         total_scripts = await db["scripts"].count_documents({})
@@ -101,6 +106,7 @@ class DashboardService:
             "servers": {
                 "total": total_servers,
                 "online": online_servers,
+                "reachable": reachable_servers,
                 "offline": offline_servers,
             },
             "incidents": incidents,

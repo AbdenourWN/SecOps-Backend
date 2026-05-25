@@ -728,6 +728,9 @@ async def seed_scripts(db) -> dict:
     for s in to_insert:
         s["created_at"] = now
         s["updated_at"] = now
+        # Phase 28.5 — explicit global ownership on the 23 curated scripts
+        s.setdefault("owner_type", "global")
+        s.setdefault("owner_id", None)
 
     result = await db["scripts"].insert_many(to_insert)
     by_category = {}
@@ -787,6 +790,9 @@ async def seed_rules(db, script_lookup: dict):
 
         rule["created_at"] = now
         rule["updated_at"] = None
+        # Phase 28.5 — explicit global ownership on the 55 curated rules
+        rule.setdefault("owner_type", "global")
+        rule.setdefault("owner_id", None)
 
     await db["rules"].insert_many(to_insert)
 

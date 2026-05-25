@@ -1,3 +1,4 @@
+import asyncio
 import re
 import shlex
 from app.core.database import get_database
@@ -5,6 +6,7 @@ from app.core.executors import DEFAULT_COMMAND_TIMEOUT_S
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB, AutomationLog
 from app.core.executors import get_server_executor
 from app.core.security import decrypt_password
+from app.core.datetime_utils import utc_now
 from bson import ObjectId
 from datetime import datetime, timezone
 from app.core.events import event_bus
@@ -86,6 +88,8 @@ class AutomationService:
         status: str | None = None,
         server_id: str | None = None,
         script_id: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
     ) -> dict:
         """Shared filter builder for history list + stats queries."""
         query: dict = {}
@@ -95,7 +99,64 @@ class AutomationService:
             query["server_id"] = server_id
         if script_id:
             query["script_id"] = script_id
+        # Date range on `executed_at`. Bad input silently ignored.
+        date_range: dict = {}
+        if from_date:
+            try:
+                date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if to_date:
+            try:
+                date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
+            except Exception:
+                pass
+        if date_range:
+            query["executed_at"] = date_range
         return query
+
+    async def get_run(self, automation_log_id: str) -> dict | None:
+        """
+        Phase 28.5 — single-run fetch for the new remediation detail page.
+        Mirrors `get_history`'s enrichment shape (server_hostname + script_name)
+        so the detail page can use the same `RemediationRun` type.
+        """
+        db = get_database()
+        try:
+            oid = ObjectId(automation_log_id)
+        except Exception:
+            return None
+        run = await db["automation_logs"].find_one({"_id": oid})
+        if not run:
+            return None
+
+        run["_id"] = str(run["_id"])
+
+        server_id = run.get("server_id", "")
+        if server_id:
+            try:
+                srv = await db["servers"].find_one(
+                    {"_id": ObjectId(server_id)}, {"hostname": 1}
+                )
+            except Exception:
+                srv = None
+            run["server_hostname"] = (srv or {}).get("hostname", "Unknown")
+        else:
+            run["server_hostname"] = "Unknown"
+
+        script_id = run.get("script_id", "")
+        if script_id:
+            try:
+                scr = await db["scripts"].find_one(
+                    {"_id": ObjectId(script_id)}, {"name": 1}
+                )
+            except Exception:
+                scr = None
+            run["script_name"] = (scr or {}).get("name", "Unknown script")
+        else:
+            run["script_name"] = "Unknown script"
+
+        return run
 
     async def get_history(
         self,
@@ -104,6 +165,8 @@ class AutomationService:
         status: str | None = None,
         server_id: str | None = None,
         script_id: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
     ):
         """
         Returns remediation runs (newest first), optionally filtered by status,
@@ -113,7 +176,7 @@ class AutomationService:
         """
         db = get_database()
 
-        query = self._build_history_filter(status, server_id, script_id)
+        query = self._build_history_filter(status, server_id, script_id, from_date, to_date)
 
         cursor = (
             db["automation_logs"]
@@ -297,6 +360,20 @@ class AutomationService:
 
         print(f"🤖 AUTO-FIX: Executing '{script_doc['name']}' on {server['hostname']}...")
 
+        # Phase 28.4 — Capture pre-snapshot BEFORE the script runs, gated by the
+        # per-server `script_review_enabled` toggle (default True). Done in a
+        # try/except so a snapshot failure never aborts the actual remediation.
+        review_enabled = ((server.get("detection_config") or {}).get("script_review_enabled", True))
+        pre_snapshot = None
+        if review_enabled:
+            try:
+                from app.modules.ai.snapshots import capture_snapshot
+                pre_snapshot = await capture_snapshot(server_id, anchor=utc_now())
+            except Exception as snap_exc:
+                # Snapshot failure → just disable review for this run; don't block remediation.
+                print(f"⚠️ Pre-snapshot capture failed ({snap_exc}); skipping AI review for this run.")
+                pre_snapshot = None
+
         # 3. Variable Substitution (validated + OS-escaped)
         command = script_doc["content"]
         language = script_doc.get("language", "bash")
@@ -362,6 +439,23 @@ class AutomationService:
             "incident_id": incident_id,
             "status": status,
         })
+
+        # Phase 28.4 — Fire-and-forget AI review on the executed run. The script
+        # has already completed and been audited; the review runs after a
+        # settling window, takes a post-snapshot, calls the LLM, and writes
+        # ai_review_id / ai_review_verdict / ai_review_summary back onto this
+        # automation_logs row. The scheduler is NOT blocked on this — control
+        # returns immediately to analyze_logs() / execute_remediation() callers.
+        if review_enabled and pre_snapshot is not None:
+            try:
+                from app.modules.ai.script_review import run_review_with_settling
+                asyncio.create_task(run_review_with_settling(
+                    automation_log_id=str(log_result.inserted_id),
+                    server_id=server_id,
+                    pre_snapshot=pre_snapshot,
+                ))
+            except Exception as task_exc:
+                print(f"⚠️ Failed to schedule AI script review ({task_exc}); script run unaffected.")
 
         if result["status"] == "success":
             print(f"✅ Remediation Successful: {result.get('output')}")

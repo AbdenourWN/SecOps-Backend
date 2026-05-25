@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Literal
 from datetime import datetime
 from enum import Enum
 from app.core.datetime_utils import utc_now
@@ -32,6 +32,10 @@ class DetectionRule(BaseModel):
 
     remediation_script_id: Optional[str] = None
     remediation_script_id_windows: Optional[str] = None  # Windows override for cross-OS rules
+
+    # Phase 28.5 — per-server library scoping
+    owner_type: Literal["global", "server"] = "global"
+    owner_id: Optional[str] = None
 
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: Optional[datetime] = None

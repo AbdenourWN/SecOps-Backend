@@ -24,10 +24,12 @@ async def list_observations(
     status: Optional[str] = Query(None, description="pending_review | dismissed | promoted_to_incident | all"),
     severity: Optional[str] = Query(None, description="low | medium | high | all"),
     type: Optional[str] = Query(None, description="log | volume | all"),
+    from_date: Optional[str] = Query(None, description="ISO datetime — filter on last_seen_at >= this time"),
+    to_date: Optional[str] = Query(None, description="ISO datetime — filter on last_seen_at <= this time"),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=200),
 ):
-    """List anomaly observations, newest first."""
+    """List anomaly observations, newest first. Date range applies on `last_seen_at`."""
     return await service.list(
         page=page,
         page_size=page_size,
@@ -35,6 +37,8 @@ async def list_observations(
         status=status,
         severity=severity,
         type_=type,
+        from_date=from_date,
+        to_date=to_date,
     )
 
 

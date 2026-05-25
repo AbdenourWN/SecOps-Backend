@@ -28,8 +28,10 @@ ALLOWED_TOPICS: set[str] = {
 }
 
 # Matches per-server topics: "servers.<mongo-objectid>.<subtopic>"
+# Phase 28.5: `rules` and `scripts` added so per-server library tabs refresh
+# live when an operator (or AI approval) inserts a server-scoped row.
 _SERVER_TOPIC_RE = re.compile(
-    r"^servers\.[0-9a-f]{24}\.(metrics|logs|incidents|status|automation|anomalies|log_sources|ai)$"
+    r"^servers\.[0-9a-f]{24}\.(metrics|logs|incidents|status|automation|anomalies|log_sources|ai|rules|scripts)$"
 )
 
 

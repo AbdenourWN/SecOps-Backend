@@ -12,16 +12,28 @@ Model name examples:
   ollama:      "llama3:latest", "mistral"
 """
 from functools import lru_cache
+from typing import Optional
 from langchain_core.language_models import BaseChatModel
 from app.core.config import settings
 
 
-@lru_cache(maxsize=1)
-def get_chat_model() -> BaseChatModel:
+# Cache size is small but > 1 because callers may request different
+# max_tokens budgets (server-overview wants a larger budget than triage).
+# Each distinct budget gets its own cached client instance.
+@lru_cache(maxsize=8)
+def get_chat_model(max_tokens_override: Optional[int] = None) -> BaseChatModel:
+    """
+    Return a configured LangChain chat model.
+
+    `max_tokens_override` lets a specific call site (e.g. the server-overview
+    agent) request a higher generation budget than the global `LLM_MAX_TOKENS`
+    default without affecting other callers (triage stays cheap).
+    Pass `None` (the default) to use `settings.LLM_MAX_TOKENS`.
+    """
     provider = settings.LLM_PROVIDER
     model = settings.LLM_MODEL
     temperature = settings.LLM_TEMPERATURE
-    max_tokens = settings.LLM_MAX_TOKENS
+    max_tokens = max_tokens_override if max_tokens_override is not None else settings.LLM_MAX_TOKENS
 
     if provider == "openrouter":
         if not settings.OPENROUTER_API_KEY:

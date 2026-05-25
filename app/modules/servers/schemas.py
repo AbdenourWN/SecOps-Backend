@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, BeforeValidator, ConfigDict
-from typing import List, Optional, Annotated
+from typing import List, Optional, Annotated, Literal
 from enum import Enum
 from datetime import datetime
 from app.core.datetime_utils import utc_now
@@ -159,6 +159,16 @@ class DetectionConfig(BaseModel):
             "Disable on noisy servers until the keyword/pattern tuning is dialled in."
         ),
     )
+    script_review_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run an AI review after every L1/L2 remediation script execution on "
+            "this server. The review reads pre/post snapshots + stdout/stderr and "
+            "decides if the fix actually addressed the root cause (resolved / "
+            "partial / no_effect / made_worse). Adds 10–20s and one LLM call per "
+            "automated fix. Disable on cost-sensitive or extremely chatty servers."
+        ),
+    )
 
 
 # --- Server Schemas ---
@@ -176,7 +186,15 @@ class ServerBase(BaseModel):
     windows_event_ids_exclude: Optional[List[int]] = None   # denylist applied after allowlist
     # AI agent autonomy level (defaults to read_only — safest)
     ai_autonomy_level: AIAutonomyLevel = AIAutonomyLevel.READ_ONLY
-    
+
+    # Phase 28.5 — per-server rule/script library mode.
+    #   global = use only the curated 55-rule / 23-script global library (default)
+    #   server = use only this server's private library
+    #   both   = global library + this server's private library
+    # See analysis/service.py:_rules_for_server / _resolve_script_id for resolution.
+    rule_library_mode: Literal["global", "server", "both"] = "global"
+    script_library_mode: Literal["global", "server", "both"] = "global"
+
 
 class ServerCreate(ServerBase):
     credential: CredentialInput
@@ -200,6 +218,12 @@ class ServerInDB(TimestampModel, ServerBase):
     consecutive_offline_checks: int = 0
     next_health_check_at: Optional[datetime] = None
 
+    # AI server-overview state — set True before the agent runs, cleared in finally.
+    # Frontend polls this flag for the spinner.
+    ai_analysis_in_progress: Optional[bool] = None
+    ai_analysis_latest_id: Optional[str] = None
+    ai_analysis_count: int = 0
+
     class Config:
         populate_by_name = True
 
@@ -222,6 +246,12 @@ class ServerResponse(TimestampModel, ServerBase):
     log_rate_baseline: Optional[float] = None
     log_rate_updated_at: Optional[datetime] = None
 
+    # AI server-overview state — exposed to the frontend so it can drive spinner +
+    # latest-analysis fetch on the new AI Overview tab.
+    ai_analysis_in_progress: Optional[bool] = None
+    ai_analysis_latest_id: Optional[str] = None
+    ai_analysis_count: int = 0
+
     class Config:
         populate_by_name = True
 
@@ -235,6 +265,9 @@ class ServerUpdate(BaseModel):
     windows_event_ids: Optional[List[int]] = None
     windows_event_ids_exclude: Optional[List[int]] = None
     ai_autonomy_level: Optional[AIAutonomyLevel] = None
+    # Phase 28.5 — per-server library mode (see ServerBase for semantics)
+    rule_library_mode: Optional[Literal["global", "server", "both"]] = None
+    script_library_mode: Optional[Literal["global", "server", "both"]] = None
 
     # Allow updating the stored credential (e.g., changing the password)
     credential: Optional[CredentialUpdate] = None

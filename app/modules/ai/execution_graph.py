@@ -5,16 +5,20 @@ Entry point: run_execution_batch(batch_id, command_ids)
 
 For each approved command in sequence:
   1. Check guardrails (block list / rate limit)
-  2. Capture pre_snapshot (metrics + log tail)
-  3. Execute via terminal_pool
-  4. Capture post_snapshot
-  5. Run impact agent → save to ai_analysis (analysis_type="command_impact")
-  6. Denormalize verdict + summary onto ai_command row
+  2. Pull source-alert + triage analysis context (`_fetch_impact_context`)
+  3. Capture pre_snapshot (metrics window, server state) anchored at "now"
+  4. Server-online guard, then execute via terminal_pool
+  5. ~4s settling delay so post-exec logs/metrics can land
+  6. Capture post_snapshot anchored at "now"
+  7. Fetch impact logs (10 lines at source-alert time + 10 latest, deduped by ES _id)
+  8. Run impact agent with full context → save to ai_analysis (analysis_type="command_impact")
+  9. Denormalize verdict + summary + addressed_root_cause onto ai_command row
 """
+import asyncio
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from bson import ObjectId
@@ -26,36 +30,63 @@ from app.core.datetime_utils import utc_now
 from app.core.events import event_bus
 from app.modules.servers.guardrails import check_command
 from app.modules.ai.llm import get_chat_model
-from app.modules.ai.analysis_store import save_analysis
+from app.modules.ai.analysis_store import save_analysis, get_analysis_by_id
 from app.modules.ai.tools_read import ALL_READ_TOOLS
+from app.modules.ai.snapshots import capture_snapshot, fetch_review_logs
 
 
-IMPACT_SYSTEM_PROMPT = """You are a SOC analyst reviewing the result of a remediation command that was just executed on a server.
+IMPACT_SYSTEM_PROMPT = """You are a SOC analyst reviewing the result of a remediation command that was just executed on a server. Your job is to decide whether the command **addressed the diagnosed root cause** of the original alert — not just whether anything changed.
 
-You receive:
-- The command that was run, its purpose and expected outcome
-- The server's state BEFORE execution (metrics + log tail)
-- The command's stdout/stderr/exit_code
-- The server's state AFTER execution
+## What you receive
 
-Your job: determine whether the command worked and what changed.
+1. **Source alert** — the incident or anomaly that triggered the command (severity, rule name / reasons, when it fired, the matched log line).
+2. **Triage diagnosis** — the prior AI analysis: summary, root cause hypothesis, confidence. Treat this as "what we believed was wrong."
+3. **Command details** — the command text, its stated purpose, expected outcome, and risk level.
+4. **Execution result** — exit code, stdout, stderr.
+5. **Pre-snapshot metrics** — metric time series for the ~5 minutes leading up to execution.
+6. **Post-snapshot metrics** — metric time series for the ~5 minutes after execution (captured after a ~4 s settling delay).
+7. **Logs evidence — two slices, deduplicated by document ID, no overlap:**
+   - **Logs at the source alert time** — ~10 log lines bracketing the moment the alert originally fired (5 immediately before + 5 immediately after).
+   - **Most recent logs** — the 10 newest log lines on the server right now.
+   Use the first slice to ground "what the problem looked like" and the second to ground "what the system looks like after the command." If the recent slice no longer contains the diagnostic patterns from the source slice, that's strong evidence of improvement.
 
-Write a short analysis in Markdown (3-5 sentences), then end with a ```json block:
+## What you must produce
+
+Write a short Markdown analysis (3-6 sentences). Reference **specific timestamps, metric numbers, and log fragments** as evidence — do not write generic phrases like "the command worked."
+
+Then end with a ```json block in this exact shape:
+
 ```json
 {
   "outcome": "resolved|partial|no_effect|made_worse",
+  "addressed_root_cause": "yes|partial|no|unknown",
   "before_after_delta": "1-2 line factual diff (e.g. CPU 92% → 14%, sshd auth failures stopped)",
+  "evidence": [
+    "CPU dropped from 92% at 10:14:02 to 14% at 10:14:08",
+    "sshd 'authentication failure' lines absent from the most recent log slice"
+  ],
   "follow_up_required": false,
   "follow_up_reason": null,
   "next_recommended_action": null
 }
 ```
 
-Outcome definitions:
-- resolved: the root cause appears fixed (metrics/logs confirm improvement)
-- partial: improvement but issue persists
-- no_effect: command ran successfully but nothing measurable changed
-- made_worse: metrics or logs indicate degradation after execution
+**Field definitions:**
+
+- `outcome`:
+  - `resolved` — metrics/logs confirm the issue is fixed
+  - `partial` — improvement but issue persists
+  - `no_effect` — command ran successfully but nothing measurable changed
+  - `made_worse` — metrics or logs indicate degradation after execution
+- `addressed_root_cause`:
+  - `yes` — the command directly targeted what triage diagnosed and the data shows it worked
+  - `partial` — addressed part of the diagnosis but not all
+  - `no` — command ran but did not address the diagnosed root cause (e.g. it cleared a symptom but the cause remains)
+  - `unknown` — insufficient evidence in the data to judge
+- `evidence` — a list of **concrete factual statements** drawn from the metrics/logs sections, each citing a number or log fragment. Aim for 2-4 items. Empty list is allowed only when there is genuinely no evidence (e.g. command produced no output and metrics are flat).
+- `follow_up_required` / `follow_up_reason` / `next_recommended_action` — populate if `outcome` is `partial`, `no_effect`, or `made_worse`. Otherwise `false` / `null` / `null`.
+
+Use read tools only if you genuinely need additional context beyond what's provided — most assessments should be possible from the pre-fetched data alone.
 """
 
 
@@ -79,52 +110,65 @@ def _extract_final_text(messages: list) -> str:
     return ""
 
 
-async def _capture_snapshot(server_id: str) -> dict:
-    """Capture a lightweight server snapshot: cached metrics + last 10 log lines."""
+async def _fetch_impact_context(cmd_doc: dict) -> dict:
+    """
+    Pull the source incident/anomaly + the original triage analysis so the
+    impact agent knows WHAT problem the command was meant to fix.
+
+    Returns:
+      source_type, source_id, source_doc, source_anchor (datetime|None),
+      rule_name, triage_summary, triage_markdown, triage_structured,
+      triage_confidence
+    """
     db = get_database()
-    now = utc_now()
-    metrics = {}
-    try:
-        srv = await db["servers"].find_one({"_id": ObjectId(server_id)}, {"last_metrics": 1, "open_incidents_count": 1})
-        if srv:
-            lm = srv.get("last_metrics") or {}
-            metrics = {
-                "cpu_usage": lm.get("cpu_usage"),
-                "ram_usage": lm.get("ram_usage"),
-                "disk_usage": lm.get("disk_usage"),
-                "collected_at": str(lm.get("collected_at", "")),
-            }
-    except Exception:
-        pass
+    src_type = cmd_doc.get("source_type", "")
+    src_id = cmd_doc.get("source_id", "")
+    analysis_id_triage = cmd_doc.get("analysis_id", "")
 
-    open_incidents_count = 0
-    try:
-        open_incidents_count = await db["incidents"].count_documents(
-            {"server_id": server_id, "status": {"$in": ["open", "verifying"]}}
-        )
-    except Exception:
-        pass
+    source_doc: dict = {}
+    rule_name = ""
+    if src_id:
+        try:
+            oid = ObjectId(src_id)
+            if src_type == "incident":
+                source_doc = await db["incidents"].find_one({"_id": oid}) or {}
+                if source_doc.get("rule_id"):
+                    rule = await db["rules"].find_one(
+                        {"_id": ObjectId(str(source_doc["rule_id"]))}, {"name": 1}
+                    )
+                    rule_name = (rule or {}).get("name", "")
+            elif src_type == "anomaly":
+                source_doc = await db["log_observations"].find_one({"_id": oid}) or {}
+        except Exception:
+            source_doc = {}
 
-    log_tail = []
-    try:
-        cursor = db["logs"].find({"server_id": server_id}).sort("timestamp", -1).limit(10)
-        logs = await cursor.to_list(length=10)
-        log_tail = [
-            {
-                "timestamp": str(l.get("timestamp", "")),
-                "level": l.get("level", ""),
-                "message": (l.get("message", "") or "")[:200],
-            }
-            for l in reversed(logs)
-        ]
-    except Exception:
-        pass
+    triage: dict = {}
+    if analysis_id_triage:
+        try:
+            triage = await get_analysis_by_id(analysis_id_triage) or {}
+        except Exception:
+            triage = {}
+
+    source_anchor: Optional[datetime] = None
+    if src_type == "incident":
+        source_anchor = source_doc.get("detected_at")
+    elif src_type == "anomaly":
+        source_anchor = source_doc.get("first_seen_at") or source_doc.get("last_seen_at")
+    if isinstance(source_anchor, datetime) and source_anchor.tzinfo is None:
+        source_anchor = source_anchor.replace(tzinfo=timezone.utc)
+    if not isinstance(source_anchor, datetime):
+        source_anchor = None
 
     return {
-        "metrics": metrics,
-        "log_tail": log_tail,
-        "open_incidents_count": open_incidents_count,
-        "timestamp": now.isoformat(),
+        "source_type": src_type,
+        "source_id": src_id,
+        "source_doc": source_doc,
+        "source_anchor": source_anchor,
+        "rule_name": rule_name,
+        "triage_summary": triage.get("summary", ""),
+        "triage_markdown": triage.get("markdown", ""),
+        "triage_structured": triage.get("structured", {}) or {},
+        "triage_confidence": triage.get("confidence", 0.0),
     }
 
 
@@ -140,55 +184,168 @@ def _emit_progress(server_id: str, command_id: str, phase: str, **kwargs):
         pass
 
 
-async def _run_impact_agent(
+def _fmt_metrics_table(points: list) -> str:
+    if not points:
+        return "_No metric points in window._"
+    rows = ["| Timestamp | CPU % | RAM % | Disk % |", "|---|---|---|---|"]
+    for p in points:
+        rows.append(
+            f"| {p.get('t', '')} | "
+            f"{p.get('cpu') if p.get('cpu') is not None else '—'} | "
+            f"{p.get('ram') if p.get('ram') is not None else '—'} | "
+            f"{p.get('disk') if p.get('disk') is not None else '—'} |"
+        )
+    return "\n".join(rows)
+
+
+def _fmt_log_lines(logs: list) -> str:
+    if not logs:
+        return "_No log lines._"
+    lines = [f"[{l.get('t', '')}] [{(l.get('level') or '').upper():7}] {l.get('msg', '')}" for l in logs]
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def _build_impact_user_message(
+    *,
     command: str,
     purpose: str,
     expected_outcome: str,
+    risk_level: str,
     stdout: str,
     stderr: str,
     exit_code: Optional[int],
     pre_snapshot: dict,
     post_snapshot: dict,
+    impact_context: dict,
+    impact_logs: dict,
+    server_id: str,
+    command_id: str,
+) -> str:
+    src_doc = impact_context.get("source_doc") or {}
+    src_type = impact_context.get("source_type", "")
+    rule_name = impact_context.get("rule_name", "")
+    triage_summary = impact_context.get("triage_summary", "")
+    triage_structured = impact_context.get("triage_structured") or {}
+    triage_md = (impact_context.get("triage_markdown") or "")[:1500]
+
+    if src_type == "incident":
+        source_block = (
+            f"- **Type**: incident\n"
+            f"- **Severity**: {src_doc.get('severity', '?')}\n"
+            f"- **Rule**: {rule_name or src_doc.get('rule_id', '?')}\n"
+            f"- **Detected at**: {src_doc.get('detected_at', '?')}\n"
+            f"- **Status**: {src_doc.get('status', '?')}\n"
+            f"- **Description**: {src_doc.get('description', '?')}\n"
+        )
+    elif src_type == "anomaly":
+        reasons = ", ".join(src_doc.get("reasons", [])) or "n/a"
+        source_block = (
+            f"- **Type**: anomaly\n"
+            f"- **Severity**: {src_doc.get('severity', '?')}\n"
+            f"- **Score**: {src_doc.get('score', '?')}\n"
+            f"- **Reasons**: {reasons}\n"
+            f"- **Occurrences**: {src_doc.get('occurrence_count', 1)}\n"
+            f"- **First seen**: {src_doc.get('first_seen_at', '?')}\n"
+            f"- **Last seen**: {src_doc.get('last_seen_at', '?')}\n"
+            f"- **Sample log**: {(src_doc.get('log_message') or 'n/a')[:300]}\n"
+        )
+    else:
+        source_block = "_No source alert context available._"
+
+    triage_block = (
+        f"- **Summary**: {triage_summary or '—'}\n"
+        f"- **Root cause hypothesis**: {triage_structured.get('root_cause_hypothesis', '—')}\n"
+        f"- **Confidence**: {triage_structured.get('confidence', '—')}\n"
+        f"- **Severity assessment**: {triage_structured.get('severity_assessment', '—')}\n"
+        f"- **Impact at time of triage**: {triage_structured.get('impact_now', '—')}\n\n"
+        f"_Triage narrative (truncated to 1500 chars):_\n\n{triage_md if triage_md else '_no markdown available_'}"
+    )
+
+    pre_metrics = pre_snapshot.get("metrics_window") or []
+    post_metrics = post_snapshot.get("metrics_window") or []
+    pre_state = pre_snapshot.get("server_state") or {}
+    post_state = post_snapshot.get("server_state") or {}
+
+    at_source = (impact_logs or {}).get("at_source") or []
+    latest = (impact_logs or {}).get("latest") or []
+
+    return (
+        f"# Impact assessment request\n\n"
+        f"A command was just executed on server `{server_id}` (command id `{command_id}`).\n\n"
+        f"## 1. Source alert\n{source_block}\n"
+        f"## 2. Triage diagnosis\n{triage_block}\n\n"
+        f"## 3. Command details\n"
+        f"- **Command**: `{command}`\n"
+        f"- **Purpose**: {purpose}\n"
+        f"- **Expected outcome**: {expected_outcome}\n"
+        f"- **Risk level**: {risk_level}\n\n"
+        f"## 4. Execution result\n"
+        f"- **Exit code**: {exit_code}\n"
+        f"- **stdout** (truncated 2000 chars):\n```\n{(stdout or '')[:2000]}\n```\n"
+        f"- **stderr** (truncated 500 chars):\n```\n{(stderr or '')[:500]}\n```\n\n"
+        f"## 5. Pre-snapshot metrics (anchor: {pre_snapshot.get('anchor', '?')})\n"
+        f"- **Server**: {pre_state.get('hostname', '?')} · online={pre_state.get('is_online', '?')} · status={pre_state.get('status', '?')}\n\n"
+        f"{_fmt_metrics_table(pre_metrics)}\n\n"
+        f"## 6. Post-snapshot metrics (anchor: {post_snapshot.get('anchor', '?')}, after ~4s settling delay)\n"
+        f"- **Server**: {post_state.get('hostname', '?')} · online={post_state.get('is_online', '?')} · status={post_state.get('status', '?')}\n\n"
+        f"{_fmt_metrics_table(post_metrics)}\n\n"
+        f"## 7. Logs evidence (deduplicated by ES `_id` — no entry appears in both slices)\n\n"
+        f"### 7a. Logs at the source alert time (up to 10: 5 before + 5 after the alert anchor)\n"
+        f"{_fmt_log_lines(at_source)}\n\n"
+        f"### 7b. Most recent logs on the server (up to 10, latest first)\n"
+        f"{_fmt_log_lines(list(reversed(latest)))}\n\n"
+        f"---\n\n"
+        f"Now produce the impact assessment. End with the ```json block exactly as specified in your system prompt."
+    )
+
+
+async def _run_impact_agent(
+    *,
+    command: str,
+    purpose: str,
+    expected_outcome: str,
+    risk_level: str,
+    stdout: str,
+    stderr: str,
+    exit_code: Optional[int],
+    pre_snapshot: dict,
+    post_snapshot: dict,
+    impact_context: dict,
+    impact_logs: dict,
     server_id: str,
     command_id: str,
     run_id: str,
-    analysis_id_triage: str,
 ) -> dict:
-    """Run the impact analysis LLM for one command. Returns analysis_id + verdict."""
+    """Run the impact analysis LLM for one command. Returns analysis_id + parsed verdict."""
     model = get_chat_model()
     agent = create_react_agent(model=model, tools=list(ALL_READ_TOOLS), prompt=IMPACT_SYSTEM_PROMPT)
 
-    pre_str = json.dumps(pre_snapshot, default=str)
-    post_str = json.dumps(post_snapshot, default=str)
-    stdout_snippet = (stdout or "")[:2000]
-    stderr_snippet = (stderr or "")[:500]
+    user_message = _build_impact_user_message(
+        command=command,
+        purpose=purpose,
+        expected_outcome=expected_outcome,
+        risk_level=risk_level,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        pre_snapshot=pre_snapshot,
+        post_snapshot=post_snapshot,
+        impact_context=impact_context,
+        impact_logs=impact_logs,
+        server_id=server_id,
+        command_id=command_id,
+    )
 
-    result = await agent.ainvoke({
-        "messages": [
-            HumanMessage(
-                content=(
-                    f"A command was just executed on server (server_id={server_id}).\n\n"
-                    f"**Command:** `{command}`\n"
-                    f"**Purpose:** {purpose}\n"
-                    f"**Expected outcome:** {expected_outcome}\n\n"
-                    f"**Exit code:** {exit_code}\n"
-                    f"**stdout:**\n```\n{stdout_snippet}\n```\n"
-                    f"**stderr:**\n```\n{stderr_snippet}\n```\n\n"
-                    f"**Before execution state:**\n{pre_str}\n\n"
-                    f"**After execution state:**\n{post_str}\n\n"
-                    f"Assess the impact. Use read tools only if you need more context. "
-                    f"End with the ```json block."
-                )
-            )
-        ]
-    })
+    result = await agent.ainvoke({"messages": [HumanMessage(content=user_message)]})
 
     messages = result.get("messages", [])
     raw_text = _extract_final_text(messages)
     parsed = _extract_json_block(raw_text) or {}
 
     outcome = parsed.get("outcome", "no_effect")
-    before_after_delta = parsed.get("before_after_delta", "")
+    addressed = parsed.get("addressed_root_cause", "unknown")
+    before_after_delta = parsed.get("before_after_delta", "") or ""
+    evidence = parsed.get("evidence", []) or []
     markdown = f"## AI Impact Analysis\n\n{raw_text}\n\n---\n*Command: {command_id}*"
 
     from app.core.config import settings
@@ -203,7 +360,9 @@ async def _run_impact_agent(
         confidence=0.0,
         structured={
             "outcome": outcome,
+            "addressed_root_cause": addressed,
             "before_after_delta": before_after_delta,
+            "evidence": evidence,
             "follow_up_required": parsed.get("follow_up_required", False),
             "follow_up_reason": parsed.get("follow_up_reason"),
             "next_recommended_action": parsed.get("next_recommended_action"),
@@ -217,6 +376,7 @@ async def _run_impact_agent(
     return {
         "analysis_id": analysis_id,
         "outcome": outcome,
+        "addressed_root_cause": addressed,
         "before_after_delta": before_after_delta,
     }
 
@@ -243,7 +403,12 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
         server_id = cmd_doc.get("server_id", "")
         purpose = cmd_doc.get("purpose", "")
         expected_outcome = cmd_doc.get("expected_outcome", "")
+        risk_level = cmd_doc.get("risk_level", "medium")
         run_id = cmd_doc.get("run_id", str(uuid.uuid4())[:8])
+
+        # Pull source alert + triage analysis once — used to build the impact prompt
+        # and to anchor the source-time log slice for fetch_review_logs.
+        impact_context = await _fetch_impact_context(cmd_doc)
 
         # Guardrails check
         guard = check_command(command, os_type)
@@ -267,8 +432,9 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
         )
         _emit_progress(server_id, command_id, "pre_snapshot")
 
-        # Pre-snapshot
-        pre_snapshot = await _capture_snapshot(server_id)
+        # Pre-snapshot — anchor at "now" just before execution starts
+        pre_anchor = utc_now()
+        pre_snapshot = await capture_snapshot(server_id, anchor=pre_anchor)
         await db["ai_command"].update_one(
             {"_id": ObjectId(command_id)},
             {"$set": {"pre_snapshot": pre_snapshot}},
@@ -377,36 +543,52 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
         )
         _emit_progress(server_id, command_id, "executed", exit_code=exit_code, status=status)
 
-        # Post-snapshot
-        post_snapshot = await _capture_snapshot(server_id)
+        # Settling delay — give the server ~4 s to emit follow-up logs (service
+        # restart messages, etc.) and let a fresh metric sample push to ES.
+        # Skip when the command never reached the server.
+        will_run_impact = status == "completed" or (status == "failed" and (stdout or stderr))
+        if will_run_impact:
+            await asyncio.sleep(4)
+
+        # Post-snapshot — anchor at "now" after the settling delay
+        post_anchor = utc_now()
+        post_snapshot = await capture_snapshot(server_id, anchor=post_anchor)
         await db["ai_command"].update_one(
             {"_id": ObjectId(command_id)},
             {"$set": {"post_snapshot": post_snapshot}},
         )
 
-        # Impact agent — skip if the command never reached the server (no output at all)
-        if status == "completed" or (status == "failed" and (stdout or stderr)):
+        # Impact agent — skip if the command never reached the server
+        if will_run_impact:
             try:
+                # Logs slice anchored at the source alert's creation time +
+                # 10 most recent server logs (deduplicated by ES _id).
+                source_anchor = impact_context.get("source_anchor") or (executed_at - timedelta(minutes=5))
+                impact_logs = await fetch_review_logs(server_id, source_anchor=source_anchor)
+
                 impact = await _run_impact_agent(
                     command=command,
                     purpose=purpose,
                     expected_outcome=expected_outcome,
+                    risk_level=risk_level,
                     stdout=stdout,
                     stderr=stderr,
                     exit_code=exit_code,
                     pre_snapshot=pre_snapshot,
                     post_snapshot=post_snapshot,
+                    impact_context=impact_context,
+                    impact_logs=impact_logs,
                     server_id=server_id,
                     command_id=command_id,
                     run_id=run_id,
-                    analysis_id_triage=cmd_doc.get("analysis_id", ""),
                 )
                 await db["ai_command"].update_one(
                     {"_id": ObjectId(command_id)},
                     {"$set": {
                         "impact_analysis_id": impact["analysis_id"],
                         "impact_verdict": impact["outcome"],
-                        "impact_summary": impact["before_after_delta"][:200] if impact["before_after_delta"] else "",
+                        "impact_addressed_root_cause": impact.get("addressed_root_cause", "unknown"),
+                        "impact_summary": (impact["before_after_delta"] or "")[:200],
                     }},
                 )
                 _emit_progress(server_id, command_id, "report_ready", verdict=impact["outcome"])

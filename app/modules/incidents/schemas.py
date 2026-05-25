@@ -53,6 +53,14 @@ class IncidentInDB(BaseModel):
     ai_analysis_count: int = 0
     ai_analysis_in_progress: bool = False        # True while triage agent is running
     ai_manual_commands: Optional[List[Dict[str, Any]]] = None  # sudo/TTY commands from triage
+    # Phase 28.5.2 — separate field for the manual checklist produced by the
+    # post-remediation review's `suggest_manual_remediation` action. Kept
+    # distinct from `ai_manual_commands` so the original triage suggestions
+    # are not clobbered. `_meta.automation_log_id` links back to the
+    # remediation run that produced these commands so the incident page can
+    # render "View remediation run →".
+    ai_remediation_manual_commands: Optional[List[Dict[str, Any]]] = None
+    ai_remediation_manual_commands_meta: Optional[Dict[str, Any]] = None
     # Set when a rule's linked script was disabled/missing at fire time
     automation_skipped_reason: Optional[str] = None
     # Set when remediation was attempted but failed in a structural way
@@ -72,10 +80,30 @@ class IncidentInDB(BaseModel):
         populate_by_name = True
 
 
+class LatestRemediation(BaseModel):
+    """Phase 28.4 — denormalised latest automation_logs row for the incident detail page."""
+    automation_log_id: str
+    script_id: Optional[str] = None
+    script_name: Optional[str] = None
+    status: Optional[str] = None
+    executed_at: Optional[datetime] = None
+    output: Optional[str] = None
+    error: Optional[str] = None
+    ai_review_id: Optional[str] = None
+    ai_review_verdict: Optional[str] = None
+    ai_review_summary: Optional[str] = None
+
+
 class IncidentResponse(IncidentInDB):
     """Response model that converts MongoDB _id to string."""
     id: PyObjectId = Field(alias="_id")
     server_hostname: Optional[str] = None
+    # Phase 28.4 — most recent remediation run on this incident + its AI review verdict.
+    # Populated by IncidentService.get_by_id; absent on list responses.
+    latest_remediation: Optional[LatestRemediation] = None
+    # Phase 28.4 — reason text attached when an AI-suggest action of type
+    # `suggest_manual_remediation` was approved on this incident.
+    ai_manual_commands_reason: Optional[str] = None
 
 
 class IncidentStatusUpdate(BaseModel):
