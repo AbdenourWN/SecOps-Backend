@@ -39,6 +39,8 @@ from app.modules.ai.tools_mutate import (
     _execute_create_server_rule,
     _execute_create_server_script,
     _execute_swap_remediation_script,
+    # Phase 28.5.4 — atomic rule+script pair
+    _execute_create_server_rule_with_script,
 )
 from app.modules.ai.command_store import (
     approve_commands,
@@ -428,6 +430,25 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
                 new_script_content=payload.get("new_script_content", ""),
                 language=payload.get("language", "bash"),
                 target_os=payload.get("target_os", "linux"),
+                reason=payload.get("reason", ""),
+                ai_analysis_id=payload.get("ai_analysis_id"),
+            )
+        elif action_type == "create_server_rule_with_script":
+            outcome = await _execute_create_server_rule_with_script(
+                server_id=payload.get("server_id", ""),
+                rule_name=payload.get("rule_name", ""),
+                pattern=payload.get("pattern", ""),
+                severity=payload.get("severity", "medium"),
+                action_level=int(payload.get("action_level", 3) or 3),
+                rule_description=payload.get("rule_description", ""),
+                os_type=payload.get("os_type", "linux"),
+                tags=payload.get("tags") or [],
+                script_name=payload.get("script_name", ""),
+                script_description=payload.get("script_description", ""),
+                language=payload.get("language", "bash"),
+                content=payload.get("content", ""),
+                target_os=payload.get("target_os", "linux"),
+                category=payload.get("category", "recovery"),
                 reason=payload.get("reason", ""),
                 ai_analysis_id=payload.get("ai_analysis_id"),
             )

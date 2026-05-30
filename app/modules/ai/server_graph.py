@@ -150,10 +150,17 @@ for operator approval; approval auto-flips the server's library mode from
   "tags": ["recon"]
 }
 {
-  "action": "create_server_script",
-  "reason": "Recurring incident on this server has no remediation; here's a safe responder.",
-  "name": "<script name>",
-  "description": "<short purpose>",
+  "action": "create_server_rule_with_script",
+  "reason": "Recurring incident on this server has no rule AND no remediation; here's a detection plus a safe responder, linked.",
+  "rule_name": "<rule name>",
+  "pattern": "<Python regex>",
+  "severity": "low|medium|high|critical",
+  "action_level": 1|2|3,
+  "rule_description": "<short description>",
+  "os_type": "linux|windows|common",
+  "tags": ["..."],
+  "script_name": "<script name>",
+  "script_description": "<short purpose>",
   "language": "bash|powershell|python",
   "content": "<full script body>",
   "target_os": "linux|windows",
@@ -172,6 +179,8 @@ for operator approval; approval auto-flips the server's library mode from
 Be conservative — only propose new rules/scripts when the data clearly
 shows the global library doesn't cover the case. An empty `suggestions`
 array is correct when the overview is normal or when the cause is unclear.
+Never propose a standalone script with no rule to fire it — use
+`create_server_rule_with_script` so the helper is actually reachable.
 
 Rules for `manual_commands`:
 - 3–8 commands is the sweet spot. Each one should test a distinct hypothesis or perform a distinct fix step.
@@ -507,6 +516,25 @@ async def _queue_overview_suggestions(
                 "server_id": server_id,
                 "name": str(sug.get("name", ""))[:200],
                 "description": str(sug.get("description", ""))[:1000],
+                "language": sug.get("language") if sug.get("language") in ("bash", "powershell", "python") else "bash",
+                "content": str(sug.get("content", ""))[:20000],
+                "target_os": sug.get("target_os") if sug.get("target_os") in ("linux", "windows") else "linux",
+                "category": sug.get("category") if sug.get("category") in ("diagnostic", "containment", "recovery") else "recovery",
+                "reason": reason,
+                "ai_analysis_id": analysis_id,
+            }
+        elif action == "create_server_rule_with_script":
+            payload = {
+                "server_id": server_id,
+                "rule_name": str(sug.get("rule_name", ""))[:200],
+                "pattern": str(sug.get("pattern", ""))[:2000],
+                "severity": sug.get("severity") if sug.get("severity") in ("low", "medium", "high", "critical") else "medium",
+                "action_level": int(sug.get("action_level") or 3),
+                "rule_description": str(sug.get("rule_description", ""))[:1000],
+                "os_type": sug.get("os_type") if sug.get("os_type") in ("linux", "windows", "common") else "common",
+                "tags": [str(t)[:50] for t in (sug.get("tags") or [])][:10],
+                "script_name": str(sug.get("script_name", ""))[:200],
+                "script_description": str(sug.get("script_description", ""))[:1000],
                 "language": sug.get("language") if sug.get("language") in ("bash", "powershell", "python") else "bash",
                 "content": str(sug.get("content", ""))[:20000],
                 "target_os": sug.get("target_os") if sug.get("target_os") in ("linux", "windows") else "linux",

@@ -123,10 +123,17 @@ proposing the flip), you may additionally propose:
   "new_script_content": "<full replacement script — keep the SAME name as the global one>"
 }
 {
-  "action": "create_server_script",
-  "reason": "the global library doesn't cover <X> on this server",
-  "name": "<distinct new script name>",
-  "description": "<short purpose>",
+  "action": "create_server_rule_with_script",
+  "reason": "this failure pattern isn't covered by any global rule and the global library has no helper to fix it",
+  "rule_name": "<rule name>",
+  "pattern": "<Python regex that matches the log line>",
+  "severity": "low|medium|high|critical",
+  "action_level": 1,
+  "rule_description": "<short description>",
+  "os_type": "linux|windows|common",
+  "tags": ["..."],
+  "script_name": "<distinct new script name>",
+  "script_description": "<short purpose>",
   "language": "bash|powershell|python",
   "content": "<full script body>",
   "target_os": "linux|windows",
@@ -134,10 +141,13 @@ proposing the flip), you may additionally propose:
 }
 ```
 
-Approval of either auto-flips the server's `script_library_mode` from
-`global` to `both` so the new script actually runs. Use `swap_remediation_script`
+Approval of any of these auto-flips the server's library mode(s) from
+`global` to `both` so the new entry actually runs. Use `swap_remediation_script`
 when the existing global remediation is *almost right* but needs server-specific
-tweaks; use `create_server_script` when proposing a brand-new helper.
+tweaks. Use `create_server_rule_with_script` when a brand-new detection needs a
+brand-new helper to remediate it — the rule and script are inserted together and
+linked so the script actually fires. Do **NOT** propose a standalone script: a
+script with no rule pointing to it never executes.
 
 Each suggestion will be queued as a separate `ai_actions` row for operator approval. Be concrete; cite the specific evidence that motivated the suggestion. Only emit suggestions when the data clearly points to one — empty array is correct when the verdict is `resolved` or when the cause is unclear.
 
@@ -417,6 +427,25 @@ async def _queue_suggestion_actions(
                 "new_script_content": str(sug.get("new_script_content", ""))[:20000],
                 "language": sug.get("language") if sug.get("language") in ("bash", "powershell", "python") else "bash",
                 "target_os": sug.get("target_os") if sug.get("target_os") in ("linux", "windows") else "linux",
+                "reason": reason[:500],
+                "ai_analysis_id": analysis_id,
+            }
+        elif action == "create_server_rule_with_script":
+            payload = {
+                "server_id": server_id,
+                "rule_name": str(sug.get("rule_name", ""))[:200],
+                "pattern": str(sug.get("pattern", ""))[:2000],
+                "severity": sug.get("severity") if sug.get("severity") in ("low", "medium", "high", "critical") else "medium",
+                "action_level": int(sug.get("action_level") or 3),
+                "rule_description": str(sug.get("rule_description", ""))[:1000],
+                "os_type": sug.get("os_type") if sug.get("os_type") in ("linux", "windows", "common") else "common",
+                "tags": [str(t)[:50] for t in (sug.get("tags") or [])][:10],
+                "script_name": str(sug.get("script_name", ""))[:200],
+                "script_description": str(sug.get("script_description", ""))[:1000],
+                "language": sug.get("language") if sug.get("language") in ("bash", "powershell", "python") else "bash",
+                "content": str(sug.get("content", ""))[:20000],
+                "target_os": sug.get("target_os") if sug.get("target_os") in ("linux", "windows") else "linux",
+                "category": sug.get("category") if sug.get("category") in ("diagnostic", "containment", "recovery") else "recovery",
                 "reason": reason[:500],
                 "ai_analysis_id": analysis_id,
             }

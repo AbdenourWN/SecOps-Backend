@@ -167,6 +167,10 @@ async def lifespan(app: FastAPI):
     # Apply any runtime overrides stored in DB (e.g. max_concurrent_servers)
     await load_system_settings()
 
+    # Apply the DB-stored LLM provider/model override, if any (Phase 28.6)
+    from app.modules.notifications.service import load_llm_settings
+    await load_llm_settings()
+
     # Start the scheduler (health, telemetry, file_watcher jobs)
     start_scheduler()
 

@@ -418,6 +418,132 @@ async def _execute_swap_remediation_script(
     )
 
 
+async def _execute_create_server_rule_with_script(
+    server_id: str,
+    # Rule fields
+    rule_name: str,
+    pattern: str,
+    severity: str,
+    action_level: int,
+    rule_description: str,
+    os_type: str = "linux",
+    tags: Optional[list] = None,
+    # Script fields
+    script_name: str = "",
+    script_description: str = "",
+    language: str = "bash",
+    content: str = "",
+    target_os: str = "linux",
+    category: str = "recovery",
+    # Shared metadata
+    reason: str = "",
+    ai_analysis_id: Optional[str] = None,
+) -> dict:
+    """
+    Atomically insert a server-scoped script AND a server-scoped rule that
+    points to it via `remediation_script_id`. This is the fix for the
+    orphan-script hole: a brand-new helper is useless unless a rule fires it,
+    so the LLM must propose both together.
+
+    Inlines the two insert bodies (rather than calling the existing executors)
+    so we get one timestamp, one auto-flip per mode, and a single emit per
+    inserted row. Script is inserted first so its `_id` is available for the
+    rule's `remediation_script_id`. If the rule insert fails, the script is
+    deleted (best-effort rollback — PFE Mongo isn't a replica set, so no real
+    transactions).
+    """
+    from bson import ObjectId
+    db = get_database()
+    if not server_id or not rule_name or not pattern or not script_name or not content:
+        return {
+            "executed": False,
+            "error": "server_id, rule_name, pattern, script_name and content required",
+        }
+    try:
+        srv_oid = ObjectId(server_id)
+    except Exception:
+        return {"executed": False, "error": "Invalid server_id"}
+    if not await db["servers"].find_one({"_id": srv_oid}, {"_id": 1}):
+        return {"executed": False, "error": f"Server {server_id} not found"}
+
+    now = utc_now()
+    ai_origin = {"reason": reason, "ai_analysis_id": ai_analysis_id} if ai_analysis_id else None
+
+    # 1. Insert the server-scoped script first.
+    script_doc = {
+        "name": script_name,
+        "description": script_description or "",
+        "language": language or "bash",
+        "content": content,
+        "target_os": target_os or "linux",
+        "category": category or "recovery",
+        "enabled": True,
+        "owner_type": "server",
+        "owner_id": server_id,
+        "ai_origin": ai_origin,
+        "created_at": now,
+        "updated_at": now,
+    }
+    script_result = await db["scripts"].insert_one(script_doc)
+    script_id = str(script_result.inserted_id)
+
+    # 2. Insert the rule pointing at the just-created script. On failure, roll
+    #    back the script so we don't leave an orphan behind.
+    rule_doc = {
+        "name": rule_name,
+        "pattern": pattern,
+        "severity": severity,
+        "action_level": int(action_level) if action_level is not None else 3,
+        "description": rule_description or "",
+        "enabled": True,
+        "os_type": os_type or "common",
+        "tags": tags or [],
+        "remediation_script_id": script_id,
+        "remediation_script_id_windows": None,
+        "owner_type": "server",
+        "owner_id": server_id,
+        "ai_origin": ai_origin,
+        "created_at": now,
+        "updated_at": None,
+    }
+    try:
+        rule_result = await db["rules"].insert_one(rule_doc)
+        rule_id = str(rule_result.inserted_id)
+    except Exception as exc:
+        try:
+            await db["scripts"].delete_one({"_id": script_result.inserted_id})
+        except Exception:
+            pass
+        return {"executed": False, "error": f"Rule insert failed, script rolled back: {exc}"}
+
+    # 3. Bust the global rule cache so the new rule is picked up next tick.
+    try:
+        from app.modules.analysis.service import _rule_cache
+        _rule_cache["loaded_at"] = 0
+    except Exception:
+        pass
+
+    # 4. Auto-flip BOTH modes — script first, then rule.
+    auto_flipped_script = await _auto_flip_to_both(server_id, "script_library_mode")
+    auto_flipped_rule = await _auto_flip_to_both(server_id, "rule_library_mode")
+
+    # 5. Emit for both surfaces.
+    event_bus.emit("scripts", "script.created", {"script_id": script_id})
+    event_bus.emit(f"servers.{server_id}.scripts", "script.created", {"script_id": script_id})
+    event_bus.emit("rules", "rule.created", {"rule_id": rule_id})
+    event_bus.emit(f"servers.{server_id}.rules", "rule.created", {"rule_id": rule_id})
+
+    return {
+        "executed": True,
+        "rule_id": rule_id,
+        "script_id": script_id,
+        "server_id": server_id,
+        "auto_flipped_rule_mode": auto_flipped_rule,
+        "auto_flipped_script_mode": auto_flipped_script,
+        "action": "create_server_rule_with_script",
+    }
+
+
 # ── Bookkeeping helpers ──────────────────────────────────────────────────────
 
 async def clear_pending_actions_for_source(source_type: str, source_id: str) -> int:

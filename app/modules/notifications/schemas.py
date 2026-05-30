@@ -1,11 +1,17 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime, timezone
 from enum import Enum
 
 
 class NotificationChannel(str, Enum):
     EMAIL = "email"
+
+
+class LlmConfigUpdate(BaseModel):
+    """Phase 28.6 — runtime LLM provider/model override (stored in `settings`)."""
+    provider: Literal["openrouter", "anthropic", "openai"]
+    model: str
 
 
 class NotificationConfigCreate(BaseModel):

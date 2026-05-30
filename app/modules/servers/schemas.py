@@ -160,13 +160,14 @@ class DetectionConfig(BaseModel):
         ),
     )
     script_review_enabled: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Run an AI review after every L1/L2 remediation script execution on "
             "this server. The review reads pre/post snapshots + stdout/stderr and "
             "decides if the fix actually addressed the root cause (resolved / "
             "partial / no_effect / made_worse). Adds 10–20s and one LLM call per "
-            "automated fix. Disable on cost-sensitive or extremely chatty servers."
+            "automated fix. Off by default — enable per-server when you want the "
+            "verdict signal; operators can still trigger a review on-demand per run."
         ),
     )
 

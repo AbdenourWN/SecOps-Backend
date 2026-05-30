@@ -1,6 +1,6 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from app.modules.notifications.service import NotificationService
-from app.modules.notifications.schemas import NotificationConfigCreate
+from app.modules.notifications.schemas import NotificationConfigCreate, LlmConfigUpdate
 
 router = APIRouter()
 
@@ -37,3 +37,23 @@ async def send_test_alert():
     """
     service = NotificationService()
     return await service.test_alert()
+
+
+@router.get("/llm")
+async def get_llm_config():
+    """Returns the active LLM provider/model + the .env defaults."""
+    service = NotificationService()
+    return await service.get_llm_config()
+
+
+@router.put("/llm")
+async def update_llm_config(config: LlmConfigUpdate):
+    """
+    Override the LLM provider/model at runtime. Persisted in `settings` and
+    applied live (clears the get_chat_model cache) — no restart needed.
+    """
+    service = NotificationService()
+    try:
+        return await service.save_llm_config(config.provider, config.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

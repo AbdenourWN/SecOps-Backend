@@ -12,9 +12,35 @@ Model name examples:
   ollama:      "llama3:latest", "mistral"
 """
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Tuple
 from langchain_core.language_models import BaseChatModel
 from app.core.config import settings
+
+
+# The true .env/config defaults, captured once at import time *before* any DB
+# override mutates `settings` at runtime. Lets the settings UI show "what the
+# env file says" alongside the currently-active value even after an override.
+_ENV_DEFAULT_PROVIDER = settings.LLM_PROVIDER
+_ENV_DEFAULT_MODEL = settings.LLM_MODEL
+
+
+def get_env_default_llm() -> Tuple[str, str]:
+    """Return the (provider, model) from the .env/config, ignoring DB overrides."""
+    return _ENV_DEFAULT_PROVIDER, _ENV_DEFAULT_MODEL
+
+
+def apply_llm_override(provider: str, model: str) -> None:
+    """
+    Apply a runtime LLM provider/model override (from the DB-backed settings UI).
+
+    Mutates the live `settings` object so every existing call site that reads
+    `settings.LLM_PROVIDER` / `settings.LLM_MODEL` (including the 6 AI graphs
+    that log provenance) transparently picks up the new value, then clears the
+    `get_chat_model` cache so the next call builds a client for the new model.
+    """
+    settings.LLM_PROVIDER = provider  # type: ignore[assignment]
+    settings.LLM_MODEL = model
+    get_chat_model.cache_clear()
 
 
 # Cache size is small but > 1 because callers may request different

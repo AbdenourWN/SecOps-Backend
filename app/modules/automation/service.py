@@ -361,9 +361,9 @@ class AutomationService:
         print(f"🤖 AUTO-FIX: Executing '{script_doc['name']}' on {server['hostname']}...")
 
         # Phase 28.4 — Capture pre-snapshot BEFORE the script runs, gated by the
-        # per-server `script_review_enabled` toggle (default True). Done in a
+        # per-server `script_review_enabled` toggle (default False). Done in a
         # try/except so a snapshot failure never aborts the actual remediation.
-        review_enabled = ((server.get("detection_config") or {}).get("script_review_enabled", True))
+        review_enabled = ((server.get("detection_config") or {}).get("script_review_enabled", False))
         pre_snapshot = None
         if review_enabled:
             try:

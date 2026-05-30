@@ -23,6 +23,8 @@ ALLOWED_TOPICS: set[str] = {
     "anomalies",
     # Phase 28.1 — AI actions global inbox (pending actions + commands)
     "ai_actions",
+    # Phase 28.7 — app-wide AI overview stream (dashboard)
+    "app.ai",
     # Note: "servers.metrics" and "servers.logs" removed — replaced by
     # per-server topics validated by _SERVER_TOPIC_RE below.
 }
