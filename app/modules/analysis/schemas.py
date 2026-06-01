@@ -1,21 +1,13 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
 from datetime import datetime
-from enum import Enum
 from app.core.datetime_utils import utc_now
 
-# Re-export incident schemas from their new home for backward compatibility
-from app.modules.incidents.schemas import (
-    SeverityLevel,
-    IncidentStatus,
-    IncidentInDB,
-    ActionLevel,
-)
-
-class RuleOSType(str, Enum):
-    LINUX = "linux"
-    WINDOWS = "windows"
-    COMMON = "common"  # For things like SQL Injection that can happen anywhere
+# Re-export shared enums from their canonical home for backward compatibility.
+# SeverityLevel / IncidentStatus / ActionLevel / RuleOSType all live in
+# app.core.constants now; IncidentInDB still comes from incidents.schemas.
+from app.core.constants import SeverityLevel, IncidentStatus, ActionLevel, RuleOSType
+from app.modules.incidents.schemas import IncidentInDB
 
 
 # --- 1. The Rule (Stored in DB) ---

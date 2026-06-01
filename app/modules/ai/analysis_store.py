@@ -5,6 +5,7 @@ Every AI-generated analysis (incident_triage, anomaly_triage, server_overview,
 script_execution_review, command_impact) is stored here. Source documents
 keep a denormalized pointer (ai_analysis_latest_id) + count for fast display.
 """
+from app.core.constants import Collections, SourceType
 from datetime import datetime, timezone
 from typing import List, Optional
 import uuid
@@ -53,7 +54,7 @@ async def save_analysis(
         "llm_model": llm_model,
         "created_at": now,
     }
-    result = await db["ai_analysis"].insert_one(doc)
+    result = await db[Collections.AI_ANALYSIS].insert_one(doc)
     analysis_id = str(result.inserted_id)
 
     # Denormalize pointer + count onto the source document
@@ -76,7 +77,7 @@ async def save_analysis(
 async def get_analysis_by_id(analysis_id: str) -> Optional[dict]:
     db = get_database()
     try:
-        doc = await db["ai_analysis"].find_one({"_id": ObjectId(analysis_id)})
+        doc = await db[Collections.AI_ANALYSIS].find_one({"_id": ObjectId(analysis_id)})
     except Exception:
         return None
     if not doc:
@@ -95,7 +96,7 @@ async def list_analyses_for_source(
     query: dict = {"source_type": source_type, "source_id": source_id}
     if analysis_type:
         query["analysis_type"] = analysis_type
-    cursor = db["ai_analysis"].find(query).sort("created_at", -1).limit(limit)
+    cursor = db[Collections.AI_ANALYSIS].find(query).sort("created_at", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
     for d in docs:
         d["_id"] = str(d["_id"])
@@ -111,7 +112,7 @@ async def list_server_analyses(
     query: dict = {"server_id": server_id}
     if analysis_type:
         query["analysis_type"] = analysis_type
-    cursor = db["ai_analysis"].find(query).sort("created_at", -1).limit(limit)
+    cursor = db[Collections.AI_ANALYSIS].find(query).sort("created_at", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
     for d in docs:
         d["_id"] = str(d["_id"])
@@ -120,9 +121,9 @@ async def list_server_analyses(
 
 def _source_collection(source_type: str) -> Optional[str]:
     return {
-        "incident": "incidents",
-        "anomaly": "log_observations",
-        "server": "servers",
-        "automation_log": "automation_logs",
-        "command": "ai_command",
+        SourceType.INCIDENT: Collections.INCIDENTS,
+        SourceType.ANOMALY: Collections.LOG_OBSERVATIONS,
+        SourceType.SERVER: Collections.SERVERS,
+        SourceType.AUTOMATION_LOG: Collections.AUTOMATION_LOGS,
+        SourceType.COMMAND: Collections.AI_COMMAND,
     }.get(source_type)

@@ -1,8 +1,13 @@
 from pydantic import BaseModel, Field, BeforeValidator, ConfigDict
 from typing import List, Optional, Annotated, Literal
-from enum import Enum
 from datetime import datetime
 from app.core.datetime_utils import utc_now
+# OSType / AIAutonomyLevel / ServerStatus / CredentialType now live in
+# app.core.constants; re-exported here so existing imports keep working.
+# DetectionDefaults centralises the per-server tunable fallback values.
+from app.core.constants import (
+    OSType, AIAutonomyLevel, ServerStatus, CredentialType, DetectionDefaults,
+)
 
 # --- Helpers ---
 # This tells Pydantic: "If you see an ObjectId, turn it into a string"
@@ -13,25 +18,6 @@ PyObjectId = Annotated[str, BeforeValidator(str)]
 class TimestampModel(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
-
-class OSType(str, Enum):
-    LINUX = "linux"
-    WINDOWS = "windows"
-
-class AIAutonomyLevel(str, Enum):
-    READ_ONLY = "read_only"  # agent investigates only; output is suggestions
-    SUGGEST   = "suggest"    # agent proposes mutations; operator approves each one
-
-class ServerStatus(str, Enum):
-    ONLINE = "online"
-    REACHABLE = "reachable"   # TCP ok, credentials broken
-    OFFLINE = "offline"
-    UNKNOWN = "unknown"
-    WARNING = "warning"
-
-class CredentialType(str, Enum):
-    PASSWORD = "password"
-    SSH_KEY = "ssh_key"
 
 # --- Credential Schemas ---
 class CredentialInput(BaseModel):
@@ -86,7 +72,7 @@ class DetectionConfig(BaseModel):
     defined as constants in analysis/service.py.
     """
     verification_window_minutes: int = Field(
-        default=10, ge=1, le=120,
+        default=DetectionDefaults.VERIFICATION_WINDOW_MINUTES, ge=1, le=120,
         description=(
             "Minutes to watch for rule recurrence after a remediation script runs. "
             "If the same rule fires again within this window the fix is considered failed "
@@ -95,7 +81,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     max_remediation_attempts: int = Field(
-        default=3, ge=1, le=10,
+        default=DetectionDefaults.MAX_REMEDIATION_ATTEMPTS, ge=1, le=10,
         description=(
             "Maximum number of times the remediation script is retried before giving up "
             "and sending an escalation alert. Higher = more persistent automation. "
@@ -103,7 +89,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     incident_lookback_minutes: int = Field(
-        default=30, ge=5, le=1440,
+        default=DetectionDefaults.INCIDENT_LOOKBACK_MINUTES, ge=5, le=1440,
         description=(
             "How far back (minutes) to look for an existing OPEN/VERIFYING incident "
             "when deduplicating. Incidents older than this are treated as stale and a "
@@ -111,7 +97,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     recurrence_streak_threshold: int = Field(
-        default=3, ge=2, le=20,
+        default=DetectionDefaults.RECURRENCE_STREAK_THRESHOLD, ge=2, le=20,
         description=(
             "How many consecutive times the same script must appear to succeed then have "
             "the problem come back before automation is paused and an alert is sent. "
@@ -119,7 +105,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     recurrence_lookback_hours: float = Field(
-        default=2.0, ge=0.25, le=24.0,
+        default=DetectionDefaults.RECURRENCE_LOOKBACK_HOURS, ge=0.25, le=24.0,
         description=(
             "How recent (hours) a previous auto-resolved incident must be to count as "
             "part of the recurrence chain. If the last resolution was older, the streak "
@@ -127,7 +113,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     volume_spike_multiplier: float = Field(
-        default=10.0, ge=2.0, le=100.0,
+        default=DetectionDefaults.VOLUME_SPIKE_MULTIPLIER, ge=2.0, le=100.0,
         description=(
             "Trigger a volume-spike anomaly when the current log rate exceeds this "
             "multiple of the server's rolling baseline. Lower = more sensitive. "
@@ -135,7 +121,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     anomaly_dedup_window_hours: float = Field(
-        default=2.0, ge=0.25, le=24.0,
+        default=DetectionDefaults.ANOMALY_DEDUP_WINDOW_HOURS, ge=0.25, le=24.0,
         description=(
             "How long (hours) identical anomaly observations are aggregated into "
             "one row instead of creating new rows. Repeated detections within this "
@@ -144,7 +130,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     anomaly_suppression_ttl_hours: float = Field(
-        default=24.0, ge=1.0, le=168.0,
+        default=DetectionDefaults.ANOMALY_SUPPRESSION_TTL_HOURS, ge=1.0, le=168.0,
         description=(
             "How long (hours) a dismissed anomaly fingerprint suppresses new "
             "detections of the same pattern. 24h = dismiss once, silent for a day. "
@@ -152,7 +138,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     anomaly_auto_promote: bool = Field(
-        default=False,
+        default=DetectionDefaults.ANOMALY_AUTO_PROMOTE,
         description=(
             "Automatically promote observations to incidents when severity=high "
             "and occurrence_count≥3 and the fingerprint is not suppressed. "
@@ -160,7 +146,7 @@ class DetectionConfig(BaseModel):
         ),
     )
     script_review_enabled: bool = Field(
-        default=False,
+        default=DetectionDefaults.SCRIPT_REVIEW_ENABLED,
         description=(
             "Run an AI review after every L1/L2 remediation script execution on "
             "this server. The review reads pre/post snapshots + stdout/stderr and "

@@ -10,6 +10,7 @@ This eliminates 2-3 agent tool-call round-trips for the most common
 data the agent ALWAYS needs, while still leaving targeted drill-down
 tools available for deeper investigation.
 """
+from app.core.constants import Collections
 import asyncio
 import json
 from datetime import datetime, timezone, timedelta
@@ -39,7 +40,7 @@ def _fmt_dt(v) -> str:
 async def _fetch_server_profile(server_id: str) -> dict:
     db = get_database()
     try:
-        srv = await db["servers"].find_one(
+        srv = await db[Collections.SERVERS].find_one(
             {"_id": ObjectId(server_id)},
             {
                 "hostname": 1, "ip_address": 1, "os_type": 1, "port": 1,
@@ -121,14 +122,14 @@ async def _fetch_recent_incidents(server_id: str, hours: int = 24, exclude_id: O
                 query["_id"] = {"$ne": ObjectId(exclude_id)}
             except Exception:
                 pass
-        cursor = db["incidents"].find(query).sort("detected_at", -1).limit(8)
+        cursor = db[Collections.INCIDENTS].find(query).sort("detected_at", -1).limit(8)
         incidents = await cursor.to_list(length=8)
         result = []
         for inc in incidents:
             rule_name = ""
             if inc.get("rule_id"):
                 try:
-                    rule = await db["rules"].find_one({"_id": ObjectId(str(inc["rule_id"]))}, {"name": 1})
+                    rule = await db[Collections.RULES].find_one({"_id": ObjectId(str(inc["rule_id"]))}, {"name": 1})
                     if rule:
                         rule_name = rule.get("name", "")
                 except Exception:
@@ -220,7 +221,7 @@ async def _fetch_remediation_history(server_id: str, hours: int = 24, limit: int
     db = get_database()
     try:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
-        cursor = db["automation_logs"].find(
+        cursor = db[Collections.AUTOMATION_LOGS].find(
             {"server_id": server_id, "executed_at": {"$gte": since}}
         ).sort("executed_at", -1).limit(limit)
         runs = await cursor.to_list(length=limit)
@@ -235,7 +236,7 @@ async def _fetch_remediation_history(server_id: str, hours: int = 24, limit: int
                 pass
         scripts_map: dict = {}
         if script_oids:
-            sc_cursor = db["scripts"].find({"_id": {"$in": script_oids}}, {"name": 1})
+            sc_cursor = db[Collections.SCRIPTS].find({"_id": {"$in": script_oids}}, {"name": 1})
             sc_docs = await sc_cursor.to_list(length=len(script_oids))
             scripts_map = {str(s["_id"]): s.get("name", "") for s in sc_docs}
         out = []
@@ -256,7 +257,7 @@ async def _fetch_recent_anomalies(server_id: str, hours: int = 24) -> list:
     db = get_database()
     try:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
-        cursor = db["log_observations"].find(
+        cursor = db[Collections.LOG_OBSERVATIONS].find(
             {"server_id": server_id, "last_seen_at": {"$gte": since}}
         ).sort("last_seen_at", -1).limit(8)
         obs = await cursor.to_list(length=8)

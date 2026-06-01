@@ -18,6 +18,8 @@ AI analysis history:
   GET  /api/ai-actions/analysis           list analyses (filter: source_type, source_id, server_id, analysis_type)
   GET  /api/ai-actions/analysis/{id}      single analysis detail
 """
+from app.core.constants import Collections, ActionType, ActionStatus
+from app.core.db_utils import build_date_range_query, enrich_with_server_hostname
 import asyncio
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -98,49 +100,23 @@ async def list_ai_actions(
         query["source_type"] = source_type
     if source_id:
         query["source_id"] = source_id
-    date_range: dict = {}
-    if from_date:
-        try:
-            date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
-        except Exception:
-            pass
-    if to_date:
-        try:
-            date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
-        except Exception:
-            pass
+    date_range = build_date_range_query(from_date, to_date)
     if date_range:
         query["created_at"] = date_range
 
-    total = await db["ai_actions"].count_documents(query)
+    total = await db[Collections.AI_ACTIONS].count_documents(query)
     skip = (page - 1) * page_size
     # For decided rows we want "most recently decided" at the top; for pending,
     # the only meaningful timestamp is created_at. decided_at is null for pending,
     # so this composite sort lands on the right answer in both filters.
-    docs = await db["ai_actions"].find(query).sort([
+    docs = await db[Collections.AI_ACTIONS].find(query).sort([
         ("decided_at", -1),
         ("created_at", -1),
     ]).skip(skip).limit(page_size).to_list(length=page_size)
 
     # Batch-enrich with server hostname so the UI doesn't need a second round-trip per row
-    server_ids = list({d.get("server_id") for d in docs if d.get("server_id")})
-    hostname_map: dict = {}
-    if server_ids:
-        try:
-            srv_cursor = db["servers"].find(
-                {"_id": {"$in": [ObjectId(sid) for sid in server_ids if ObjectId.is_valid(sid)]}},
-                {"hostname": 1},
-            )
-            srv_docs = await srv_cursor.to_list(length=len(server_ids))
-            hostname_map = {str(s["_id"]): s.get("hostname", "") for s in srv_docs}
-        except Exception:
-            hostname_map = {}
-
-    out = []
-    for d in docs:
-        d = _fmt(d)
-        d["server_hostname"] = hostname_map.get(d.get("server_id", ""), "")
-        out.append(d)
+    out = [_fmt(d) for d in docs]
+    await enrich_with_server_hostname(out, db)
 
     return {"total": total, "page": page, "page_size": page_size, "results": out}
 
@@ -157,7 +133,7 @@ async def pending_action_count(
         query["source_type"] = source_type
     if source_id:
         query["source_id"] = source_id
-    count = await db["ai_actions"].count_documents(query)
+    count = await db[Collections.AI_ACTIONS].count_documents(query)
     return {"pending": count}
 
 
@@ -289,17 +265,7 @@ async def list_ai_analyses(
         query["server_id"] = server_id
     if analysis_type and analysis_type != "all":
         query["analysis_type"] = analysis_type
-    date_range: dict = {}
-    if from_date:
-        try:
-            date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
-        except Exception:
-            pass
-    if to_date:
-        try:
-            date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
-        except Exception:
-            pass
+    date_range = build_date_range_query(from_date, to_date)
     if date_range:
         query["created_at"] = date_range
 
@@ -309,36 +275,20 @@ async def list_ai_analyses(
             return await list_analyses_for_source(source_type, source_id, analysis_type, limit)
         if server_id:
             return await list_server_analyses(server_id, analysis_type, limit)
-        cursor = db["ai_analysis"].find(query).sort("created_at", -1).limit(limit)
+        cursor = db[Collections.AI_ANALYSIS].find(query).sort("created_at", -1).limit(limit)
         docs = await cursor.to_list(length=limit)
         for d in docs:
             d["_id"] = str(d["_id"])
         return docs
 
     size = page_size or 25
-    total = await db["ai_analysis"].count_documents(query)
+    total = await db[Collections.AI_ANALYSIS].count_documents(query)
     skip = (page - 1) * size
-    docs = await db["ai_analysis"].find(query).sort("created_at", -1).skip(skip).limit(size).to_list(length=size)
+    docs = await db[Collections.AI_ANALYSIS].find(query).sort("created_at", -1).skip(skip).limit(size).to_list(length=size)
 
     # Batch-enrich with server hostname so the list page doesn't need N round-trips
-    server_ids = list({d.get("server_id") for d in docs if d.get("server_id")})
-    hostname_map: dict = {}
-    if server_ids:
-        try:
-            srv_cursor = db["servers"].find(
-                {"_id": {"$in": [ObjectId(sid) for sid in server_ids if ObjectId.is_valid(sid)]}},
-                {"hostname": 1},
-            )
-            srv_docs = await srv_cursor.to_list(length=len(server_ids))
-            hostname_map = {str(s["_id"]): s.get("hostname", "") for s in srv_docs}
-        except Exception:
-            hostname_map = {}
-
-    out = []
-    for d in docs:
-        d = _fmt(d)
-        d["server_hostname"] = hostname_map.get(d.get("server_id", ""), "")
-        out.append(d)
+    out = [_fmt(d) for d in docs]
+    await enrich_with_server_hostname(out, db)
     return {"total": total, "page": page, "page_size": size, "results": out}
 
 
@@ -362,7 +312,7 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid action_id")
 
-    action = await db["ai_actions"].find_one({"_id": oid, "status": "pending"})
+    action = await db[Collections.AI_ACTIONS].find_one({"_id": oid, "status": ActionStatus.PENDING})
     if not action:
         raise HTTPException(status_code=404, detail="Pending action not found")
 
@@ -371,25 +321,25 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
 
     outcome = {"executed": False, "error": "Unknown action_type"}
     try:
-        if action_type == "dismiss_anomaly":
+        if action_type == ActionType.DISMISS_ANOMALY:
             outcome = await _execute_dismiss_anomaly(payload["observation_id"], payload.get("reason", ""))
-        elif action_type == "promote_anomaly":
+        elif action_type == ActionType.PROMOTE_ANOMALY:
             outcome = await _execute_promote_anomaly(payload["observation_id"])
-        elif action_type == "mark_incident_false_positive":
+        elif action_type == ActionType.MARK_INCIDENT_FALSE_POSITIVE:
             outcome = await _execute_mark_incident_false_positive(payload["incident_id"], payload.get("reason", ""))
-        elif action_type == "disable_script_for_server":
+        elif action_type == ActionType.DISABLE_SCRIPT_FOR_SERVER:
             outcome = await _execute_disable_script_for_server(
                 payload.get("server_id", ""),
                 payload.get("script_id", ""),
                 payload.get("reason", ""),
             )
-        elif action_type == "disable_rule_for_server":
+        elif action_type == ActionType.DISABLE_RULE_FOR_SERVER:
             outcome = await _execute_disable_rule_for_server(
                 payload.get("server_id", ""),
                 payload.get("rule_id", ""),
                 payload.get("reason", ""),
             )
-        elif action_type == "suggest_manual_remediation":
+        elif action_type == ActionType.SUGGEST_MANUAL_REMEDIATION:
             outcome = await _execute_suggest_manual_remediation(
                 payload.get("incident_id", ""),
                 payload.get("manual_commands", []) or [],
@@ -397,7 +347,7 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
                 payload.get("automation_log_id", "") or "",
             )
         # Phase 28.5 — per-server library actions
-        elif action_type == "create_server_rule":
+        elif action_type == ActionType.CREATE_SERVER_RULE:
             outcome = await _execute_create_server_rule(
                 server_id=payload.get("server_id", ""),
                 name=payload.get("name", ""),
@@ -411,7 +361,7 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
                 reason=payload.get("reason", ""),
                 ai_analysis_id=payload.get("ai_analysis_id"),
             )
-        elif action_type == "create_server_script":
+        elif action_type == ActionType.CREATE_SERVER_SCRIPT:
             outcome = await _execute_create_server_script(
                 server_id=payload.get("server_id", ""),
                 name=payload.get("name", ""),
@@ -423,7 +373,7 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
                 reason=payload.get("reason", ""),
                 ai_analysis_id=payload.get("ai_analysis_id"),
             )
-        elif action_type == "swap_remediation_script":
+        elif action_type == ActionType.SWAP_REMEDIATION_SCRIPT:
             outcome = await _execute_swap_remediation_script(
                 server_id=payload.get("server_id", ""),
                 rule_id=payload.get("rule_id", ""),
@@ -433,7 +383,7 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
                 reason=payload.get("reason", ""),
                 ai_analysis_id=payload.get("ai_analysis_id"),
             )
-        elif action_type == "create_server_rule_with_script":
+        elif action_type == ActionType.CREATE_SERVER_RULE_WITH_SCRIPT:
             outcome = await _execute_create_server_rule_with_script(
                 server_id=payload.get("server_id", ""),
                 rule_name=payload.get("rule_name", ""),
@@ -456,9 +406,9 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
         outcome = {"executed": False, "error": str(exc)}
 
     now = utc_now()
-    await db["ai_actions"].update_one(
+    await db[Collections.AI_ACTIONS].update_one(
         {"_id": oid},
-        {"$set": {"status": "approved", "decided_at": now, "decided_by": decided_by, "outcome": outcome}},
+        {"$set": {"status": ActionStatus.APPROVED, "decided_at": now, "decided_by": decided_by, "outcome": outcome}},
     )
     return {"status": "approved", "action_id": action_id, "outcome": outcome}
 
@@ -472,9 +422,9 @@ async def reject_action(action_id: str, decided_by: str = "operator"):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid action_id")
 
-    result = await db["ai_actions"].update_one(
-        {"_id": oid, "status": "pending"},
-        {"$set": {"status": "rejected", "decided_at": utc_now(), "decided_by": decided_by}},
+    result = await db[Collections.AI_ACTIONS].update_one(
+        {"_id": oid, "status": ActionStatus.PENDING},
+        {"$set": {"status": ActionStatus.REJECTED, "decided_at": utc_now(), "decided_by": decided_by}},
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Pending action not found or already decided")

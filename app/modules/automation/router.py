@@ -1,7 +1,9 @@
+from app.core.constants import Collections, WSTopic
 import asyncio
 import re as re_mod
 
 from fastapi import APIRouter, HTTPException, Query
+from app.core.errors import http_error
 from typing import Optional
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB
 from app.modules.automation.service import AutomationService
@@ -77,7 +79,7 @@ async def manually_analyze_remediation(automation_log_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid automation_log_id")
 
-    log = await db["automation_logs"].find_one({"_id": oid})
+    log = await db[Collections.AUTOMATION_LOGS].find_one({"_id": oid})
     if not log:
         raise HTTPException(status_code=404, detail="Automation log not found")
 
@@ -101,10 +103,10 @@ async def manually_analyze_remediation(automation_log_id: str):
     try:
         pre_snapshot = await capture_snapshot(server_id, anchor=executed_at)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Pre-snapshot capture failed: {exc}")
+        raise http_error(500, "Could not capture the pre-execution snapshot.", exc, "remediation pre-snapshot")
 
     # Mark in-progress so the UI shows the spinner immediately.
-    await db["automation_logs"].update_one(
+    await db[Collections.AUTOMATION_LOGS].update_one(
         {"_id": oid},
         {"$set": {"ai_review_verdict": "in_progress", "ai_review_summary": "Manual analysis running…"}},
     )
@@ -122,7 +124,7 @@ async def manually_analyze_remediation(automation_log_id: str):
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"[:200]
             try:
-                await db["automation_logs"].update_one(
+                await db[Collections.AUTOMATION_LOGS].update_one(
                     {"_id": oid},
                     {"$set": {"ai_review_verdict": "review_failed", "ai_review_summary": msg}},
                 )
@@ -163,7 +165,7 @@ async def create_new_script(script: ScriptCreate):
         if not script.owner_id:
             raise HTTPException(status_code=422, detail="owner_id is required when owner_type=='server'")
         try:
-            srv = await db["servers"].find_one({"_id": ObjectId(script.owner_id)}, {"_id": 1})
+            srv = await db[Collections.SERVERS].find_one({"_id": ObjectId(script.owner_id)}, {"_id": 1})
         except Exception:
             raise HTTPException(status_code=422, detail="owner_id is not a valid server id")
         if not srv:
@@ -217,9 +219,9 @@ async def list_scripts(
         pattern = re_mod.compile(re_mod.escape(search), re_mod.IGNORECASE)
         query["$or"] = [{"name": pattern}, {"description": pattern}]
 
-    total = await db["scripts"].count_documents(query)
+    total = await db[Collections.SCRIPTS].count_documents(query)
     skip = (page - 1) * page_size
-    scripts = await db["scripts"].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(length=page_size)
+    scripts = await db[Collections.SCRIPTS].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(length=page_size)
     for s in scripts:
         s["_id"] = str(s["_id"])
     return {"total": total, "page": page, "page_size": page_size, "results": scripts}
@@ -228,7 +230,7 @@ async def list_scripts(
 async def get_script(script_id: str):
     db = get_database()
     try:
-        script = await db["scripts"].find_one({"_id": ObjectId(script_id)})
+        script = await db[Collections.SCRIPTS].find_one({"_id": ObjectId(script_id)})
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
     if not script:
@@ -244,7 +246,7 @@ async def update_script(script_id: str, updates: dict):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    existing = await db["scripts"].find_one({"_id": oid})
+    existing = await db[Collections.SCRIPTS].find_one({"_id": oid})
     if not existing:
         raise HTTPException(status_code=404, detail="Script not found")
 
@@ -254,8 +256,8 @@ async def update_script(script_id: str, updates: dict):
     update_data = {k: v for k, v in updates.items() if k in allowed}
     update_data["updated_at"] = datetime.now(timezone.utc)
 
-    await db["scripts"].update_one({"_id": oid}, {"$set": update_data})
-    event_bus.emit("scripts", "script.updated", {"script_id": str(oid)})
+    await db[Collections.SCRIPTS].update_one({"_id": oid}, {"$set": update_data})
+    event_bus.emit(WSTopic.SCRIPTS, "script.updated", {"script_id": str(oid)})
     if existing.get("owner_type") == "server" and existing.get("owner_id"):
         event_bus.emit(
             f"servers.{existing['owner_id']}.scripts",
@@ -274,16 +276,16 @@ async def toggle_script_enabled(script_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    script = await db["scripts"].find_one({"_id": oid}, {"enabled": 1})
+    script = await db[Collections.SCRIPTS].find_one({"_id": oid}, {"enabled": 1})
     if not script:
         raise HTTPException(status_code=404, detail="Script not found")
 
     new_state = not script.get("enabled", True)
-    await db["scripts"].update_one(
+    await db[Collections.SCRIPTS].update_one(
         {"_id": oid},
         {"$set": {"enabled": new_state, "updated_at": datetime.now(timezone.utc)}},
     )
-    event_bus.emit("scripts", "script.updated", {"script_id": str(oid), "enabled": new_state})
+    event_bus.emit(WSTopic.SCRIPTS, "script.updated", {"script_id": str(oid), "enabled": new_state})
     return {"status": "success", "enabled": new_state}
 
 @router.delete("/scripts/{script_id}")
@@ -294,11 +296,11 @@ async def delete_script(script_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    existing = await db["scripts"].find_one({"_id": oid}, {"owner_type": 1, "owner_id": 1})
-    result = await db["scripts"].delete_one({"_id": oid})
+    existing = await db[Collections.SCRIPTS].find_one({"_id": oid}, {"owner_type": 1, "owner_id": 1})
+    result = await db[Collections.SCRIPTS].delete_one({"_id": oid})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Script not found")
-    event_bus.emit("scripts", "script.deleted", {"script_id": str(oid)})
+    event_bus.emit(WSTopic.SCRIPTS, "script.deleted", {"script_id": str(oid)})
     if existing and existing.get("owner_type") == "server" and existing.get("owner_id"):
         event_bus.emit(
             f"servers.{existing['owner_id']}.scripts",

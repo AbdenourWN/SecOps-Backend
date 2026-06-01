@@ -17,6 +17,10 @@ dismissed fingerprint within the TTL are silently dropped.
 
 from __future__ import annotations
 
+from app.core.constants import (
+    Collections, WSTopic,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -28,6 +32,7 @@ from pymongo import ReturnDocument
 from app.core.database import get_database
 from app.core.datetime_utils import utc_now
 from app.core.events import event_bus
+from app.modules.notifications.feed import notify
 from app.modules.anomalies.fingerprint import compute_fingerprint
 from app.modules.anomalies.schemas import (
     AnomalySeverity,
@@ -75,7 +80,7 @@ async def _get_reason_weights(db) -> Dict[str, float]:
     if now - _reason_weight_cache_ts < _REASON_CACHE_TTL:
         return _reason_weight_cache
 
-    stats = await db["reason_stats"].find({}).to_list(length=500)
+    stats = await db[Collections.REASON_STATS].find({}).to_list(length=500)
     weights: Dict[str, float] = {}
     for s in stats:
         p = s.get("promoted_count", 0)
@@ -114,7 +119,7 @@ class AnomaliesService:
 
     async def _is_suppressed(self, db, server_id: str, fingerprint: str) -> bool:
         """Return True if this fingerprint was recently dismissed."""
-        doc = await db["dismissed_fingerprints"].find_one(
+        doc = await db[Collections.DISMISSED_FINGERPRINTS].find_one(
             {"server_id": server_id, "fingerprint": fingerprint}
         )
         return doc is not None
@@ -147,7 +152,7 @@ class AnomaliesService:
         now = utc_now()
         window_start = now - timedelta(seconds=_dedup_window_s(server))
 
-        updated = await db["log_observations"].find_one_and_update(
+        updated = await db[Collections.LOG_OBSERVATIONS].find_one_and_update(
             {
                 "server_id": server_id,
                 "fingerprint": fp,
@@ -198,9 +203,12 @@ class AnomaliesService:
             "detected_at": now,
             "reviewed_at": None,
         }
-        result = await db["log_observations"].insert_one(doc)
+        result = await db[Collections.LOG_OBSERVATIONS].insert_one(doc)
         obs_id = str(result.inserted_id)
-        _emit_created(obs_id, server_id, severity.value, AnomalyType.LOG.value, reasons)
+        await _emit_created(
+            obs_id, server_id, severity.value, AnomalyType.LOG.value, reasons,
+            log_message=msg, fingerprint=fp,
+        )
         return obs_id
 
     async def record_volume_observation(
@@ -228,7 +236,7 @@ class AnomaliesService:
         now = utc_now()
         window_start = now - timedelta(seconds=_dedup_window_s(server))
 
-        updated = await db["log_observations"].find_one_and_update(
+        updated = await db[Collections.LOG_OBSERVATIONS].find_one_and_update(
             {
                 "server_id": server_id,
                 "fingerprint": fp,
@@ -268,9 +276,12 @@ class AnomaliesService:
             "detected_at": now,
             "reviewed_at": None,
         }
-        result = await db["log_observations"].insert_one(doc)
+        result = await db[Collections.LOG_OBSERVATIONS].insert_one(doc)
         obs_id = str(result.inserted_id)
-        _emit_created(obs_id, server_id, severity.value, AnomalyType.VOLUME.value, reasons)
+        await _emit_created(
+            obs_id, server_id, severity.value, AnomalyType.VOLUME.value, reasons,
+            log_message=msg, fingerprint=fp,
+        )
         return obs_id
 
     # ────────────────────────────────────────────────────────────────────
@@ -327,11 +338,11 @@ class AnomaliesService:
         db = get_database()
         q = self._build_filter(server_id, status, severity, type_, from_date, to_date)
 
-        total = await db["log_observations"].count_documents(q)
+        total = await db[Collections.LOG_OBSERVATIONS].count_documents(q)
         skip = (page - 1) * page_size
 
         cursor = (
-            db["log_observations"]
+            db[Collections.LOG_OBSERVATIONS]
             .find(q)
             .sort("last_seen_at", -1)
             .skip(skip)
@@ -349,7 +360,7 @@ class AnomaliesService:
 
         host_map: dict = {}
         if oids:
-            host_docs = await db["servers"].find(
+            host_docs = await db[Collections.SERVERS].find(
                 {"_id": {"$in": oids}}, {"hostname": 1}
             ).to_list(length=len(oids))
             host_map = {str(d["_id"]): d.get("hostname", "") for d in host_docs}
@@ -374,7 +385,7 @@ class AnomaliesService:
         except Exception:
             return None
 
-        obs = await db["log_observations"].find_one({"_id": oid})
+        obs = await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid})
         if not obs:
             return None
 
@@ -383,7 +394,7 @@ class AnomaliesService:
         server_id = obs.get("server_id")
         if server_id:
             try:
-                server = await db["servers"].find_one(
+                server = await db[Collections.SERVERS].find_one(
                     {"_id": ObjectId(server_id)},
                     {"hostname": 1},
                 )
@@ -428,7 +439,7 @@ class AnomaliesService:
                 }
             }
         ]
-        agg = await db["log_observations"].aggregate(pipeline).to_list(length=1)
+        agg = await db[Collections.LOG_OBSERVATIONS].aggregate(pipeline).to_list(length=1)
         if not agg:
             return {"total": 0, "pending": 0, "dismissed": 0, "promoted": 0}
         r = agg[0]
@@ -445,7 +456,7 @@ class AnomaliesService:
         except Exception:
             return False
 
-        result = await db["log_observations"].update_one(
+        result = await db[Collections.LOG_OBSERVATIONS].update_one(
             {"_id": oid, "status": LogObservationStatus.PENDING_REVIEW.value},
             {"$set": {
                 "status": LogObservationStatus.DISMISSED.value,
@@ -455,7 +466,7 @@ class AnomaliesService:
         if not result.modified_count:
             return False
 
-        obs = await db["log_observations"].find_one({"_id": oid}, {"server_id": 1, "fingerprint": 1, "reasons": 1})
+        obs = await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid}, {"server_id": 1, "fingerprint": 1, "reasons": 1})
         _sid = obs.get("server_id") if obs else None
         fp = obs.get("fingerprint") if obs else None
         obs_reasons = obs.get("reasons", []) if obs else []
@@ -463,7 +474,7 @@ class AnomaliesService:
         # B3: Record dismissal feedback for each reason
         global _reason_weight_cache_ts
         for reason in obs_reasons:
-            await db["reason_stats"].update_one(
+            await db[Collections.REASON_STATS].update_one(
                 {"reason": reason},
                 {"$inc": {"dismissed_count": 1}, "$set": {"last_updated": utc_now()}},
                 upsert=True,
@@ -476,13 +487,13 @@ class AnomaliesService:
             # Load detection_config to get the per-server suppression window.
             server_doc: dict = {}
             try:
-                server_doc = await db["servers"].find_one(
+                server_doc = await db[Collections.SERVERS].find_one(
                     {"_id": ObjectId(_sid)}, {"detection_config": 1}
                 ) or {}
             except Exception:
                 pass
             expires = now + timedelta(seconds=_suppression_ttl_s(server_doc))
-            await db["dismissed_fingerprints"].update_one(
+            await db[Collections.DISMISSED_FINGERPRINTS].update_one(
                 {"server_id": _sid, "fingerprint": fp},
                 {
                     "$set": {
@@ -494,7 +505,7 @@ class AnomaliesService:
                 upsert=True,
             )
 
-        event_bus.emit("anomalies", "anomaly.updated", {
+        event_bus.emit(WSTopic.ANOMALIES, "anomaly.updated", {
             "observation_id": observation_id,
             "server_id": _sid,
             "status": LogObservationStatus.DISMISSED.value,
@@ -521,7 +532,7 @@ class AnomaliesService:
         except Exception:
             return None
 
-        obs = await db["log_observations"].find_one({"_id": oid})
+        obs = await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid})
         if not obs or obs.get("status") != LogObservationStatus.PENDING_REVIEW.value:
             return None
 
@@ -538,7 +549,7 @@ class AnomaliesService:
         # B3: Record promotion feedback for each reason
         global _reason_weight_cache_ts
         for reason in obs.get("reasons", []):
-            await db["reason_stats"].update_one(
+            await db[Collections.REASON_STATS].update_one(
                 {"reason": reason},
                 {"$inc": {"promoted_count": 1}, "$set": {"last_updated": utc_now()}},
                 upsert=True,
@@ -561,16 +572,16 @@ class AnomaliesService:
                 "auto_promoted": auto,
             },
         )
-        inc_result = await db["incidents"].insert_one(incident.model_dump())
+        inc_result = await db[Collections.INCIDENTS].insert_one(incident.model_dump())
         incident_id = str(inc_result.inserted_id)
         from bson import ObjectId as _OID
-        await db["servers"].update_one(
+        await db[Collections.SERVERS].update_one(
             {"_id": _OID(obs["server_id"])},
             {"$inc": {"open_incidents_count": 1}},
         )
-        event_bus.emit("servers", "server.updated", {"server_id": obs["server_id"]})
+        event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": obs["server_id"]})
 
-        await db["log_observations"].update_one(
+        await db[Collections.LOG_OBSERVATIONS].update_one(
             {"_id": oid},
             {"$set": {
                 "status": LogObservationStatus.PROMOTED_TO_INCIDENT.value,
@@ -579,7 +590,7 @@ class AnomaliesService:
             }},
         )
 
-        event_bus.emit("anomalies", "anomaly.updated", {
+        event_bus.emit(WSTopic.ANOMALIES, "anomaly.updated", {
             "observation_id": observation_id,
             "server_id": obs["server_id"],
             "status": LogObservationStatus.PROMOTED_TO_INCIDENT.value,
@@ -591,7 +602,7 @@ class AnomaliesService:
             "status": LogObservationStatus.PROMOTED_TO_INCIDENT.value,
             "promoted_incident_id": incident_id,
         })
-        event_bus.emit("incidents", "incident.created", {
+        event_bus.emit(WSTopic.INCIDENTS, "incident.created", {
             "incident_id": incident_id,
             "server_id": obs["server_id"],
             "severity": incident_severity.value,
@@ -605,7 +616,7 @@ class AnomaliesService:
             "rule_name": "Anomaly (promoted)",
             "action_level": 3,
         })
-        event_bus.emit("dashboard.summary", "incident.created", {"incident_id": incident_id})
+        event_bus.emit(WSTopic.DASHBOARD_SUMMARY, "incident.created", {"incident_id": incident_id})
 
         return incident_id
 
@@ -631,7 +642,7 @@ class AnomaliesService:
             # Load this server's detection_config to check per-server flag.
             server_doc: dict = {}
             try:
-                server_doc = await db["servers"].find_one(
+                server_doc = await db[Collections.SERVERS].find_one(
                     {"_id": ObjectId(server_id)}, {"detection_config": 1}
                 ) or {}
             except Exception:
@@ -644,7 +655,7 @@ class AnomaliesService:
         except Exception:
             return False
 
-        obs = await db["log_observations"].find_one(
+        obs = await db[Collections.LOG_OBSERVATIONS].find_one(
             {"_id": oid, "status": LogObservationStatus.PENDING_REVIEW.value},
             {"severity": 1, "occurrence_count": 1, "fingerprint": 1},
         )
@@ -666,7 +677,16 @@ class AnomaliesService:
 # Private emit helpers
 # ────────────────────────────────────────────────────────────────────────
 
-def _emit_created(obs_id: str, server_id: str, severity: str, type_: str, reasons: list):
+async def _emit_created(
+    obs_id: str,
+    server_id: str,
+    severity: str,
+    type_: str,
+    reasons: list,
+    *,
+    log_message: str = "",
+    fingerprint: str = "",
+):
     payload = {
         "observation_id": obs_id,
         "server_id": server_id,
@@ -674,8 +694,27 @@ def _emit_created(obs_id: str, server_id: str, severity: str, type_: str, reason
         "type": type_,
         "reasons": reasons,
     }
-    event_bus.emit("anomalies", "anomaly.created", payload)
+    event_bus.emit(WSTopic.ANOMALIES, "anomaly.created", payload)
     event_bus.emit(f"servers.{server_id}.anomalies", "anomaly.created", payload)
+    # In-app notification (chosen group). Dedup by fingerprint so a pattern that
+    # re-detects after its dedup window doesn't re-spam the feed for a day.
+    await notify(
+        type=NotificationType.ANOMALY_DETECTED,
+        category=NotificationCategory.ANOMALY,
+        severity=(
+            NotificationSeverity.WARNING
+            if severity == AnomalySeverity.HIGH.value
+            else NotificationSeverity.INFO
+        ),
+        title="New anomaly detected",
+        body=(log_message or ", ".join(reasons) or "")[:160],
+        link=f"/anomalies/{obs_id}",
+        server_id=server_id,
+        entity_type="anomaly",
+        entity_id=obs_id,
+        dedup_key=f"anomaly:{server_id}:{fingerprint}" if fingerprint else None,
+        dedup_window_s=24 * 3600,
+    )
 
 
 def _emit_updated(obs_id: str, server_id: str, occurrence_count: int):
@@ -684,5 +723,5 @@ def _emit_updated(obs_id: str, server_id: str, occurrence_count: int):
         "server_id": server_id,
         "occurrence_count": occurrence_count,
     }
-    event_bus.emit("anomalies", "anomaly.updated", payload)
+    event_bus.emit(WSTopic.ANOMALIES, "anomaly.updated", payload)
     event_bus.emit(f"servers.{server_id}.anomalies", "anomaly.updated", payload)

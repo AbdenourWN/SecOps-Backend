@@ -1,3 +1,4 @@
+from app.core.constants import Collections
 import json
 import uuid
 from datetime import datetime, timezone
@@ -107,10 +108,10 @@ class LogService:
             s_oid = ObjectId(server_id)
         except Exception:
             return {"status": "failed", "error": "Invalid ID"}
-        server = await db["servers"].find_one({"_id": s_oid})
+        server = await db[Collections.SERVERS].find_one({"_id": s_oid})
         if not server:
             return {"status": "failed", "error": "Server not found"}
-        cred = await db["credentials"].find_one({"_id": ObjectId(server["credential_id"])})
+        cred = await db[Collections.CREDENTIALS].find_one({"_id": ObjectId(server["credential_id"])})
         plain_secret = decrypt_password(cred["encrypted_secret"])
         executor = get_server_executor(server, plain_secret)
         executor.credential["username"] = cred["username"]

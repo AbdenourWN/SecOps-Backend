@@ -10,6 +10,7 @@ plus the impact-agent fields (`anchor`, `server_state`, `metrics_window`).
 deduplicated by `_id` — same shape as the impact agent's input. Reused so both
 review paths get logs at the alert moment + the freshest logs after settling.
 """
+from app.core.constants import Collections
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional
@@ -35,7 +36,7 @@ async def capture_snapshot(server_id: str, anchor: datetime) -> dict:
     server_state: dict = {}
     open_incidents_count = 0
     try:
-        srv = await db["servers"].find_one(
+        srv = await db[Collections.SERVERS].find_one(
             {"_id": ObjectId(server_id)},
             {"hostname": 1, "is_online": 1, "status": 1, "last_metrics": 1},
         )
@@ -52,7 +53,7 @@ async def capture_snapshot(server_id: str, anchor: datetime) -> dict:
                     "collected_at": str(lm.get("collected_at", "")),
                 },
             }
-        open_incidents_count = await db["incidents"].count_documents(
+        open_incidents_count = await db[Collections.INCIDENTS].count_documents(
             {"server_id": server_id, "status": {"$in": ["open", "verifying"]}}
         )
     except Exception:

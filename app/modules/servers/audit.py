@@ -6,6 +6,7 @@ persisted; previews are truncated to 4 KB per stream.
 
 from __future__ import annotations
 
+from app.core.constants import Collections
 from datetime import datetime, timezone
 from typing import Dict, Literal, Optional
 
@@ -44,13 +45,13 @@ def _preview(text: str | None) -> tuple[str, int]:
 async def ensure_audit_indexes() -> None:
     """Call once at startup. Idempotent."""
     db = get_database()
-    await db["command_audit"].create_index(
+    await db[Collections.COMMAND_AUDIT].create_index(
         [("started_at", ASCENDING)], expireAfterSeconds=AUDIT_TTL_SECONDS
     )
-    await db["command_audit"].create_index(
+    await db[Collections.COMMAND_AUDIT].create_index(
         [("server_id", ASCENDING), ("started_at", DESCENDING)]
     )
-    await db["command_audit"].create_index(
+    await db[Collections.COMMAND_AUDIT].create_index(
         [("principal_id", ASCENDING), ("started_at", DESCENDING)]
     )
 
@@ -103,7 +104,7 @@ async def write_audit(
         "stream_stats": stream_stats,
     }
     try:
-        await get_database()["command_audit"].insert_one(doc)
+        await get_database()[Collections.COMMAND_AUDIT].insert_one(doc)
     except Exception as e:
         # Audit must never break the user-facing call. Log and move on.
         print(f"⚠️  audit write failed: {e}")

@@ -1,3 +1,7 @@
+from app.core.constants import (
+    Collections, WSTopic,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import asyncio
 import uuid
 from typing import AsyncIterator, Optional, Union
@@ -15,6 +19,44 @@ from app.modules.servers.guardrails import check_command
 from app.modules.servers.audit import write_audit
 from app.core.events import event_bus
 from app.core.connection_pool import connection_pool, terminal_pool
+from app.modules.notifications.feed import notify
+
+
+# Health transition → in-app notification copy. `None` = no notification for
+# that state (e.g. flips to "unknown" are too noisy to surface).
+_HEALTH_NOTIF = {
+    "offline": (NotificationSeverity.ERROR, "Server offline", "is no longer reachable."),
+    "reachable": (NotificationSeverity.WARNING, "Server authentication failing", "is reachable but credentials are being rejected."),
+    "online": (NotificationSeverity.SUCCESS, "Server back online", "has recovered and is online."),
+}
+
+
+async def _send_offline_alert_email(server: dict, previous_status: str) -> None:
+    """
+    Email the admin when a server transitions to offline. Reuses the existing
+    NotificationService email pipeline (recipients from the DB email config,
+    `.env` fallback). Best-effort — never raises into the health-check loop.
+    """
+    try:
+        from app.modules.notifications.service import NotificationService
+        from app.modules.notifications.schemas import AlertPayload
+
+        hostname = server.get("hostname") or server.get("ip_address") or str(server.get("_id"))
+        payload = AlertPayload(
+            incident_id="",
+            server_id=str(server.get("_id")),
+            server_hostname=hostname,
+            server_ip=server.get("ip_address", "unknown"),
+            rule_name="Server Offline",
+            severity="critical",                   # ensures it clears any configured min_severity
+            description=f"{hostname} is offline and no longer reachable by the platform.",
+            context={"Previous status": previous_status or "unknown"},
+            detected_at=utc_now(),
+            action_level=3,                        # alert-only
+        )
+        await NotificationService().send_alert(payload)
+    except Exception as e:
+        print(f"[health] offline alert email failed for {server.get('hostname')}: {e}")
 
 
 DEFAULT_COMMAND_TIMEOUT_S = 60
@@ -29,13 +71,13 @@ class ServerService:
         Returns the credential document if valid, raises error if not.
         """
         # 1. Find Server
-        server = await db["servers"].find_one({"_id": server_id})
+        server = await db[Collections.SERVERS].find_one({"_id": server_id})
         if not server:
             return {"valid": False, "error": "Server not found"}
 
         # 2. Find Linked Credential
         cred_id = server["credential_id"] # It's an ObjectId now
-        credential = await db["credentials"].find_one({"_id": ObjectId(cred_id)})
+        credential = await db[Collections.CREDENTIALS].find_one({"_id": ObjectId(cred_id)})
         
         if not credential:
             return {"valid": False, "error": "Critical Data Corruption: Credential missing"}
@@ -57,7 +99,7 @@ class ServerService:
         from app.core.config import settings
 
         db = get_database()
-        servers = await db["servers"].find().to_list(length=10000)
+        servers = await db[Collections.SERVERS].find().to_list(length=10000)
         print(f"🕵️  Starting Health Check Cycle ({len(servers)} servers)...")
 
         sem = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
@@ -89,7 +131,7 @@ class ServerService:
                     auth_ok = False
                     fail_reason = None
                     try:
-                        cred = await db["credentials"].find_one(
+                        cred = await db[Collections.CREDENTIALS].find_one(
                             {"_id": ObjectId(server["credential_id"])}
                         )
                         if not cred:
@@ -148,14 +190,14 @@ class ServerService:
                             "auth_failure_reason": fail_reason,
                         }
 
-                await db["servers"].update_one(
+                await db[Collections.SERVERS].update_one(
                     {"_id": server["_id"]},
                     {"$set": update},
                 )
 
                 new_status = update["status"]
                 if previous_status != new_status:
-                    event_bus.emit("servers.status", "server.status_changed", {
+                    event_bus.emit(WSTopic.SERVERS_STATUS, "server.status_changed", {
                         "server_id": server_id,
                         "status": new_status,
                         "previous_status": previous_status,
@@ -167,10 +209,40 @@ class ServerService:
                         "previous_status": previous_status,
                         "hostname": server.get("hostname"),
                     })
-                    event_bus.emit("dashboard.summary", "server.status_changed", {
+                    event_bus.emit(WSTopic.DASHBOARD_SUMMARY, "server.status_changed", {
                         "server_id": server_id,
                         "status": new_status,
                     })
+
+                    # In-app notification (chosen group). Dedup per server+status
+                    # so a flapping host doesn't re-spam the same transition.
+                    copy = _HEALTH_NOTIF.get(new_status)
+                    if copy is not None:
+                        sev, title, tail = copy
+                        host = server.get("hostname") or server.get("ip_address") or server_id
+                        reason = update.get("auth_failure_reason")
+                        body = f"{host} {tail}"
+                        if new_status == "reachable" and reason:
+                            body = f"{host}: {reason}"
+                        await notify(
+                            type=NotificationType.SERVER_HEALTH_CHANGED,
+                            category=NotificationCategory.SERVER,
+                            severity=sev,
+                            title=title,
+                            body=body[:160],
+                            link=f"/servers/{server_id}",
+                            server_id=server_id,
+                            entity_type="server",
+                            entity_id=server_id,
+                            dedup_key=f"server_health:{server_id}:{new_status}",
+                            dedup_window_s=3600,
+                        )
+
+                    # Email the admin when a server goes offline. Fire-and-forget
+                    # so SMTP latency never blocks the health-check gather; only
+                    # fires on the transition INTO offline (not every tick).
+                    if new_status == "offline":
+                        asyncio.create_task(_send_offline_alert_email(server, previous_status))
 
         await asyncio.gather(*[check_one(s) for s in servers], return_exceptions=True)
         print(f"✅ Health Check Complete. Scanned {len(servers)} servers.")
@@ -184,7 +256,7 @@ class ServerService:
         db = get_database()
         
         # 1. Check if Server IP exists
-        if await db["servers"].find_one({"ip_address": server_data.ip_address}):
+        if await db[Collections.SERVERS].find_one({"ip_address": server_data.ip_address}):
             return {"status": "failed", "error": "Server with this IP already exists"}
 
         # --- STEP A: Handle Credential ---
@@ -213,7 +285,7 @@ class ServerService:
         )
 
         # Save Credential to "credentials" collection
-        cred_result = await db["credentials"].insert_one(cred_in_db.model_dump())
+        cred_result = await db[Collections.CREDENTIALS].insert_one(cred_in_db.model_dump())
         new_cred_id = cred_result.inserted_id 
         
         # --- STEP B: Handle Server ---
@@ -260,13 +332,13 @@ class ServerService:
         server_doc["log_rate_baseline"] = 0.0
         server_doc["log_rate_updated_at"] = None
 
-        server_result = await db["servers"].insert_one(server_doc)
+        server_result = await db[Collections.SERVERS].insert_one(server_doc)
 
-        event_bus.emit("servers", "server.created", {
+        event_bus.emit(WSTopic.SERVERS, "server.created", {
             "server_id": str(server_result.inserted_id),
             "hostname": server_data.hostname,
         })
-        event_bus.emit("dashboard.summary", "server.created", {
+        event_bus.emit(WSTopic.DASHBOARD_SUMMARY, "server.created", {
             "server_id": str(server_result.inserted_id),
         })
 
@@ -287,9 +359,9 @@ class ServerService:
             import re
             pattern = re.compile(re.escape(search), re.IGNORECASE)
             query["$or"] = [{"hostname": pattern}, {"ip_address": pattern}]
-        total = await db["servers"].count_documents(query)
+        total = await db[Collections.SERVERS].count_documents(query)
         skip = (page - 1) * page_size
-        servers = await db["servers"].find(query).skip(skip).limit(page_size).to_list(page_size)
+        servers = await db[Collections.SERVERS].find(query).skip(skip).limit(page_size).to_list(page_size)
         return {"total": total, "page": page, "page_size": page_size, "results": servers}
 
     async def get_server(self, server_id: str):
@@ -300,7 +372,7 @@ class ServerService:
         except:
             return None
             
-        server = await db["servers"].find_one({"_id": oid})
+        server = await db[Collections.SERVERS].find_one({"_id": oid})
         return server
 
 
@@ -322,7 +394,7 @@ class ServerService:
         if update_data.hostname: server_updates["hostname"] = update_data.hostname
         if update_data.ip_address:
             # Check uniqueness if IP is changing
-            dup = await db["servers"].find_one({"ip_address": update_data.ip_address, "_id": {"$ne": oid}})
+            dup = await db[Collections.SERVERS].find_one({"ip_address": update_data.ip_address, "_id": {"$ne": oid}})
             if dup: return {"status": "failed", "error": "IP already taken"}
             server_updates["ip_address"] = update_data.ip_address
         if update_data.os_type: server_updates["os_type"] = update_data.os_type
@@ -361,7 +433,7 @@ class ServerService:
             # Update the Credential Collection
             if cred_updates:
                 cred_updates["updated_at"] = datetime.now(timezone.utc)
-                await db["credentials"].update_one(
+                await db[Collections.CREDENTIALS].update_one(
                     {"_id": ObjectId(verification["credential_id"])}, 
                     {"$set": cred_updates}
                 )
@@ -369,13 +441,13 @@ class ServerService:
         # 4. Update the Server Collection
         if server_updates:
             server_updates["updated_at"] = datetime.now(timezone.utc)
-            await db["servers"].update_one({"_id": oid}, {"$set": server_updates})
+            await db[Collections.SERVERS].update_one({"_id": oid}, {"$set": server_updates})
 
         # Evict from both pools so the next access picks up fresh credentials/config
         connection_pool.evict(str(oid))
         terminal_pool.evict(str(oid))
 
-        event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
+        event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": str(oid)})
 
         return {"status": "success", "message": "Server and credentials updated"}
 
@@ -395,14 +467,14 @@ class ServerService:
         cred_id = ObjectId(verification["credential_id"])
 
         # 2. DELETE EVERYTHING (Cascade)
-        await db["servers"].delete_one({"_id": oid})
-        await db["credentials"].delete_one({"_id": cred_id})
+        await db[Collections.SERVERS].delete_one({"_id": oid})
+        await db[Collections.CREDENTIALS].delete_one({"_id": cred_id})
         # Evict from both pools — releases all cached sessions immediately
         connection_pool.evict(str(oid))
         terminal_pool.evict(str(oid))
 
-        event_bus.emit("servers", "server.deleted", {"server_id": str(oid)})
-        event_bus.emit("dashboard.summary", "server.deleted", {"server_id": str(oid)})
+        event_bus.emit(WSTopic.SERVERS, "server.deleted", {"server_id": str(oid)})
+        event_bus.emit(WSTopic.DASHBOARD_SUMMARY, "server.deleted", {"server_id": str(oid)})
 
         return {"status": "success", "message": "Server and associated credentials deleted"}
 
@@ -432,7 +504,7 @@ class ServerService:
         except Exception:
             return {"status": "failed", "error": "Invalid Server ID"}
 
-        if not await db["servers"].find_one({"_id": oid}, {"_id": 1}):
+        if not await db[Collections.SERVERS].find_one({"_id": oid}, {"_id": 1}):
             return {"status": "failed", "error": "Server not found"}
 
         if warmup_minutes < 0 or warmup_minutes > 525_600:
@@ -444,14 +516,14 @@ class ServerService:
             if warmup_minutes == 0
             else now + timedelta(minutes=warmup_minutes)
         )
-        await db["servers"].update_one(
+        await db[Collections.SERVERS].update_one(
             {"_id": oid},
             {"$set": {"pattern_warmup_until": new_until}},
         )
         if clear_known_patterns:
-            await db["server_log_patterns"].delete_many({"server_id": str(oid)})
+            await db[Collections.SERVER_LOG_PATTERNS].delete_many({"server_id": str(oid)})
 
-        event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
+        event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": str(oid)})
         return {
             "status": "success",
             "message": f"Pattern warm-up restarted ({warmup_minutes} minutes)",
@@ -467,14 +539,14 @@ class ServerService:
         except Exception:
             return {"status": "failed", "error": "Invalid Server ID"}
 
-        if not await db["servers"].find_one({"_id": oid}, {"_id": 1}):
+        if not await db[Collections.SERVERS].find_one({"_id": oid}, {"_id": 1}):
             return {"status": "failed", "error": "Server not found"}
 
-        await db["servers"].update_one(
+        await db[Collections.SERVERS].update_one(
             {"_id": oid},
             {"$set": {"log_rate_baseline": 0.0, "log_rate_updated_at": None}},
         )
-        event_bus.emit("servers", "server.updated", {"server_id": str(oid)})
+        event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": str(oid)})
         return {"status": "success", "message": "Log rate baseline reset"}
 
     async def recalculate_server_stats(self, server_id: str):
@@ -488,15 +560,15 @@ class ServerService:
         except Exception:
             return {"status": "failed", "error": "Invalid Server ID"}
 
-        if not await db["servers"].find_one({"_id": oid}, {"_id": 1}):
+        if not await db[Collections.SERVERS].find_one({"_id": oid}, {"_id": 1}):
             return {"status": "failed", "error": "Server not found"}
 
-        active_count = await db["incidents"].count_documents({
+        active_count = await db[Collections.INCIDENTS].count_documents({
             "server_id": server_id,
             "status": {"$in": ["open", "verifying", "investigating"]},
         })
 
-        await db["servers"].update_one(
+        await db[Collections.SERVERS].update_one(
             {"_id": oid},
             {"$set": {"open_incidents_count": active_count}},
         )
@@ -527,7 +599,7 @@ class ServerService:
         except Exception:
             return {"status": "failed", "error": "Invalid Server ID"}
 
-        server = await db["servers"].find_one({"_id": s_oid})
+        server = await db[Collections.SERVERS].find_one({"_id": s_oid})
         if not server:
             return {"status": "failed", "error": "Server not found"}
 
@@ -639,7 +711,7 @@ class ServerService:
                    "message": "Invalid server ID"}
             return
 
-        server = await db["servers"].find_one({"_id": s_oid})
+        server = await db[Collections.SERVERS].find_one({"_id": s_oid})
         if not server:
             yield {"type": "error", "command_id": None, "code": "invalid_command",
                    "message": "Server not found"}

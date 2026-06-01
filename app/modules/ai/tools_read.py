@@ -5,6 +5,7 @@ All tools call get_database() directly (consistent with the rest of the codebase
 Each tool caps its output at ~2 KB so the LLM context stays bounded.
 These tools are always available regardless of ai_autonomy_level.
 """
+from app.core.constants import Collections
 import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -41,7 +42,7 @@ async def get_incident(incident_id: str) -> str:
     except Exception:
         return json.dumps({"error": f"Invalid incident_id: {incident_id}"})
 
-    inc = await db["incidents"].find_one({"_id": oid})
+    inc = await db[Collections.INCIDENTS].find_one({"_id": oid})
     if not inc:
         return json.dumps({"error": "Incident not found"})
 
@@ -54,7 +55,7 @@ async def get_incident(incident_id: str) -> str:
     rule = None
     if inc.get("rule_id"):
         try:
-            rule = await db["rules"].find_one({"_id": ObjectId(inc["rule_id"])})
+            rule = await db[Collections.RULES].find_one({"_id": ObjectId(inc["rule_id"])})
         except Exception:
             pass
 
@@ -83,7 +84,7 @@ async def get_recent_logs(server_id: str, limit: int = 20, level: Optional[str] 
     if level:
         query["level"] = level
 
-    cursor = db["logs"].find(query).sort("timestamp", -1).limit(limit)
+    cursor = db[Collections.LOGS].find(query).sort("timestamp", -1).limit(limit)
     logs = await cursor.to_list(length=limit)
 
     result = [
@@ -110,7 +111,7 @@ async def get_related_incidents(server_id: str, rule_id: Optional[str] = None, h
     if rule_id:
         query["rule_id"] = rule_id
 
-    cursor = db["incidents"].find(query).sort("detected_at", -1).limit(10)
+    cursor = db[Collections.INCIDENTS].find(query).sort("detected_at", -1).limit(10)
     incidents = await cursor.to_list(length=10)
 
     result = [
@@ -139,7 +140,7 @@ async def get_server_metrics(server_id: str) -> str:
     except Exception:
         return json.dumps({"error": f"Invalid server_id: {server_id}"})
 
-    server = await db["servers"].find_one(
+    server = await db[Collections.SERVERS].find_one(
         {"_id": oid},
         {"last_metrics": 1, "hostname": 1, "status": 1},
     )
@@ -168,7 +169,7 @@ async def get_related_anomalies(server_id: str, hours: int = 24) -> str:
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     query = {"server_id": server_id, "last_seen_at": {"$gte": since}}
 
-    cursor = db["log_observations"].find(query).sort("last_seen_at", -1).limit(10)
+    cursor = db[Collections.LOG_OBSERVATIONS].find(query).sort("last_seen_at", -1).limit(10)
     obs = await cursor.to_list(length=10)
 
     result = [
@@ -200,7 +201,7 @@ async def get_rule(rule_id: str) -> str:
     except Exception:
         return json.dumps({"error": f"Invalid rule_id: {rule_id}"})
 
-    rule = await db["rules"].find_one({"_id": oid})
+    rule = await db[Collections.RULES].find_one({"_id": oid})
     if not rule:
         return json.dumps({"error": "Rule not found"})
 
@@ -208,7 +209,7 @@ async def get_rule(rule_id: str) -> str:
     script_id = rule.get("remediation_script_id")
     if script_id:
         try:
-            script = await db["scripts"].find_one({"_id": ObjectId(str(script_id))}, {"name": 1})
+            script = await db[Collections.SCRIPTS].find_one({"_id": ObjectId(str(script_id))}, {"name": 1})
             if script:
                 script_name = script.get("name")
         except Exception:
@@ -238,7 +239,7 @@ async def get_anomaly(observation_id: str) -> str:
     except Exception:
         return json.dumps({"error": f"Invalid observation_id: {observation_id}"})
 
-    obs = await db["log_observations"].find_one({"_id": oid})
+    obs = await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid})
     if not obs:
         return json.dumps({"error": "Observation not found"})
 
@@ -248,7 +249,7 @@ async def get_anomaly(observation_id: str) -> str:
     hostname = ""
     if obs.get("server_id"):
         try:
-            srv = await db["servers"].find_one({"_id": ObjectId(obs["server_id"])}, {"hostname": 1})
+            srv = await db[Collections.SERVERS].find_one({"_id": ObjectId(obs["server_id"])}, {"hostname": 1})
             if srv:
                 hostname = srv.get("hostname", "")
         except Exception:
@@ -277,7 +278,7 @@ async def get_pattern_history(server_id: str, pattern_hash: str) -> str:
     Returns first/last seen timestamps and total occurrence count.
     """
     db = get_database()
-    pat = await db["server_log_patterns"].find_one(
+    pat = await db[Collections.SERVER_LOG_PATTERNS].find_one(
         {"server_id": server_id, "pattern_hash": pattern_hash}
     )
     if not pat:
@@ -328,7 +329,7 @@ async def get_logs_around(
     }
     if level:
         query["level"] = level
-    cursor = db["logs"].find(query).sort("timestamp", 1).limit(limit)
+    cursor = db[Collections.LOGS].find(query).sort("timestamp", 1).limit(limit)
     logs = await cursor.to_list(length=limit)
     result = [
         {
@@ -396,7 +397,7 @@ async def get_incidents_around(
     }
     if rule_id:
         query["rule_id"] = rule_id
-    cursor = db["incidents"].find(query).sort("detected_at", 1).limit(15)
+    cursor = db[Collections.INCIDENTS].find(query).sort("detected_at", 1).limit(15)
     incidents = await cursor.to_list(length=15)
     result = [
         {
@@ -429,7 +430,7 @@ async def get_anomalies_around(
         "server_id": server_id,
         "last_seen_at": {"$gte": anchor - delta, "$lte": anchor + delta},
     }
-    cursor = db["log_observations"].find(query).sort("last_seen_at", 1).limit(15)
+    cursor = db[Collections.LOG_OBSERVATIONS].find(query).sort("last_seen_at", 1).limit(15)
     obs = await cursor.to_list(length=15)
     result = [
         {

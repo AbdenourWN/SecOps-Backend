@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query
+from app.core.errors import http_error
 from typing import List, Optional
 from app.modules.logs.service import LogService
 from app.modules.logs.schemas import (
@@ -100,7 +101,7 @@ async def search_logs(
             "results": logs,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ES search error: {str(e)}")
+        raise http_error(500, "Log search failed — please try again.", e, "log search")
 
 
 @router.post("/collect/{server_id}")

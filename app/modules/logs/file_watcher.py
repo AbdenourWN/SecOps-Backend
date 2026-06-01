@@ -1,3 +1,4 @@
+from app.core.constants import Collections, WSTopic
 import asyncio
 import shlex
 import uuid
@@ -49,9 +50,9 @@ class FileWatcherService:
         new_source["is_active"] = True
         new_source["created_at"] = datetime.now(timezone.utc)
 
-        result = await db["log_sources"].insert_one(new_source)
+        result = await db[Collections.LOG_SOURCES].insert_one(new_source)
         _sid = new_source.get("server_id")
-        event_bus.emit("log.sources", "log_source.created", {
+        event_bus.emit(WSTopic.LOG_SOURCES, "log_source.created", {
             "source_id": str(result.inserted_id),
             "server_id": _sid,
         })
@@ -64,12 +65,12 @@ class FileWatcherService:
 
     async def get_all_sources(self):
         db = get_database()
-        return await db["log_sources"].find({"is_active": True}).to_list(length=1000)
+        return await db[Collections.LOG_SOURCES].find({"is_active": True}).to_list(length=1000)
 
     async def get_sources_by_server(self, server_id: str):
         """List every log source registered for a given server (active or not)."""
         db = get_database()
-        sources = await db["log_sources"].find({"server_id": server_id}).to_list(length=200)
+        sources = await db[Collections.LOG_SOURCES].find({"server_id": server_id}).to_list(length=200)
         for s in sources:
             s["_id"] = str(s["_id"])
         return sources
@@ -77,7 +78,7 @@ class FileWatcherService:
     async def get_source(self, source_id: str):
         db = get_database()
         try:
-            doc = await db["log_sources"].find_one({"_id": ObjectId(source_id)})
+            doc = await db[Collections.LOG_SOURCES].find_one({"_id": ObjectId(source_id)})
         except Exception:
             return None
         if doc:
@@ -108,10 +109,10 @@ class FileWatcherService:
             clean["error_count"] = 0
 
         # Fetch server_id before update for per-server topic emit
-        src = await db["log_sources"].find_one({"_id": oid}, {"server_id": 1})
-        result = await db["log_sources"].update_one({"_id": oid}, {"$set": clean})
+        src = await db[Collections.LOG_SOURCES].find_one({"_id": oid}, {"server_id": 1})
+        result = await db[Collections.LOG_SOURCES].update_one({"_id": oid}, {"$set": clean})
         if result.matched_count > 0:
-            event_bus.emit("log.sources", "log_source.updated", {"source_id": str(oid)})
+            event_bus.emit(WSTopic.LOG_SOURCES, "log_source.updated", {"source_id": str(oid)})
             _sid = src.get("server_id") if src else None
             if _sid:
                 event_bus.emit(f"servers.{_sid}.log_sources", "log_source.updated", {  # deprecated: remove when RBAC lands
@@ -126,10 +127,10 @@ class FileWatcherService:
         except Exception:
             return False
         # Fetch server_id before delete for per-server topic emit
-        src = await db["log_sources"].find_one({"_id": oid}, {"server_id": 1})
-        result = await db["log_sources"].delete_one({"_id": oid})
+        src = await db[Collections.LOG_SOURCES].find_one({"_id": oid}, {"server_id": 1})
+        result = await db[Collections.LOG_SOURCES].delete_one({"_id": oid})
         if result.deleted_count > 0:
-            event_bus.emit("log.sources", "log_source.deleted", {"source_id": str(oid)})
+            event_bus.emit(WSTopic.LOG_SOURCES, "log_source.deleted", {"source_id": str(oid)})
             _sid = src.get("server_id") if src else None
             if _sid:
                 event_bus.emit(f"servers.{_sid}.log_sources", "log_source.deleted", {  # deprecated: remove when RBAC lands
@@ -146,7 +147,7 @@ class FileWatcherService:
         db = get_database()
         server_id = source_doc["server_id"]
 
-        server = await db["servers"].find_one({"_id": ObjectId(server_id)})
+        server = await db[Collections.SERVERS].find_one({"_id": ObjectId(server_id)})
         if not server:
             return
 
@@ -187,7 +188,7 @@ class FileWatcherService:
 
         # Success - Reset Error Count
         if error_count > 0:
-            await db["log_sources"].update_one(
+            await db[Collections.LOG_SOURCES].update_one(
                 {"_id": source_id}, {"$set": {"error_count": 0}}
             )
 
@@ -226,7 +227,7 @@ class FileWatcherService:
         read_result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
         if read_result["status"] == "success":
             await self._save_logs(read_result["output"], source_doc, db, server)
-            await db["log_sources"].update_one(
+            await db[Collections.LOG_SOURCES].update_one(
                 {"_id": source_id},
                 {"$set": {
                     "last_offset": current_size,
@@ -263,7 +264,7 @@ class FileWatcherService:
             return
 
         if error_count > 0:
-            await db["log_sources"].update_one(
+            await db[Collections.LOG_SOURCES].update_one(
                 {"_id": source_id}, {"$set": {"error_count": 0}}
             )
 
@@ -299,7 +300,7 @@ class FileWatcherService:
         if read_result["status"] == "success":
             await self._save_logs(read_result["output"], source_doc, db, server)
 
-            await db["log_sources"].update_one(
+            await db[Collections.LOG_SOURCES].update_one(
                 {"_id": source_id},
                 {
                     "$set": {
@@ -355,7 +356,7 @@ class FileWatcherService:
         if new_count >= 10:
             print(f"💀 file_path {path} seems dead. Disabling.")
             updates["is_active"] = False
-        await db["log_sources"].update_one({"_id": source_id}, {"$set": updates})
+        await db[Collections.LOG_SOURCES].update_one({"_id": source_id}, {"$set": updates})
 
     async def _save_logs(self, raw_data, source_doc, db, server=None):
         if not raw_data:

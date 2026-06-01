@@ -1,29 +1,14 @@
 from datetime import datetime
-from enum import Enum
 from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import BaseModel, BeforeValidator, Field
 
 from app.core.datetime_utils import utc_now
+# AnomalyType / AnomalySeverity / LogObservationStatus now live in
+# app.core.constants; re-exported here so existing imports keep working.
+from app.core.constants import AnomalyType, AnomalySeverity, LogObservationStatus
 
 PyObjectId = Annotated[str, BeforeValidator(str)]
-
-
-class AnomalyType(str, Enum):
-    LOG = "log"          # individual log message flagged
-    VOLUME = "volume"    # server-wide log-rate spike
-
-
-class AnomalySeverity(str, Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
-
-class LogObservationStatus(str, Enum):
-    PENDING_REVIEW = "pending_review"
-    DISMISSED = "dismissed"
-    PROMOTED_TO_INCIDENT = "promoted_to_incident"
 
 
 class LogObservationInDB(BaseModel):

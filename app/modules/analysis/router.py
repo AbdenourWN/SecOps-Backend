@@ -1,6 +1,8 @@
+from app.core.constants import Collections, WSTopic
 import re as re_mod
 
 from fastapi import APIRouter, HTTPException, Query
+from app.core.errors import http_error
 from typing import Optional
 from app.modules.analysis.schemas import DetectionRule
 from app.core.database import get_database
@@ -44,9 +46,9 @@ async def list_rules(
         pattern = re_mod.compile(re_mod.escape(search), re_mod.IGNORECASE)
         query["$or"] = [{"name": pattern}, {"pattern": pattern}]
 
-    total = await db["rules"].count_documents(query)
+    total = await db[Collections.RULES].count_documents(query)
     skip = (page - 1) * page_size
-    rules = await db["rules"].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(length=page_size)
+    rules = await db[Collections.RULES].find(query).sort("created_at", -1).skip(skip).limit(page_size).to_list(length=page_size)
     for r in rules:
         r["_id"] = str(r["_id"])
         if "remediation_script_id" in r and r["remediation_script_id"]:
@@ -57,7 +59,7 @@ async def list_rules(
 async def get_rule(rule_id: str):
     db = get_database()
     try:
-        rule = await db["rules"].find_one({"_id": ObjectId(rule_id)})
+        rule = await db[Collections.RULES].find_one({"_id": ObjectId(rule_id)})
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
     if not rule:
@@ -80,7 +82,7 @@ async def create_rule(rule: DetectionRule):
         if not owner_id:
             raise HTTPException(status_code=422, detail="owner_id is required when owner_type=='server'")
         try:
-            srv = await db["servers"].find_one({"_id": ObjectId(owner_id)}, {"_id": 1})
+            srv = await db[Collections.SERVERS].find_one({"_id": ObjectId(owner_id)}, {"_id": 1})
         except Exception:
             raise HTTPException(status_code=422, detail="owner_id is not a valid server id")
         if not srv:
@@ -92,9 +94,9 @@ async def create_rule(rule: DetectionRule):
     now = datetime.now(timezone.utc)
     rule_data["created_at"] = now
     rule_data["updated_at"] = None
-    result = await db["rules"].insert_one(rule_data)
+    result = await db[Collections.RULES].insert_one(rule_data)
     _bust_rule_cache()
-    event_bus.emit("rules", "rule.created", {"rule_id": str(result.inserted_id)})
+    event_bus.emit(WSTopic.RULES, "rule.created", {"rule_id": str(result.inserted_id)})
     if owner_type == "server" and owner_id:
         event_bus.emit(f"servers.{owner_id}.rules", "rule.created", {"rule_id": str(result.inserted_id)})
     return {"status": "success", "id": str(result.inserted_id)}
@@ -121,7 +123,7 @@ async def update_rule(rule_id: str, updates: dict):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    existing = await db["rules"].find_one({"_id": oid})
+    existing = await db[Collections.RULES].find_one({"_id": oid})
     if not existing:
         raise HTTPException(status_code=404, detail="Rule not found")
 
@@ -136,9 +138,9 @@ async def update_rule(rule_id: str, updates: dict):
     update_data = {k: v for k, v in updates.items() if k in allowed}
     update_data["updated_at"] = datetime.now(timezone.utc)
 
-    await db["rules"].update_one({"_id": oid}, {"$set": update_data})
+    await db[Collections.RULES].update_one({"_id": oid}, {"$set": update_data})
     _bust_rule_cache()
-    event_bus.emit("rules", "rule.updated", {"rule_id": str(oid)})
+    event_bus.emit(WSTopic.RULES, "rule.updated", {"rule_id": str(oid)})
     if existing.get("owner_type") == "server" and existing.get("owner_id"):
         event_bus.emit(
             f"servers.{existing['owner_id']}.rules",
@@ -156,13 +158,13 @@ async def delete_rule(rule_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    existing = await db["rules"].find_one({"_id": oid}, {"owner_type": 1, "owner_id": 1})
-    result = await db["rules"].delete_one({"_id": oid})
+    existing = await db[Collections.RULES].find_one({"_id": oid}, {"owner_type": 1, "owner_id": 1})
+    result = await db[Collections.RULES].delete_one({"_id": oid})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Rule not found")
 
     _bust_rule_cache()
-    event_bus.emit("rules", "rule.deleted", {"rule_id": str(oid)})
+    event_bus.emit(WSTopic.RULES, "rule.deleted", {"rule_id": str(oid)})
     if existing and existing.get("owner_type") == "server" and existing.get("owner_id"):
         event_bus.emit(
             f"servers.{existing['owner_id']}.rules",
@@ -193,11 +195,11 @@ async def analyze_server_overview(server_id: str, hours: int = Query(24, ge=1, l
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid server_id")
 
-    if not await db["servers"].find_one({"_id": srv_oid}, {"_id": 1}):
+    if not await db[Collections.SERVERS].find_one({"_id": srv_oid}, {"_id": 1}):
         raise HTTPException(status_code=404, detail="Server not found")
 
     # Mark in-progress so the frontend can show a spinner while the agent runs.
-    await db["servers"].update_one(
+    await db[Collections.SERVERS].update_one(
         {"_id": srv_oid},
         {"$set": {"ai_analysis_in_progress": True}},
     )
@@ -205,13 +207,13 @@ async def analyze_server_overview(server_id: str, hours: int = Query(24, ge=1, l
     try:
         result = await run_server_overview(server_id, hours=hours)
     except Exception as exc:
-        await db["servers"].update_one(
+        await db[Collections.SERVERS].update_one(
             {"_id": srv_oid},
             {"$set": {"ai_analysis_in_progress": False}},
         )
-        raise HTTPException(status_code=503, detail=f"AI server-overview failed: {exc}")
+        raise http_error(503, "AI server overview failed — please try again.", exc, "server overview")
 
-    await db["servers"].update_one(
+    await db[Collections.SERVERS].update_one(
         {"_id": srv_oid},
         {"$set": {"ai_analysis_in_progress": False}},
     )
@@ -244,12 +246,12 @@ async def analyze_incident_with_ai(incident_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    if not await db["incidents"].find_one({"_id": inc_oid}, {"_id": 1}):
+    if not await db[Collections.INCIDENTS].find_one({"_id": inc_oid}, {"_id": 1}):
         raise HTTPException(status_code=404, detail="Incident not found")
 
     # Mark analysis as in-progress so any page showing this incident
     # can immediately reflect the loading state (persisted across navigation).
-    await db["incidents"].update_one(
+    await db[Collections.INCIDENTS].update_one(
         {"_id": inc_oid},
         {"$set": {"ai_analysis_in_progress": True}},
     )
@@ -257,13 +259,13 @@ async def analyze_incident_with_ai(incident_id: str):
     try:
         result = await run_triage(incident_id)
     except Exception as exc:
-        await db["incidents"].update_one(
+        await db[Collections.INCIDENTS].update_one(
             {"_id": inc_oid},
             {"$set": {"ai_analysis_in_progress": False}},
         )
-        raise HTTPException(status_code=503, detail=f"AI triage failed: {exc}")
+        raise http_error(503, "AI triage failed — please try again.", exc, "incident triage")
 
-    await db["incidents"].update_one(
+    await db[Collections.INCIDENTS].update_one(
         {"_id": inc_oid},
         {"$set": {
             "ai_analysis": result["markdown"],

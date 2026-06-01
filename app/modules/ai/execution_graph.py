@@ -14,6 +14,10 @@ For each approved command in sequence:
   8. Run impact agent with full context → save to ai_analysis (analysis_type="command_impact")
   9. Denormalize verdict + summary + addressed_root_cause onto ai_command row
 """
+from app.core.constants import (
+    Collections, WSTopic, AnalysisType, SourceType, ReviewVerdict,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import asyncio
 import json
 import re
@@ -33,6 +37,7 @@ from app.modules.ai.llm import get_chat_model
 from app.modules.ai.analysis_store import save_analysis, get_analysis_by_id
 from app.modules.ai.tools_read import ALL_READ_TOOLS
 from app.modules.ai.snapshots import capture_snapshot, fetch_review_logs
+from app.modules.notifications.feed import notify
 
 
 IMPACT_SYSTEM_PROMPT = """You are a SOC analyst reviewing the result of a remediation command that was just executed on a server. Your job is to decide whether the command **addressed the diagnosed root cause** of the original alert — not just whether anything changed.
@@ -131,14 +136,14 @@ async def _fetch_impact_context(cmd_doc: dict) -> dict:
         try:
             oid = ObjectId(src_id)
             if src_type == "incident":
-                source_doc = await db["incidents"].find_one({"_id": oid}) or {}
+                source_doc = await db[Collections.INCIDENTS].find_one({"_id": oid}) or {}
                 if source_doc.get("rule_id"):
-                    rule = await db["rules"].find_one(
+                    rule = await db[Collections.RULES].find_one(
                         {"_id": ObjectId(str(source_doc["rule_id"]))}, {"name": 1}
                     )
                     rule_name = (rule or {}).get("name", "")
             elif src_type == "anomaly":
-                source_doc = await db["log_observations"].find_one({"_id": oid}) or {}
+                source_doc = await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid}) or {}
         except Exception:
             source_doc = {}
 
@@ -179,7 +184,7 @@ def _emit_progress(server_id: str, command_id: str, phase: str, **kwargs):
     except Exception:
         pass
     try:
-        event_bus.emit("ai_actions", "ai_command_progress", payload)
+        event_bus.emit(WSTopic.AI_ACTIONS, "ai_command_progress", payload)
     except Exception:
         pass
 
@@ -342,7 +347,7 @@ async def _run_impact_agent(
     raw_text = _extract_final_text(messages)
     parsed = _extract_json_block(raw_text) or {}
 
-    outcome = parsed.get("outcome", "no_effect")
+    outcome = parsed.get("outcome", ReviewVerdict.NO_EFFECT.value)
     addressed = parsed.get("addressed_root_cause", "unknown")
     before_after_delta = parsed.get("before_after_delta", "") or ""
     evidence = parsed.get("evidence", []) or []
@@ -351,8 +356,8 @@ async def _run_impact_agent(
     from app.core.config import settings
     analysis_id = await save_analysis(
         run_id=run_id,
-        analysis_type="command_impact",
-        source_type="command",
+        analysis_type=AnalysisType.COMMAND_IMPACT,
+        source_type=SourceType.COMMAND,
         source_id=command_id,
         server_id=server_id,
         summary=before_after_delta or outcome,
@@ -389,10 +394,11 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
     """
     db = get_database()
     results = []
+    batch_server_id = ""
 
     for command_id in command_ids:
         try:
-            cmd_doc = await db["ai_command"].find_one({"_id": ObjectId(command_id)})
+            cmd_doc = await db[Collections.AI_COMMAND].find_one({"_id": ObjectId(command_id)})
         except Exception:
             continue
         if not cmd_doc or cmd_doc.get("status") != "approved":
@@ -401,6 +407,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
         command = cmd_doc.get("command", "")
         os_type = cmd_doc.get("os_type", "linux")
         server_id = cmd_doc.get("server_id", "")
+        batch_server_id = batch_server_id or server_id
         purpose = cmd_doc.get("purpose", "")
         expected_outcome = cmd_doc.get("expected_outcome", "")
         risk_level = cmd_doc.get("risk_level", "medium")
@@ -413,7 +420,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
         # Guardrails check
         guard = check_command(command, os_type)
         if not guard.allowed:
-            await db["ai_command"].update_one(
+            await db[Collections.AI_COMMAND].update_one(
                 {"_id": ObjectId(command_id)},
                 {"$set": {
                     "status": "blocked",
@@ -426,7 +433,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
             continue
 
         # Mark executing + emit
-        await db["ai_command"].update_one(
+        await db[Collections.AI_COMMAND].update_one(
             {"_id": ObjectId(command_id)},
             {"$set": {"status": "executing"}},
         )
@@ -435,7 +442,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
         # Pre-snapshot — anchor at "now" just before execution starts
         pre_anchor = utc_now()
         pre_snapshot = await capture_snapshot(server_id, anchor=pre_anchor)
-        await db["ai_command"].update_one(
+        await db[Collections.AI_COMMAND].update_one(
             {"_id": ObjectId(command_id)},
             {"$set": {"pre_snapshot": pre_snapshot}},
         )
@@ -450,7 +457,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
 
         # ── Server online check before attempting connection ──────────────────
         try:
-            srv_doc = await db["servers"].find_one(
+            srv_doc = await db[Collections.SERVERS].find_one(
                 {"_id": ObjectId(server_id)},
                 {"is_online": 1, "status": 1, "hostname": 1},
             )
@@ -462,7 +469,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
             srv_label = srv_doc.get("hostname") or server_id if srv_doc else server_id
             exec_error = f"Server '{srv_label}' is {srv_status} — execution skipped"
             stderr = exec_error
-            await db["ai_command"].update_one(
+            await db[Collections.AI_COMMAND].update_one(
                 {"_id": ObjectId(command_id)},
                 {"$set": {
                     "status": "failed",
@@ -529,7 +536,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
         if not stdout and not stderr and status == "failed":
             stderr = "(no output captured — command may not have reached the server)"
 
-        await db["ai_command"].update_one(
+        await db[Collections.AI_COMMAND].update_one(
             {"_id": ObjectId(command_id)},
             {"$set": {
                 "stdout": stdout,
@@ -553,7 +560,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
         # Post-snapshot — anchor at "now" after the settling delay
         post_anchor = utc_now()
         post_snapshot = await capture_snapshot(server_id, anchor=post_anchor)
-        await db["ai_command"].update_one(
+        await db[Collections.AI_COMMAND].update_one(
             {"_id": ObjectId(command_id)},
             {"$set": {"post_snapshot": post_snapshot}},
         )
@@ -582,7 +589,7 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
                     command_id=command_id,
                     run_id=run_id,
                 )
-                await db["ai_command"].update_one(
+                await db[Collections.AI_COMMAND].update_one(
                     {"_id": ObjectId(command_id)},
                     {"$set": {
                         "impact_analysis_id": impact["analysis_id"],
@@ -596,5 +603,26 @@ async def run_execution_batch(batch_id: str, command_ids: list[str]) -> dict:
                 _emit_progress(server_id, command_id, "report_error", error=str(e))
 
         results.append({"command_id": command_id, "status": status})
+
+    # In-app notification: one summary per batch (core event). Skipped when
+    # nothing actually ran (all commands already non-approved / filtered out).
+    if results:
+        n_ok = sum(1 for r in results if r["status"] == "completed")
+        n_bad = len(results) - n_ok
+        await notify(
+            type=NotificationType.COMMAND_FINISHED,
+            category=NotificationCategory.AI,
+            severity=(NotificationSeverity.SUCCESS if n_bad == 0 else NotificationSeverity.WARNING),
+            title="AI command execution finished",
+            body=(
+                f"{n_ok} succeeded"
+                + (f", {n_bad} failed or blocked" if n_bad else "")
+                + "."
+            ),
+            link="/ai-actions",
+            server_id=batch_server_id or None,
+            entity_type="command_batch",
+            entity_id=batch_id,
+        )
 
     return {"batch_id": batch_id, "results": results}

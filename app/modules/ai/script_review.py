@@ -11,6 +11,10 @@ and denormalises verdict + summary back onto the originating `automation_logs`
 row so the history list and incident-detail page can render the badge without
 a second fetch.
 """
+from app.core.constants import (
+    Collections, WSEvent, WSTopic, AnalysisType, SourceType, ReviewVerdict,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import asyncio
 import json
 import re
@@ -28,6 +32,16 @@ from app.core.events import event_bus
 from app.modules.ai.analysis_store import save_analysis
 from app.modules.ai.llm import get_chat_model
 from app.modules.ai.snapshots import capture_snapshot, fetch_review_logs
+from app.modules.notifications.feed import notify
+
+
+# Map a post-execution review verdict to a notification severity.
+_REVIEW_SEVERITY = {
+    ReviewVerdict.MADE_WORSE.value: NotificationSeverity.ERROR,
+    ReviewVerdict.NO_EFFECT.value: NotificationSeverity.WARNING,
+    ReviewVerdict.PARTIAL.value: NotificationSeverity.WARNING,
+    ReviewVerdict.RESOLVED.value: NotificationSeverity.SUCCESS,
+}
 
 
 # 10s is the right default for scripts (vs 4s for single commands). Scripts can
@@ -194,7 +208,7 @@ async def _fetch_review_context(automation_log_id: str) -> Optional[dict]:
     """
     db = get_database()
     try:
-        log = await db["automation_logs"].find_one({"_id": ObjectId(automation_log_id)})
+        log = await db[Collections.AUTOMATION_LOGS].find_one({"_id": ObjectId(automation_log_id)})
     except Exception:
         return None
     if not log:
@@ -208,13 +222,13 @@ async def _fetch_review_context(automation_log_id: str) -> Optional[dict]:
     rule_name = ""
     if incident_id:
         try:
-            incident_doc = await db["incidents"].find_one({"_id": ObjectId(incident_id)}) or {}
+            incident_doc = await db[Collections.INCIDENTS].find_one({"_id": ObjectId(incident_id)}) or {}
         except Exception:
             incident_doc = {}
         rule_id = incident_doc.get("rule_id")
         if rule_id:
             try:
-                rule_doc = await db["rules"].find_one({"_id": ObjectId(str(rule_id))}, {"name": 1, "severity": 1})
+                rule_doc = await db[Collections.RULES].find_one({"_id": ObjectId(str(rule_id))}, {"name": 1, "severity": 1})
                 if rule_doc:
                     rule_name = rule_doc.get("name", "")
             except Exception:
@@ -223,14 +237,14 @@ async def _fetch_review_context(automation_log_id: str) -> Optional[dict]:
     script_doc: dict = {}
     if script_id:
         try:
-            script_doc = await db["scripts"].find_one({"_id": ObjectId(script_id)}) or {}
+            script_doc = await db[Collections.SCRIPTS].find_one({"_id": ObjectId(script_id)}) or {}
         except Exception:
             script_doc = {}
 
     server_doc: dict = {}
     if server_id:
         try:
-            server_doc = await db["servers"].find_one(
+            server_doc = await db[Collections.SERVERS].find_one(
                 {"_id": ObjectId(server_id)},
                 {"hostname": 1, "os_type": 1, "ai_autonomy_level": 1, "status": 1, "is_online": 1},
             ) or {}
@@ -468,16 +482,27 @@ async def _queue_suggestion_actions(
     if not rows:
         return 0
 
-    await db["ai_actions"].insert_many(rows)
+    await db[Collections.AI_ACTIONS].insert_many(rows)
     # Tell the AI Actions inbox to refresh its badge / list.
     try:
-        event_bus.emit("ai_actions", "ai_action.created", {
+        event_bus.emit(WSTopic.AI_ACTIONS, "ai_action.created", {
             "server_id": server_id,
             "automation_log_id": automation_log_id,
             "count": len(rows),
         })
     except Exception:
         pass
+    await notify(
+        type=NotificationType.AI_SUGGESTIONS_QUEUED,
+        category=NotificationCategory.AI,
+        severity=NotificationSeverity.INFO,
+        title="AI suggestions ready for review",
+        body=f"{len(rows)} suggested action(s) from the remediation review await your approval.",
+        link="/ai-actions",
+        server_id=server_id,
+        entity_type="ai_actions",
+        entity_id=run_id,
+    )
     return len(rows)
 
 
@@ -501,9 +526,9 @@ async def run_script_execution_review(
     db = get_database()
     ctx = await _fetch_review_context(automation_log_id)
     if not ctx:
-        await db["automation_logs"].update_one(
+        await db[Collections.AUTOMATION_LOGS].update_one(
             {"_id": ObjectId(automation_log_id)},
-            {"$set": {"ai_review_verdict": "review_failed", "ai_review_summary": "Context not found"}},
+            {"$set": {"ai_review_verdict": ReviewVerdict.REVIEW_FAILED, "ai_review_summary": "Context not found"}},
         )
         return
 
@@ -518,10 +543,10 @@ async def run_script_execution_review(
     # Phase 28.5 — mark in-progress immediately so the detail page's
     # "analysisRunning" flag is true on first render. Cleared in the happy path
     # below when the verdict is persisted, or in the except branch on failure.
-    await db["automation_logs"].update_one(
+    await db[Collections.AUTOMATION_LOGS].update_one(
         {"_id": ObjectId(automation_log_id)},
         {"$set": {
-            "ai_review_verdict": "in_progress",
+            "ai_review_verdict": ReviewVerdict.IN_PROGRESS,
             "ai_review_summary": "Analysis running…",
         }},
     )
@@ -553,7 +578,7 @@ async def run_script_execution_review(
 
         # Initial empty token kicks the frontend's stream state into "running".
         try:
-            event_bus.emit(f"servers.{server_id}.ai", "ai_analysis_token", {
+            event_bus.emit(f"servers.{server_id}.ai", WSEvent.AI_ANALYSIS_TOKEN, {
                 "run_id": run_id,
                 "source_type": "automation_log",
                 "source_id": automation_log_id,
@@ -583,7 +608,7 @@ async def run_script_execution_review(
                 continue
             stream_chunks.append(token_text)
             try:
-                event_bus.emit(f"servers.{server_id}.ai", "ai_analysis_token", {
+                event_bus.emit(f"servers.{server_id}.ai", WSEvent.AI_ANALYSIS_TOKEN, {
                     "run_id": run_id,
                     "source_type": "automation_log",
                     "source_id": automation_log_id,
@@ -606,8 +631,8 @@ async def run_script_execution_review(
 
         analysis_id = await save_analysis(
             run_id=run_id,
-            analysis_type="script_execution_review",
-            source_type="automation_log",
+            analysis_type=AnalysisType.SCRIPT_EXECUTION_REVIEW,
+            source_type=SourceType.AUTOMATION_LOG,
             source_id=automation_log_id,
             server_id=server_id,
             summary=summary_one_line,
@@ -636,7 +661,7 @@ async def run_script_execution_review(
         # Denormalise pointer + verdict back onto the automation_logs row.
         # `save_analysis` already wrote `ai_analysis_latest_id` + count via
         # _source_collection mapping; the three review fields are extra.
-        await db["automation_logs"].update_one(
+        await db[Collections.AUTOMATION_LOGS].update_one(
             {"_id": ObjectId(automation_log_id)},
             {"$set": {
                 "ai_review_id": analysis_id,
@@ -672,18 +697,18 @@ async def run_script_execution_review(
             "suggested_actions": suggested_count,
         }
         try:
-            event_bus.emit(f"servers.{server_id}.automation", "automation_review_ready", payload)
+            event_bus.emit(f"servers.{server_id}.automation", WSEvent.AUTOMATION_REVIEW_READY, payload)
         except Exception:
             pass
         try:
-            event_bus.emit("automation.history", "automation_review_ready", payload)
+            event_bus.emit(WSTopic.AUTOMATION_HISTORY, WSEvent.AUTOMATION_REVIEW_READY, payload)
         except Exception:
             pass
 
         # Phase 28.5 — signal stream completion so `useAiAnalysisStream` flips
         # `streamCompleted=true` and the typing cursor disappears.
         try:
-            event_bus.emit(f"servers.{server_id}.ai", "ai_analysis_complete", {
+            event_bus.emit(f"servers.{server_id}.ai", WSEvent.AI_ANALYSIS_COMPLETE, {
                 "run_id": run_id,
                 "source_type": "automation_log",
                 "source_id": automation_log_id,
@@ -692,22 +717,34 @@ async def run_script_execution_review(
         except Exception:
             pass
 
+        await notify(
+            type=NotificationType.AI_ANALYSIS_READY,
+            category=NotificationCategory.AI,
+            severity=_REVIEW_SEVERITY.get(outcome, NotificationSeverity.INFO),
+            title="Remediation review ready",
+            body=(summary_one_line or "Post-execution review complete.")[:160],
+            link=f"/automation/history/{automation_log_id}",
+            server_id=server_id,
+            entity_type="automation_log",
+            entity_id=automation_log_id,
+        )
+
     except Exception as exc:
         # Persist a failure marker so the UI shows "review unavailable" instead
         # of an indefinite spinner. The underlying script execution is unaffected
         # — it already completed before this function ran.
         msg = f"{type(exc).__name__}: {exc}"[:200]
         try:
-            await db["automation_logs"].update_one(
+            await db[Collections.AUTOMATION_LOGS].update_one(
                 {"_id": ObjectId(automation_log_id)},
-                {"$set": {"ai_review_verdict": "review_failed", "ai_review_summary": msg}},
+                {"$set": {"ai_review_verdict": ReviewVerdict.REVIEW_FAILED, "ai_review_summary": msg}},
             )
         except Exception:
             pass
         # Phase 28.5 — break the frontend's running state so the failure marker
         # actually renders (otherwise the stream hook keeps showing the cursor).
         try:
-            event_bus.emit(f"servers.{server_id}.ai", "ai_analysis_complete", {
+            event_bus.emit(f"servers.{server_id}.ai", WSEvent.AI_ANALYSIS_COMPLETE, {
                 "run_id": run_id,
                 "source_type": "automation_log",
                 "source_id": automation_log_id,
@@ -716,6 +753,18 @@ async def run_script_execution_review(
             })
         except Exception:
             pass
+
+        await notify(
+            type=NotificationType.AI_ANALYSIS_FAILED,
+            category=NotificationCategory.AI,
+            severity=NotificationSeverity.ERROR,
+            title="Remediation review failed",
+            body="The post-execution AI review couldn't be generated.",
+            link=f"/automation/history/{automation_log_id}",
+            server_id=server_id,
+            entity_type="automation_log",
+            entity_id=automation_log_id,
+        )
 
 
 async def run_review_with_settling(
@@ -742,9 +791,9 @@ async def run_review_with_settling(
         db = get_database()
         msg = f"{type(exc).__name__}: {exc}"[:200]
         try:
-            await db["automation_logs"].update_one(
+            await db[Collections.AUTOMATION_LOGS].update_one(
                 {"_id": ObjectId(automation_log_id)},
-                {"$set": {"ai_review_verdict": "review_failed", "ai_review_summary": msg}},
+                {"$set": {"ai_review_verdict": ReviewVerdict.REVIEW_FAILED, "ai_review_summary": msg}},
             )
         except Exception:
             pass

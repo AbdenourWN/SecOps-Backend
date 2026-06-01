@@ -1,3 +1,7 @@
+from app.core.constants import (
+    Collections, WSTopic, DetectionDefaults, AutomationSkippedReason, AutomationFailureReason,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import re
 import time
 from datetime import datetime, timezone, timedelta
@@ -11,19 +15,43 @@ from app.modules.notifications.service import NotificationService
 from app.modules.notifications.schemas import AlertPayload
 from app.modules.heuristics.service import HeuristicService
 from app.modules.anomalies.service import AnomaliesService
+from app.modules.notifications.feed import notify
 from app.core.events import event_bus
 from app.core.datetime_utils import to_utc
+
+
+# Map incident severity → in-app notification severity (loudness of the bell row).
+_INCIDENT_NOTIF_SEVERITY = {
+    "critical": NotificationSeverity.ERROR,
+    "high": NotificationSeverity.WARNING,
+}
+
+
+async def _notify_incident_created(incident_id: str, server_id: str, severity, rule_name: str):
+    """In-app notification for a freshly-created incident (core event)."""
+    sev = severity or ""
+    await notify(
+        type=NotificationType.INCIDENT_CREATED,
+        category=NotificationCategory.INCIDENT,
+        severity=_INCIDENT_NOTIF_SEVERITY.get(sev, NotificationSeverity.INFO),
+        title=f"New {sev} incident".strip() if sev else "New incident",
+        body=(rule_name or "")[:160],
+        link=f"/incidents/{incident_id}",
+        server_id=server_id,
+        entity_type="incident",
+        entity_id=incident_id,
+    )
 
 
 # ========================================================================
 # Remediation / Detection Tunables — GLOBAL DEFAULTS
 # All of these can be overridden per-server via DetectionConfig.
 # ========================================================================
-VERIFICATION_WINDOW_MINUTES = 10      # watch window after script runs
-MAX_REMEDIATION_ATTEMPTS = 3          # retries before escalation
-RECENT_INCIDENT_LOOKBACK_MINUTES = 30 # dedup lookback for OPEN/VERIFYING
-RECURRENCE_STREAK_THRESHOLD = 3       # consecutive "fix → recur" before pausing automation
-RECURRENCE_LOOKBACK_HOURS = 2         # how recent last resolution must be to count as chain
+VERIFICATION_WINDOW_MINUTES = DetectionDefaults.VERIFICATION_WINDOW_MINUTES    # watch window after script runs
+MAX_REMEDIATION_ATTEMPTS = DetectionDefaults.MAX_REMEDIATION_ATTEMPTS          # retries before escalation
+RECENT_INCIDENT_LOOKBACK_MINUTES = DetectionDefaults.INCIDENT_LOOKBACK_MINUTES # dedup lookback for OPEN/VERIFYING
+RECURRENCE_STREAK_THRESHOLD = DetectionDefaults.RECURRENCE_STREAK_THRESHOLD    # consecutive "fix → recur" before pausing automation
+RECURRENCE_LOOKBACK_HOURS = DetectionDefaults.RECURRENCE_LOOKBACK_HOURS        # how recent last resolution must be to count as chain
 
 
 def _cfg(server: dict) -> dict:
@@ -51,7 +79,7 @@ async def _get_cached_rules():
     now = time.time()
     if now - _rule_cache["loaded_at"] > _rule_cache["ttl"]:
         db = get_database()
-        rules_data = await db["rules"].find({"enabled": True}).to_list(length=200)
+        rules_data = await db[Collections.RULES].find({"enabled": True}).to_list(length=200)
         
         compiled = []
         for r in rules_data:
@@ -123,7 +151,7 @@ async def _resolve_script_id(rule: dict, server: dict, server_os: str, db) -> Op
     sid = str(server["_id"])
 
     try:
-        candidate = await db["scripts"].find_one(
+        candidate = await db[Collections.SCRIPTS].find_one(
             {"_id": ObjectId(candidate_id)}, {"name": 1}
         )
     except Exception:
@@ -132,7 +160,7 @@ async def _resolve_script_id(rule: dict, server: dict, server_os: str, db) -> Op
         # Broken pointer — let the downstream `script_missing` path surface it.
         return candidate_id
 
-    server_match = await db["scripts"].find_one(
+    server_match = await db[Collections.SCRIPTS].find_one(
         {
             "owner_type": "server",
             "owner_id": sid,
@@ -171,7 +199,7 @@ class AnalysisService:
 
         # 1. Fetch Server OS once
         first_server_id = logs[0]["server_id"]
-        server = await db["servers"].find_one({"_id": ObjectId(first_server_id)})
+        server = await db[Collections.SERVERS].find_one({"_id": ObjectId(first_server_id)})
         if not server:
             return
 
@@ -256,7 +284,7 @@ class AnalysisService:
                     lookback_cutoff = now - timedelta(
                         minutes=_cfg(server).get("incident_lookback_minutes") or RECENT_INCIDENT_LOOKBACK_MINUTES
                     )
-                    existing = await db["incidents"].find_one(
+                    existing = await db[Collections.INCIDENTS].find_one(
                         {
                             "server_id": server_id_str,
                             "rule_id": rule_id_str,
@@ -273,7 +301,7 @@ class AnalysisService:
                         existing_id = existing["_id"]
 
                         # Already escalated: don't retry, don't alert again. Waits for manual resolve.
-                        if existing.get("automation_failure_reason") == "remediation_exhausted":
+                        if existing.get("automation_failure_reason") == AutomationFailureReason.REMEDIATION_EXHAUSTED.value:
                             continue
 
                         verification_until = to_utc(existing.get("verification_until"))
@@ -291,26 +319,37 @@ class AnalysisService:
 
                             if attempts >= max_attempts:
                                 # Give up — mark exhausted, escalate, do NOT re-run.
-                                await db["incidents"].update_one(
+                                await db[Collections.INCIDENTS].update_one(
                                     {"_id": existing_id},
                                     {"$set": {
                                         "status": IncidentStatus.OPEN.value,
                                         "remediation_attempts": attempts,
-                                        "automation_failure_reason": "remediation_exhausted",
+                                        "automation_failure_reason": AutomationFailureReason.REMEDIATION_EXHAUSTED.value,
                                         "verification_until": None,
                                         "description": existing["description"] + f" (Auto-remediation failed {attempts}x)",
                                     }},
                                 )
-                                event_bus.emit("incidents", "incident.updated", {
+                                event_bus.emit(WSTopic.INCIDENTS, "incident.updated", {
                                     "incident_id": str(existing_id),
                                     "server_id": server_id_str,
-                                    "reason": "remediation_exhausted",
+                                    "reason": AutomationFailureReason.REMEDIATION_EXHAUSTED.value,
                                 })
                                 event_bus.emit(f"servers.{server_id_str}.incidents", "incident.updated", {  # deprecated: remove when RBAC lands
                                     "incident_id": str(existing_id),
                                     "server_id": server_id_str,
-                                    "reason": "remediation_exhausted",
+                                    "reason": AutomationFailureReason.REMEDIATION_EXHAUSTED.value,
                                 })
+                                await notify(
+                                    type=NotificationType.REMEDIATION_FAILED,
+                                    category=NotificationCategory.AUTOMATION,
+                                    severity=NotificationSeverity.ERROR,
+                                    title="Auto-remediation exhausted",
+                                    body=f"'{rule['name']}' could not be fixed automatically after {attempts} attempts.",
+                                    link=f"/incidents/{existing_id}",
+                                    server_id=server_id_str,
+                                    entity_type="incident",
+                                    entity_id=str(existing_id),
+                                )
                                 escalation_payload = AlertPayload(
                                     incident_id=str(existing_id),
                                     server_id=server_id_str,
@@ -330,7 +369,7 @@ class AnalysisService:
                                 continue
 
                             # Still under the limit — retry the same script with the original context.
-                            await db["incidents"].update_one(
+                            await db[Collections.INCIDENTS].update_one(
                                 {"_id": existing_id},
                                 {"$set": {
                                     "remediation_attempts": attempts,
@@ -339,7 +378,7 @@ class AnalysisService:
                                     "status": IncidentStatus.VERIFYING.value,
                                 }},
                             )
-                            event_bus.emit("incidents", "incident.updated", {
+                            event_bus.emit(WSTopic.INCIDENTS, "incident.updated", {
                                 "incident_id": str(existing_id),
                                 "server_id": server_id_str,
                                 "reason": "remediation_retry",
@@ -382,19 +421,19 @@ class AnalysisService:
                     skipped_reason = None
                     if action_level in [1, 2] and candidate_script_id:
                         try:
-                            script_doc = await db["scripts"].find_one({"_id": ObjectId(candidate_script_id)})
+                            script_doc = await db[Collections.SCRIPTS].find_one({"_id": ObjectId(candidate_script_id)})
                         except Exception:
                             script_doc = None
                         if not script_doc:
-                            skipped_reason = "script_missing"
+                            skipped_reason = AutomationSkippedReason.SCRIPT_MISSING.value
                         elif not script_doc.get("enabled", True):
-                            skipped_reason = "script_disabled"
+                            skipped_reason = AutomationSkippedReason.SCRIPT_DISABLED.value
                         elif server_id_str in (script_doc.get("disabled_for_servers") or []):
                             # Phase 28.4 — operator approved an AI suggestion to
                             # disable this script on this server only. Rule still
                             # fires (so the operator sees the incident), but
                             # automation is skipped and the rule degrades to alert.
-                            skipped_reason = "script_disabled_for_server"
+                            skipped_reason = AutomationSkippedReason.SCRIPT_DISABLED_FOR_SERVER.value
 
                     # Recurrence check — has the same script "fixed" this on this server
                     # repeatedly without lasting effect? Count consecutive auto-resolved
@@ -406,7 +445,7 @@ class AnalysisService:
                         recurrence_lookback_h = _cfg(server).get("recurrence_lookback_hours") or RECURRENCE_LOOKBACK_HOURS
                         recurrence_cutoff = now - timedelta(hours=recurrence_lookback_h)
 
-                        last_resolved = await db["incidents"].find_one(
+                        last_resolved = await db[Collections.INCIDENTS].find_one(
                             {
                                 "server_id": server_id_str,
                                 "rule_id": rule_id_str,
@@ -419,7 +458,7 @@ class AnalysisService:
                             recurrence_streak = (last_resolved.get("recurrence_streak") or 0) + 1
 
                         if recurrence_streak >= recurrence_threshold:
-                            skipped_reason = "recurrence_detected"
+                            skipped_reason = AutomationSkippedReason.RECURRENCE_DETECTED.value
                             print(f"🔄 Recurrence streak {recurrence_streak}/{recurrence_threshold} for '{rule['name']}' on {server.get('hostname')} — pausing automation")
 
                     alert_payload = AlertPayload(
@@ -448,15 +487,15 @@ class AnalysisService:
                         incident_data["last_remediation_at"] = now
                         incident_data["verification_until"] = now + timedelta(minutes=_cfg(server).get("verification_window_minutes") or VERIFICATION_WINDOW_MINUTES)
                         incident_data["recurrence_streak"] = recurrence_streak
-                        inc_result = await db["incidents"].insert_one(incident_data)
+                        inc_result = await db[Collections.INCIDENTS].insert_one(incident_data)
                         incident_id = str(inc_result.inserted_id)
-                        await db["servers"].update_one(
+                        await db[Collections.SERVERS].update_one(
                             {"_id": ObjectId(server_id_str)},
                             {"$inc": {"open_incidents_count": 1}},
                         )
-                        event_bus.emit("servers", "server.updated", {"server_id": server_id_str})
+                        event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": server_id_str})
 
-                        event_bus.emit("incidents", "incident.created", {
+                        event_bus.emit(WSTopic.INCIDENTS, "incident.created", {
                             "incident_id": incident_id,
                             "server_id": server_id_str,
                             "severity": rule["severity"],
@@ -470,7 +509,8 @@ class AnalysisService:
                             "rule_name": rule["name"],
                             "action_level": action_level,
                         })
-                        event_bus.emit("dashboard.summary", "incident.created", {"incident_id": incident_id})
+                        event_bus.emit(WSTopic.DASHBOARD_SUMMARY, "incident.created", {"incident_id": incident_id})
+                        await _notify_incident_created(incident_id, server_id_str, rule["severity"], rule["name"])
 
                         success = await self.automation_service.execute_remediation(
                             server_id=server_id_str,
@@ -484,9 +524,9 @@ class AnalysisService:
                         # VERIFYING here would permanently block retries (Bug 2).
                         # Annotate the failure reason for operator visibility.
                         if not success:
-                            await db["incidents"].update_one(
+                            await db[Collections.INCIDENTS].update_one(
                                 {"_id": inc_result.inserted_id},
-                                {"$set": {"automation_failure_reason": "execution_failed"}},
+                                {"$set": {"automation_failure_reason": AutomationFailureReason.EXECUTION_FAILED.value}},
                             )
 
                         # Alert on all action levels, success or failure.
@@ -499,15 +539,15 @@ class AnalysisService:
                         incident_data = incident.model_dump()
                         incident_data["automation_skipped_reason"] = skipped_reason
                         incident_data["recurrence_streak"] = recurrence_streak
-                        inc_result = await db["incidents"].insert_one(incident_data)
+                        inc_result = await db[Collections.INCIDENTS].insert_one(incident_data)
                         incident_id = str(inc_result.inserted_id)
-                        await db["servers"].update_one(
+                        await db[Collections.SERVERS].update_one(
                             {"_id": ObjectId(server_id_str)},
                             {"$inc": {"open_incidents_count": 1}},
                         )
-                        event_bus.emit("servers", "server.updated", {"server_id": server_id_str})
+                        event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": server_id_str})
                         print(f"⚠️ Automation skipped ({skipped_reason}) for rule: {rule['name']}")
-                        event_bus.emit("incidents", "incident.created", {
+                        event_bus.emit(WSTopic.INCIDENTS, "incident.created", {
                             "incident_id": incident_id,
                             "server_id": server_id_str,
                             "severity": rule["severity"],
@@ -521,7 +561,8 @@ class AnalysisService:
                             "rule_name": rule["name"],
                             "action_level": 3,
                         })
-                        event_bus.emit("dashboard.summary", "incident.created", {"incident_id": incident_id})
+                        event_bus.emit(WSTopic.DASHBOARD_SUMMARY, "incident.created", {"incident_id": incident_id})
+                        await _notify_incident_created(incident_id, server_id_str, rule["severity"], rule["name"])
                         alert_payload.incident_id = incident_id
                         alert_payload.remediation_status = "skipped"
                         await self.notification_service.send_alert(alert_payload)
@@ -551,7 +592,7 @@ class AnalysisService:
 
         # 4. Bulk Save (for incidents that didn't run automation)
         if new_incidents:
-            inc_results = await db["incidents"].insert_many(new_incidents)
+            inc_results = await db[Collections.INCIDENTS].insert_many(new_incidents)
             print(f"💾 Saved {len(new_incidents)} new incidents.")
 
             # Increment open_incidents_count per server (one $inc per distinct server_id)
@@ -559,15 +600,15 @@ class AnalysisService:
             for inc_data in new_incidents:
                 _sid_counts[inc_data["server_id"]] = _sid_counts.get(inc_data["server_id"], 0) + 1
             for _sid_str, _delta in _sid_counts.items():
-                await db["servers"].update_one(
+                await db[Collections.SERVERS].update_one(
                     {"_id": ObjectId(_sid_str)},
                     {"$inc": {"open_incidents_count": _delta}},
                 )
-                event_bus.emit("servers", "server.updated", {"server_id": _sid_str})
+                event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": _sid_str})
 
             for i, inc_data in enumerate(new_incidents):
                 _sid = inc_data["server_id"]
-                event_bus.emit("incidents", "incident.created", {
+                event_bus.emit(WSTopic.INCIDENTS, "incident.created", {
                     "incident_id": str(inc_results.inserted_ids[i]),
                     "server_id": _sid,
                     "severity": inc_data.get("severity"),
@@ -581,7 +622,13 @@ class AnalysisService:
                     "rule_name": inc_data["description"].replace("Detected: ", ""),
                     "action_level": 3,
                 })
-            event_bus.emit("dashboard.summary", "incidents.bulk_created", {
+                await _notify_incident_created(
+                    str(inc_results.inserted_ids[i]),
+                    _sid,
+                    inc_data.get("severity"),
+                    inc_data["description"].replace("Detected: ", ""),
+                )
+            event_bus.emit(WSTopic.DASHBOARD_SUMMARY, "incidents.bulk_created", {
                 "count": len(new_incidents),
             })
 
@@ -612,7 +659,7 @@ class AnalysisService:
         db = get_database()
 
         # --- Build a name→id lookup from seeded scripts ---
-        scripts = await db["scripts"].find().to_list(length=100)
+        scripts = await db[Collections.SCRIPTS].find().to_list(length=100)
         script_lookup = {s["name"]: str(s["_id"]) for s in scripts}
 
         default_rules = [
@@ -774,12 +821,12 @@ class AnalysisService:
         # Only insert rules that don't already exist by name
         existing_names = {
             r["name"]
-            for r in await db["rules"].find({}, projection={"name": 1}).to_list(length=1000)
+            for r in await db[Collections.RULES].find({}, projection={"name": 1}).to_list(length=1000)
         }
         missing = [r for r in default_rules if r["name"] not in existing_names]
 
         if missing:
-            await db["rules"].insert_many(missing)
+            await db[Collections.RULES].insert_many(missing)
             linked_count = sum(1 for r in missing if r.get("remediation_script_id"))
             print(f"🌱 Seeded {len(missing)} missing rule(s) ({linked_count} linked to scripts)")
         else:

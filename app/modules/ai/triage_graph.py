@@ -10,6 +10,10 @@ Flow:
   4. parse_output   — extract structured fields + command suggestions from JSON block in response
   5. persist        — save to ai_analysis + create ai_command rows
 """
+from app.core.constants import (
+    Collections, WSEvent, WSTopic, AnalysisType, SourceType,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import json
 import re
 import time
@@ -29,6 +33,7 @@ from app.modules.ai.analysis_store import save_analysis
 from app.modules.ai.command_store import create_commands
 from app.modules.ai.context_builder import build_incident_context
 from app.modules.ai.tools_mutate import clear_pending_actions_for_source
+from app.modules.notifications.feed import notify
 
 
 TRIAGE_SYSTEM_PROMPT = """You are a Senior Security Operations Center (SOC) Analyst with deep expertise in threat detection, incident response, and infrastructure diagnostics. Your job is to produce a thorough, evidence-driven triage report that gives the on-call operator a complete picture of what happened, why it matters, and exactly what to do about it.
@@ -194,7 +199,7 @@ def _emit_ws(server_id: str, event_type: str, payload: dict):
     except Exception:
         pass
     try:
-        event_bus.emit("ai_actions", event_type, payload)
+        event_bus.emit(WSTopic.AI_ACTIONS, event_type, payload)
     except Exception:
         pass
 
@@ -214,7 +219,7 @@ async def run_triage(incident_id: str) -> dict:
     incident_doc: dict = {}
     detected_at: datetime = datetime.now(timezone.utc)
     try:
-        inc = await db["incidents"].find_one({"_id": ObjectId(incident_id)})
+        inc = await db[Collections.INCIDENTS].find_one({"_id": ObjectId(incident_id)})
         if inc:
             inc["_id"] = str(inc["_id"])
             incident_doc = inc
@@ -222,7 +227,7 @@ async def run_triage(incident_id: str) -> dict:
             if detected_at.tzinfo is None:
                 detected_at = detected_at.replace(tzinfo=timezone.utc)
             if inc.get("server_id"):
-                srv = await db["servers"].find_one({"_id": ObjectId(str(inc["server_id"]))})
+                srv = await db[Collections.SERVERS].find_one({"_id": ObjectId(str(inc["server_id"]))})
                 if srv:
                     srv["_id"] = str(srv["_id"])
                     server = srv
@@ -242,7 +247,7 @@ async def run_triage(incident_id: str) -> dict:
     except Exception as e:
         print(f"[triage] clear_pending_actions failed for incident {incident_id}: {e}")
 
-    tools = bind_tools_for_server(server, run_id, source_type="incident", source_id=incident_id)
+    tools = bind_tools_for_server(server, run_id, source_type=SourceType.INCIDENT, source_id=incident_id)
     model = get_chat_model()
     server_id = server.get("_id", "")
 
@@ -277,7 +282,7 @@ async def run_triage(incident_id: str) -> dict:
     # from on_chat_model_end so the analysis isn't silently empty.
     buffer_size_at_turn_start = 0
 
-    _emit_ws(server_id, "ai_analysis_token", {
+    _emit_ws(server_id, WSEvent.AI_ANALYSIS_TOKEN, {
         "run_id": run_id, "source_type": "incident", "source_id": incident_id, "token": ""
     })
 
@@ -306,7 +311,7 @@ async def run_triage(incident_id: str) -> dict:
                             token_text = ""
                 if token_text:
                     stream_buffer.append(token_text)
-                    _emit_ws(server_id, "ai_analysis_token", {
+                    _emit_ws(server_id, WSEvent.AI_ANALYSIS_TOKEN, {
                         "run_id": run_id,
                         "source_type": "incident",
                         "source_id": incident_id,
@@ -337,7 +342,7 @@ async def run_triage(incident_id: str) -> dict:
                             except Exception:
                                 output_content = ""
                     if output_content:
-                        _emit_ws(server_id, "ai_analysis_token", {
+                        _emit_ws(server_id, WSEvent.AI_ANALYSIS_TOKEN, {
                             "run_id": run_id,
                             "source_type": "incident",
                             "source_id": incident_id,
@@ -349,7 +354,7 @@ async def run_triage(incident_id: str) -> dict:
                 if stream_buffer and not stream_buffer[-1].endswith("\n\n"):
                     separator = "\n\n"
                     stream_buffer.append(separator)
-                    _emit_ws(server_id, "ai_analysis_token", {
+                    _emit_ws(server_id, WSEvent.AI_ANALYSIS_TOKEN, {
                         "run_id": run_id,
                         "source_type": "incident",
                         "source_id": incident_id,
@@ -385,13 +390,24 @@ async def run_triage(incident_id: str) -> dict:
     # — surface the failure to the caller so the router returns 503 instead of
     # silently saving an empty analysis row.
     if not final_messages and not stream_buffer:
-        _emit_ws(server_id, "ai_analysis_complete", {
+        _emit_ws(server_id, WSEvent.AI_ANALYSIS_COMPLETE, {
             "run_id": run_id,
             "source_type": "incident",
             "source_id": incident_id,
             "analysis_id": None,
             "error": "agent_produced_no_output",
         })
+        await notify(
+            type=NotificationType.AI_ANALYSIS_FAILED,
+            category=NotificationCategory.AI,
+            severity=NotificationSeverity.ERROR,
+            title="Incident triage failed",
+            body="The AI agent produced no output. Please try running the analysis again.",
+            link=f"/incidents/{incident_id}",
+            server_id=server_id,
+            entity_type="incident",
+            entity_id=incident_id,
+        )
         raise RuntimeError(
             f"Triage agent produced no output for incident {incident_id} "
             f"(run {run_id}, elapsed {elapsed:.2f}s). Check the [triage] log lines above "
@@ -459,8 +475,8 @@ async def run_triage(incident_id: str) -> dict:
     # 6. Persist
     analysis_id = await save_analysis(
         run_id=run_id,
-        analysis_type="incident_triage",
-        source_type="incident",
+        analysis_type=AnalysisType.INCIDENT_TRIAGE,
+        source_type=SourceType.INCIDENT,
         source_id=incident_id,
         server_id=server_id,
         summary=summary,
@@ -476,25 +492,39 @@ async def run_triage(incident_id: str) -> dict:
     command_ids = await create_commands(
         analysis_id=analysis_id,
         run_id=run_id,
-        source_type="incident",
+        source_type=SourceType.INCIDENT,
         source_id=incident_id,
         server_id=server_id,
         suggestions=suggestions,
     )
 
     if command_ids:
-        await db["ai_analysis"].update_one(
+        await db[Collections.AI_ANALYSIS].update_one(
             {"_id": ObjectId(analysis_id)},
             {"$set": {"structured.suggested_command_ids": command_ids}},
         )
 
     # Emit completion signal
-    _emit_ws(server_id, "ai_analysis_complete", {
+    _emit_ws(server_id, WSEvent.AI_ANALYSIS_COMPLETE, {
         "run_id": run_id,
         "source_type": "incident",
         "source_id": incident_id,
         "analysis_id": analysis_id,
     })
+
+    # In-app notification: the headline case — finished while the operator may
+    # have navigated away; clicking it deep-links back to the incident.
+    await notify(
+        type=NotificationType.AI_ANALYSIS_READY,
+        category=NotificationCategory.AI,
+        severity=NotificationSeverity.SUCCESS,
+        title="Incident triage ready",
+        body=(summary or "AI analysis complete.")[:160],
+        link=f"/incidents/{incident_id}",
+        server_id=server_id,
+        entity_type="incident",
+        entity_id=incident_id,
+    )
 
     return {
         "analysis_id": analysis_id,

@@ -25,6 +25,8 @@ ALLOWED_TOPICS: set[str] = {
     "ai_actions",
     # Phase 28.7 — app-wide AI overview stream (dashboard)
     "app.ai",
+    # Phase 29 — in-app notification feed (global for v1; per-recipient split lands with auth)
+    "notifications",
     # Note: "servers.metrics" and "servers.logs" removed — replaced by
     # per-server topics validated by _SERVER_TOPIC_RE below.
 }

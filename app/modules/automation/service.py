@@ -1,7 +1,12 @@
+from app.core.constants import (
+    Collections, WSTopic,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import asyncio
 import re
 import shlex
 from app.core.database import get_database
+from app.modules.notifications.feed import notify
 from app.core.executors import DEFAULT_COMMAND_TIMEOUT_S
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB, AutomationLog
 from app.core.executors import get_server_executor
@@ -72,14 +77,14 @@ class AutomationService:
         new_script["created_at"] = datetime.now(timezone.utc)
         new_script["updated_at"] = datetime.now(timezone.utc)
 
-        result = await db["scripts"].insert_one(new_script)
-        event_bus.emit("scripts", "script.created", {"script_id": str(result.inserted_id)})
+        result = await db[Collections.SCRIPTS].insert_one(new_script)
+        event_bus.emit(WSTopic.SCRIPTS, "script.created", {"script_id": str(result.inserted_id)})
         return str(result.inserted_id)
 
     async def get_script(self, script_id: str):
         db = get_database()
         try:
-            return await db["scripts"].find_one({"_id": ObjectId(script_id)})
+            return await db[Collections.SCRIPTS].find_one({"_id": ObjectId(script_id)})
         except Exception:
             return None
 
@@ -126,7 +131,7 @@ class AutomationService:
             oid = ObjectId(automation_log_id)
         except Exception:
             return None
-        run = await db["automation_logs"].find_one({"_id": oid})
+        run = await db[Collections.AUTOMATION_LOGS].find_one({"_id": oid})
         if not run:
             return None
 
@@ -135,7 +140,7 @@ class AutomationService:
         server_id = run.get("server_id", "")
         if server_id:
             try:
-                srv = await db["servers"].find_one(
+                srv = await db[Collections.SERVERS].find_one(
                     {"_id": ObjectId(server_id)}, {"hostname": 1}
                 )
             except Exception:
@@ -147,7 +152,7 @@ class AutomationService:
         script_id = run.get("script_id", "")
         if script_id:
             try:
-                scr = await db["scripts"].find_one(
+                scr = await db[Collections.SCRIPTS].find_one(
                     {"_id": ObjectId(script_id)}, {"name": 1}
                 )
             except Exception:
@@ -179,7 +184,7 @@ class AutomationService:
         query = self._build_history_filter(status, server_id, script_id, from_date, to_date)
 
         cursor = (
-            db["automation_logs"]
+            db[Collections.AUTOMATION_LOGS]
             .find(query)
             .sort("executed_at", -1)
             .skip(skip)
@@ -201,7 +206,7 @@ class AutomationService:
 
         servers_map = {}
         if server_oids:
-            server_docs = await db["servers"].find(
+            server_docs = await db[Collections.SERVERS].find(
                 {"_id": {"$in": server_oids}},
                 {"hostname": 1},
             ).to_list(length=len(server_oids))
@@ -218,7 +223,7 @@ class AutomationService:
 
         scripts_map = {}
         if script_oids:
-            script_docs = await db["scripts"].find(
+            script_docs = await db[Collections.SCRIPTS].find(
                 {"_id": {"$in": script_oids}},
                 {"name": 1},
             ).to_list(length=len(script_oids))
@@ -265,7 +270,7 @@ class AutomationService:
                 }
             },
         ]
-        agg = await db["automation_logs"].aggregate(pipeline).to_list(length=1)
+        agg = await db[Collections.AUTOMATION_LOGS].aggregate(pipeline).to_list(length=1)
 
         if agg:
             r = agg[0]
@@ -278,7 +283,7 @@ class AutomationService:
         # Separate count for the last 24h (same filters)
         since_24h = datetime.now(timezone.utc) - timedelta(hours=24)
         last_24h_query = {**query, "executed_at": {"$gte": since_24h}}
-        last_24h = await db["automation_logs"].count_documents(last_24h_query)
+        last_24h = await db[Collections.AUTOMATION_LOGS].count_documents(last_24h_query)
 
         return {
             "total": total,
@@ -345,12 +350,12 @@ class AutomationService:
             print(f"❌ Script {script_id} not found!")
             return False
 
-        server = await db["servers"].find_one({"_id": ObjectId(server_id)})
+        server = await db[Collections.SERVERS].find_one({"_id": ObjectId(server_id)})
         if not server:
             return False
 
         # 2. Prepare Credentials & Executor
-        cred = await db["credentials"].find_one(
+        cred = await db[Collections.CREDENTIALS].find_one(
             {"_id": ObjectId(server["credential_id"])}
         )
         plain_secret = decrypt_password(cred["encrypted_secret"])
@@ -381,7 +386,7 @@ class AutomationService:
             command = self._substitute_variables(command, variables or {}, language)
         except ValueError as exc:
             print(f"🚫 Remediation aborted — unsafe placeholder value: {exc}")
-            await db["incidents"].update_one(
+            await db[Collections.INCIDENTS].update_one(
                 {"_id": ObjectId(incident_id)},
                 {"$set": {
                     "automation_failure_reason": f"unsafe_placeholder: {exc}",
@@ -389,7 +394,7 @@ class AutomationService:
                     "verification_until": None,
                 }},
             )
-            event_bus.emit("incidents", "incident.updated", {
+            event_bus.emit(WSTopic.INCIDENTS, "incident.updated", {
                 "incident_id": incident_id,
                 "server_id": server_id,
                 "reason": "unsafe_placeholder",
@@ -399,6 +404,17 @@ class AutomationService:
                 "server_id": server_id,
                 "reason": "unsafe_placeholder",
             })
+            await notify(
+                type=NotificationType.REMEDIATION_FAILED,
+                category=NotificationCategory.AUTOMATION,
+                severity=NotificationSeverity.ERROR,
+                title="Remediation blocked",
+                body=f"'{script_doc.get('name', 'script')}' was aborted — an unsafe placeholder value was rejected.",
+                link=f"/incidents/{incident_id}",
+                server_id=server_id,
+                entity_type="incident",
+                entity_id=incident_id,
+            )
             return False
 
         print(f"📝 Resolved Command: {command}")
@@ -423,9 +439,9 @@ class AutomationService:
             output=output,
             error=error,
         )
-        log_result = await db["automation_logs"].insert_one(audit_log.model_dump())
+        log_result = await db[Collections.AUTOMATION_LOGS].insert_one(audit_log.model_dump())
 
-        event_bus.emit("automation.history", "remediation.executed", {
+        event_bus.emit(WSTopic.AUTOMATION_HISTORY, "remediation.executed", {
             "log_id": str(log_result.inserted_id),
             "script_id": script_id,
             "server_id": server_id,
@@ -439,6 +455,38 @@ class AutomationService:
             "incident_id": incident_id,
             "status": status,
         })
+
+        # In-app notification for EVERY remediation run — success or failure
+        # (including each retry attempt, since every retry re-enters this method).
+        # The definitive give-up is still announced separately at "remediation
+        # exhausted" (analysis/service.py).
+        _script_name = script_doc.get("name", "script")
+        if status == "success":
+            await notify(
+                type=NotificationType.REMEDIATION_SUCCEEDED,
+                category=NotificationCategory.AUTOMATION,
+                severity=NotificationSeverity.SUCCESS,
+                title="Remediation executed",
+                body=f"'{_script_name}' ran successfully.",
+                link=f"/automation/history/{log_result.inserted_id}",
+                server_id=server_id,
+                entity_type="automation_log",
+                entity_id=str(log_result.inserted_id),
+            )
+        else:
+            _err = (error or output or "").strip()
+            _body = f"'{_script_name}' failed" + (f": {_err}" if _err else ".")
+            await notify(
+                type=NotificationType.REMEDIATION_FAILED,
+                category=NotificationCategory.AUTOMATION,
+                severity=NotificationSeverity.ERROR,
+                title="Remediation failed",
+                body=_body[:160],
+                link=f"/automation/history/{log_result.inserted_id}",
+                server_id=server_id,
+                entity_type="automation_log",
+                entity_id=str(log_result.inserted_id),
+            )
 
         # Phase 28.4 — Fire-and-forget AI review on the executed run. The script
         # has already completed and been audited; the review runs after a

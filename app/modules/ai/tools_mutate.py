@@ -8,6 +8,7 @@ wraps them according to the server's ai_autonomy_level:
   suggest   → tools write a pending action to `ai_actions`; no execution
               (operator approves/rejects on the AI Actions page)
 """
+from app.core.constants import Collections, WSTopic, ActionType
 import json
 from typing import Optional
 
@@ -33,7 +34,7 @@ async def _execute_promote_anomaly(observation_id: str) -> dict:
         oid = ObjectId(observation_id)
     except Exception:
         return {"executed": False, "error": "Invalid observation_id"}
-    obs = await db["log_observations"].find_one({"_id": oid}, {"server_id": 1})
+    obs = await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid}, {"server_id": 1})
     server_id = str(obs["server_id"]) if obs else ""
     incident_id = await AnomaliesService().maybe_auto_promote(observation_id, server_id, force=True)
     return {
@@ -51,7 +52,7 @@ async def _execute_mark_incident_false_positive(incident_id: str, reason: str) -
         oid = ObjectId(incident_id)
     except Exception:
         return {"executed": False, "error": "Invalid incident_id"}
-    result = await db["incidents"].update_one(
+    result = await db[Collections.INCIDENTS].update_one(
         {"_id": oid, "status": {"$nin": ["false_positive", "resolved"]}},
         {"$set": {"status": "false_positive", "ai_false_positive_reason": reason, "updated_at": utc_now()}},
     )
@@ -76,7 +77,7 @@ async def _execute_disable_script_for_server(server_id: str, script_id: str, rea
         oid = ObjectId(script_id)
     except Exception:
         return {"executed": False, "error": "Invalid script_id"}
-    result = await db["scripts"].update_one(
+    result = await db[Collections.SCRIPTS].update_one(
         {"_id": oid},
         {
             "$addToSet": {"disabled_for_servers": server_id},
@@ -104,7 +105,7 @@ async def _execute_disable_rule_for_server(server_id: str, rule_id: str, reason:
         oid = ObjectId(rule_id)
     except Exception:
         return {"executed": False, "error": "Invalid rule_id"}
-    result = await db["rules"].update_one(
+    result = await db[Collections.RULES].update_one(
         {"_id": oid},
         {
             "$addToSet": {"disabled_for_servers": server_id},
@@ -163,7 +164,7 @@ async def _execute_suggest_manual_remediation(
         "incident_id": incident_id,
         "created_at": utc_now(),
     }
-    result = await db["incidents"].update_one(
+    result = await db[Collections.INCIDENTS].update_one(
         {"_id": oid},
         {"$set": {
             "ai_remediation_manual_commands": manual_commands,
@@ -178,7 +179,7 @@ async def _execute_suggest_manual_remediation(
     # source of truth — this is purely a UX-side cache.
     if automation_log_id:
         try:
-            await db["automation_logs"].update_one(
+            await db[Collections.AUTOMATION_LOGS].update_one(
                 {"_id": ObjectId(automation_log_id)},
                 {"$set": {
                     "ai_remediation_manual_commands": manual_commands,
@@ -222,7 +223,7 @@ async def _auto_flip_to_both(server_id: str, mode_field: str) -> bool:
         srv_oid = ObjectId(server_id)
     except Exception:
         return False
-    result = await db["servers"].update_one(
+    result = await db[Collections.SERVERS].update_one(
         {"_id": srv_oid, mode_field: "global"},
         {"$set": {mode_field: "both", "updated_at": utc_now()}},
     )
@@ -255,7 +256,7 @@ async def _execute_create_server_rule(
         srv_oid = ObjectId(server_id)
     except Exception:
         return {"executed": False, "error": "Invalid server_id"}
-    if not await db["servers"].find_one({"_id": srv_oid}, {"_id": 1}):
+    if not await db[Collections.SERVERS].find_one({"_id": srv_oid}, {"_id": 1}):
         return {"executed": False, "error": f"Server {server_id} not found"}
 
     now = utc_now()
@@ -276,7 +277,7 @@ async def _execute_create_server_rule(
         "created_at": now,
         "updated_at": None,
     }
-    result = await db["rules"].insert_one(rule_doc)
+    result = await db[Collections.RULES].insert_one(rule_doc)
     rule_id = str(result.inserted_id)
 
     # Bust the global rule cache so the new rule is picked up on the next tick.
@@ -288,7 +289,7 @@ async def _execute_create_server_rule(
 
     auto_flipped = await _auto_flip_to_both(server_id, "rule_library_mode")
 
-    event_bus.emit("rules", "rule.created", {"rule_id": rule_id})
+    event_bus.emit(WSTopic.RULES, "rule.created", {"rule_id": rule_id})
     event_bus.emit(f"servers.{server_id}.rules", "rule.created", {"rule_id": rule_id})
 
     return {
@@ -321,7 +322,7 @@ async def _execute_create_server_script(
         srv_oid = ObjectId(server_id)
     except Exception:
         return {"executed": False, "error": "Invalid server_id"}
-    if not await db["servers"].find_one({"_id": srv_oid}, {"_id": 1}):
+    if not await db[Collections.SERVERS].find_one({"_id": srv_oid}, {"_id": 1}):
         return {"executed": False, "error": f"Server {server_id} not found"}
 
     now = utc_now()
@@ -339,12 +340,12 @@ async def _execute_create_server_script(
         "created_at": now,
         "updated_at": now,
     }
-    result = await db["scripts"].insert_one(script_doc)
+    result = await db[Collections.SCRIPTS].insert_one(script_doc)
     script_id = str(result.inserted_id)
 
     auto_flipped = await _auto_flip_to_both(server_id, "script_library_mode")
 
-    event_bus.emit("scripts", "script.created", {"script_id": script_id})
+    event_bus.emit(WSTopic.SCRIPTS, "script.created", {"script_id": script_id})
     event_bus.emit(f"servers.{server_id}.scripts", "script.created", {"script_id": script_id})
 
     return {
@@ -382,10 +383,10 @@ async def _execute_swap_remediation_script(
         r_oid = ObjectId(rule_id)
     except Exception:
         return {"executed": False, "error": "Invalid id"}
-    server = await db["servers"].find_one({"_id": srv_oid})
+    server = await db[Collections.SERVERS].find_one({"_id": srv_oid})
     if not server:
         return {"executed": False, "error": f"Server {server_id} not found"}
-    rule = await db["rules"].find_one({"_id": r_oid})
+    rule = await db[Collections.RULES].find_one({"_id": r_oid})
     if not rule:
         return {"executed": False, "error": f"Rule {rule_id} not found"}
 
@@ -398,7 +399,7 @@ async def _execute_swap_remediation_script(
         return {"executed": False, "error": "Rule has no remediation script to swap"}
 
     try:
-        current = await db["scripts"].find_one({"_id": ObjectId(current_script_id)})
+        current = await db[Collections.SCRIPTS].find_one({"_id": ObjectId(current_script_id)})
     except Exception:
         current = None
     if not current:
@@ -463,7 +464,7 @@ async def _execute_create_server_rule_with_script(
         srv_oid = ObjectId(server_id)
     except Exception:
         return {"executed": False, "error": "Invalid server_id"}
-    if not await db["servers"].find_one({"_id": srv_oid}, {"_id": 1}):
+    if not await db[Collections.SERVERS].find_one({"_id": srv_oid}, {"_id": 1}):
         return {"executed": False, "error": f"Server {server_id} not found"}
 
     now = utc_now()
@@ -484,7 +485,7 @@ async def _execute_create_server_rule_with_script(
         "created_at": now,
         "updated_at": now,
     }
-    script_result = await db["scripts"].insert_one(script_doc)
+    script_result = await db[Collections.SCRIPTS].insert_one(script_doc)
     script_id = str(script_result.inserted_id)
 
     # 2. Insert the rule pointing at the just-created script. On failure, roll
@@ -507,11 +508,11 @@ async def _execute_create_server_rule_with_script(
         "updated_at": None,
     }
     try:
-        rule_result = await db["rules"].insert_one(rule_doc)
+        rule_result = await db[Collections.RULES].insert_one(rule_doc)
         rule_id = str(rule_result.inserted_id)
     except Exception as exc:
         try:
-            await db["scripts"].delete_one({"_id": script_result.inserted_id})
+            await db[Collections.SCRIPTS].delete_one({"_id": script_result.inserted_id})
         except Exception:
             pass
         return {"executed": False, "error": f"Rule insert failed, script rolled back: {exc}"}
@@ -528,9 +529,9 @@ async def _execute_create_server_rule_with_script(
     auto_flipped_rule = await _auto_flip_to_both(server_id, "rule_library_mode")
 
     # 5. Emit for both surfaces.
-    event_bus.emit("scripts", "script.created", {"script_id": script_id})
+    event_bus.emit(WSTopic.SCRIPTS, "script.created", {"script_id": script_id})
     event_bus.emit(f"servers.{server_id}.scripts", "script.created", {"script_id": script_id})
-    event_bus.emit("rules", "rule.created", {"rule_id": rule_id})
+    event_bus.emit(WSTopic.RULES, "rule.created", {"rule_id": rule_id})
     event_bus.emit(f"servers.{server_id}.rules", "rule.created", {"rule_id": rule_id})
 
     return {
@@ -560,7 +561,7 @@ async def clear_pending_actions_for_source(source_type: str, source_id: str) -> 
     if not source_id:
         return 0
     db = get_database()
-    result = await db["ai_actions"].delete_many({
+    result = await db[Collections.AI_ACTIONS].delete_many({
         "source_type": source_type,
         "source_id": source_id,
         "status": "pending",
@@ -592,7 +593,7 @@ async def _queue_action(
         "decided_at": None,
         "decided_by": None,
     }
-    result = await db["ai_actions"].insert_one(doc)
+    result = await db[Collections.AI_ACTIONS].insert_one(doc)
     return str(result.inserted_id)
 
 
@@ -619,7 +620,7 @@ def make_dismiss_anomaly_tool(
             Provide the observation_id and a brief one-line reason.
             """
             action_id = await _queue_action(
-                action_type="dismiss_anomaly",
+                action_type=ActionType.DISMISS_ANOMALY.value,
                 payload={"observation_id": observation_id, "reason": reason},
                 run_id=run_id,
                 source_type=source_type,
@@ -646,7 +647,7 @@ def make_promote_anomaly_tool(
             threat that warrants the full incident workflow (alerts, automation).
             """
             action_id = await _queue_action(
-                action_type="promote_anomaly",
+                action_type=ActionType.PROMOTE_ANOMALY.value,
                 payload={"observation_id": observation_id},
                 run_id=run_id,
                 source_type=source_type,
@@ -674,7 +675,7 @@ def make_mark_false_positive_tool(
             Provide a short one-line reason explaining why.
             """
             action_id = await _queue_action(
-                action_type="mark_incident_false_positive",
+                action_type=ActionType.MARK_INCIDENT_FALSE_POSITIVE.value,
                 payload={"incident_id": incident_id, "reason": reason},
                 run_id=run_id,
                 source_type=source_type,

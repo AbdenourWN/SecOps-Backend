@@ -1,3 +1,4 @@
+from app.core.constants import Collections
 from app.core.database import get_database
 from app.core.elasticsearch import get_elasticsearch
 from app.core.events import event_bus
@@ -85,7 +86,7 @@ class MetricService:
             # Cache the snapshot on the server document so the server list
             # can display current metrics without querying Elasticsearch.
             db = get_database()
-            await db["servers"].update_one(
+            await db[Collections.SERVERS].update_one(
                 {"_id": ObjectId(server_id)},
                 {"$set": {"last_metrics": {
                     "cpu_usage": metric_doc["cpu_usage"],
@@ -114,10 +115,10 @@ class MetricService:
             s_oid = ObjectId(server_id)
         except Exception:
             return False
-        server = await db["servers"].find_one({"_id": s_oid})
+        server = await db[Collections.SERVERS].find_one({"_id": s_oid})
         if not server:
             return False
-        cred = await db["credentials"].find_one({"_id": ObjectId(server["credential_id"])})
+        cred = await db[Collections.CREDENTIALS].find_one({"_id": ObjectId(server["credential_id"])})
         if not cred:
             return False
         plain_secret = decrypt_password(cred["encrypted_secret"])

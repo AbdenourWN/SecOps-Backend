@@ -1,3 +1,4 @@
+from app.core.constants import Collections, WSTopic
 from app.core.database import get_database
 from app.modules.incidents.schemas import IncidentStatus
 from app.core.events import event_bus
@@ -53,10 +54,10 @@ class IncidentService:
         if date_range:
             query["detected_at"] = date_range
 
-        total = await db["incidents"].count_documents(query)
+        total = await db[Collections.INCIDENTS].count_documents(query)
         skip = (page - 1) * page_size
         cursor = (
-            db["incidents"]
+            db[Collections.INCIDENTS]
             .find(query)
             .sort("detected_at", -1)
             .skip(skip)
@@ -77,7 +78,7 @@ class IncidentService:
         except Exception:
             return None
 
-        incident = await db["incidents"].find_one({"_id": oid})
+        incident = await db[Collections.INCIDENTS].find_one({"_id": oid})
         if not incident:
             return None
 
@@ -86,7 +87,7 @@ class IncidentService:
         server_id = incident.get("server_id")
         if server_id:
             try:
-                srv = await db["servers"].find_one(
+                srv = await db[Collections.SERVERS].find_one(
                     {"_id": ObjectId(server_id)}, {"hostname": 1}
                 )
                 incident["server_hostname"] = srv.get("hostname", "") if srv else ""
@@ -98,7 +99,7 @@ class IncidentService:
         # without a second round-trip. Cheap query: `automation_logs` is indexed by
         # incident_id implicitly via the natural insert order; we just need newest.
         try:
-            latest = await db["automation_logs"].find_one(
+            latest = await db[Collections.AUTOMATION_LOGS].find_one(
                 {"incident_id": incident_id},
                 sort=[("executed_at", -1)],
             )
@@ -107,7 +108,7 @@ class IncidentService:
                 script_id = latest.get("script_id")
                 if script_id:
                     try:
-                        s_doc = await db["scripts"].find_one(
+                        s_doc = await db[Collections.SCRIPTS].find_one(
                             {"_id": ObjectId(script_id)}, {"name": 1}
                         )
                         script_name = (s_doc or {}).get("name")
@@ -139,7 +140,7 @@ class IncidentService:
             return {"status": "failed", "error": "Invalid Incident ID"}
 
         # Check it exists
-        incident = await db["incidents"].find_one({"_id": oid})
+        incident = await db[Collections.INCIDENTS].find_one({"_id": oid})
         if not incident:
             return {"status": "failed", "error": "Incident not found"}
 
@@ -150,7 +151,7 @@ class IncidentService:
         if new_status in [IncidentStatus.RESOLVED, IncidentStatus.FALSE_POSITIVE]:
             update_fields["resolved_at"] = datetime.now(timezone.utc)
 
-        await db["incidents"].update_one({"_id": oid}, {"$set": update_fields})
+        await db[Collections.INCIDENTS].update_one({"_id": oid}, {"$set": update_fields})
 
         # Adjust server open_incidents_count based on active→terminal or terminal→active
         old_status = incident.get("status")
@@ -160,20 +161,20 @@ class IncidentService:
             was_active = old_status in _ACTIVE_STATUSES
             now_active = new_status_val in _ACTIVE_STATUSES
             if was_active and not now_active:
-                await db["servers"].update_one(
+                await db[Collections.SERVERS].update_one(
                     {"_id": ObjectId(server_id)},
                     {"$inc": {"open_incidents_count": -1}},
                 )
             elif not was_active and now_active:
-                await db["servers"].update_one(
+                await db[Collections.SERVERS].update_one(
                     {"_id": ObjectId(server_id)},
                     {"$inc": {"open_incidents_count": 1}},
                 )
             if was_active != now_active:
-                event_bus.emit("servers", "server.updated", {"server_id": server_id})
+                event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": server_id})
 
         # Return updated document
-        updated = await db["incidents"].find_one({"_id": oid})
+        updated = await db[Collections.INCIDENTS].find_one({"_id": oid})
         updated["_id"] = str(updated["_id"])
         return {"status": "success", "incident": updated}
 
@@ -220,7 +221,7 @@ class IncidentService:
             }
         ]
 
-        result = await db["incidents"].aggregate(pipeline).to_list(length=1)
+        result = await db[Collections.INCIDENTS].aggregate(pipeline).to_list(length=1)
 
         if not result:
             return {

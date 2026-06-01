@@ -1,3 +1,4 @@
+from app.core.constants import Collections
 from motor.motor_asyncio import AsyncIOMotorClient
 from app.core.config import settings 
 from pymongo import ASCENDING, DESCENDING
@@ -29,17 +30,17 @@ async def connect_to_mongo():
         database = db.client[DB_NAME]
         
         # 1. Servers: Ensure IPs are unique so we don't add the same server twice
-        await database["servers"].create_index([("ip_address", ASCENDING)], unique=True)
+        await database[Collections.SERVERS].create_index([("ip_address", ASCENDING)], unique=True)
         
         # 2. Logs: We query by Server ID and sort by Timestamp often
         # Compound Index: Finds server first, then sorts by time. Extremely fast.
-        await database["logs"].create_index([
+        await database[Collections.LOGS].create_index([
             ("server_id", ASCENDING), 
             ("timestamp", DESCENDING)
         ])
         
         # 3. Metrics: Same as logs, we need history for charts
-        await database["metrics"].create_index([
+        await database[Collections.METRICS].create_index([
             ("server_id", ASCENDING),
             ("timestamp", DESCENDING)
         ])

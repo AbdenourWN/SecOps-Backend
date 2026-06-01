@@ -22,6 +22,7 @@ Design rules (per pool):
 """
 from __future__ import annotations
 
+from app.core.constants import Collections
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -155,7 +156,7 @@ class ConnectionPool:
         """
         db = get_database()
         try:
-            server = await db["servers"].find_one(
+            server = await db[Collections.SERVERS].find_one(
                 {"_id": ObjectId(server_id)},
                 projection={"credential_id": 1},
             )
@@ -172,11 +173,11 @@ class ConnectionPool:
         except Exception:
             raise ValueError(f"Invalid server ID: {server_id}")
 
-        server = await db["servers"].find_one({"_id": s_oid})
+        server = await db[Collections.SERVERS].find_one({"_id": s_oid})
         if not server:
             raise ValueError(f"Server not found: {server_id}")
 
-        cred = await db["credentials"].find_one({"_id": ObjectId(server["credential_id"])})
+        cred = await db[Collections.CREDENTIALS].find_one({"_id": ObjectId(server["credential_id"])})
         if not cred:
             raise ValueError(f"Credential not found for server: {server_id}")
 

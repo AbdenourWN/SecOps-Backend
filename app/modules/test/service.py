@@ -1,3 +1,4 @@
+from app.core.constants import Collections
 from app.core.database import get_database
 from app.core.executors import get_server_executor, DEFAULT_COMMAND_TIMEOUT_S
 from app.core.security import decrypt_password
@@ -195,7 +196,7 @@ class SimulationService:
     async def _get_server_executor(self, server):
         """Helper: builds executor for a server with credentials."""
         db = get_database()
-        cred = await db["credentials"].find_one(
+        cred = await db[Collections.CREDENTIALS].find_one(
             {"_id": ObjectId(server["credential_id"])}
         )
         if not cred:
@@ -229,14 +230,14 @@ class SimulationService:
 
         if server_id:
             try:
-                server = await db["servers"].find_one({"_id": ObjectId(server_id)})
+                server = await db[Collections.SERVERS].find_one({"_id": ObjectId(server_id)})
             except Exception:
                 return {"status": "failed", "error": "Invalid server ID"}
             if not server:
                 return {"status": "failed", "error": "Server not found"}
             servers = [server]
         else:
-            servers = await db["servers"].find().to_list(length=100)
+            servers = await db[Collections.SERVERS].find().to_list(length=100)
 
         if not servers:
             return {"status": "failed", "error": "No servers registered"}
@@ -310,14 +311,14 @@ class SimulationService:
 
         if server_id:
             try:
-                server = await db["servers"].find_one({"_id": ObjectId(server_id)})
+                server = await db[Collections.SERVERS].find_one({"_id": ObjectId(server_id)})
             except Exception:
                 return {"status": "failed", "error": "Invalid server ID"}
             if not server:
                 return {"status": "failed", "error": "Server not found"}
             servers = [server]
         else:
-            servers = await db["servers"].find().to_list(length=100)
+            servers = await db[Collections.SERVERS].find().to_list(length=100)
 
         if not servers:
             return {"status": "failed", "error": "No servers registered"}
@@ -375,14 +376,14 @@ class SimulationService:
                     continue
 
                 # Register or update the LogSource with the correct parser_type
-                existing = await db["log_sources"].find_one({
+                existing = await db[Collections.LOG_SOURCES].find_one({
                     "server_id": sid,
                     "file_path": test_file,
                 })
 
                 # Always delete and recreate so offset, inode and error_count are clean
                 if existing:
-                    await db["log_sources"].delete_one({"_id": existing["_id"]})
+                    await db[Collections.LOG_SOURCES].delete_one({"_id": existing["_id"]})
 
                 log_source = {
                     "server_id": sid,
@@ -396,7 +397,7 @@ class SimulationService:
                     "is_active": True,
                     "created_at": now,
                 }
-                await db["log_sources"].insert_one(log_source)
+                await db[Collections.LOG_SOURCES].insert_one(log_source)
                 source_status = "replaced" if existing else "created"
 
                 server_result["sources"].append({

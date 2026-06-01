@@ -11,6 +11,7 @@ Four heuristics:
 
 from __future__ import annotations
 
+from app.core.constants import Collections
 import hashlib
 import os
 import re
@@ -206,7 +207,7 @@ class HeuristicService:
         # We need to know whether this was a brand-new doc → use the Mongo
         # "upserted" return value rather than a separate find first.
         now = datetime.now(timezone.utc)
-        result = await db["server_log_patterns"].update_one(
+        result = await db[Collections.SERVER_LOG_PATTERNS].update_one(
             {"server_id": server_id, "pattern_hash": h},
             {
                 "$setOnInsert": {
@@ -294,7 +295,7 @@ class HeuristicService:
         #    baseline upward and mask future spikes.
         weight = self.EMA_ALPHA if spike is None else (self.EMA_ALPHA / 5)
         new_baseline = (1 - weight) * baseline + weight * current
-        await db["servers"].update_one(
+        await db[Collections.SERVERS].update_one(
             {"_id": ObjectId(server_id)},
             {
                 "$set": {

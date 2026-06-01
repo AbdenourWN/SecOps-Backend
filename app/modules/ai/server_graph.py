@@ -26,6 +26,10 @@ The output JSON shape (last ```json``` block in the model output):
     "confidence": 0.0-1.0
   }
 """
+from app.core.constants import (
+    Collections, WSEvent, WSTopic, AnalysisType, SourceType,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import json
 import re
 import time
@@ -44,6 +48,7 @@ from app.modules.ai.llm import get_chat_model
 from app.modules.ai.analysis_store import save_analysis
 from app.modules.ai.context_builder import build_server_context
 from app.modules.ai.tools_read import ALL_READ_TOOLS
+from app.modules.notifications.feed import notify
 
 
 SERVER_OVERVIEW_SYSTEM_PROMPT = """You are a Senior Site Reliability + Security Operations engineer producing a holistic health & risk overview for a single server. Your output is for the on-call operator who has just opened the AI Overview tab for that server and wants to know: what's been happening, is anything degrading, is anything suspicious, and what should I check or do next.
@@ -221,7 +226,7 @@ def _emit_ws(server_id: str, event_type: str, payload: dict):
     except Exception:
         pass
     try:
-        event_bus.emit("ai_actions", event_type, payload)
+        event_bus.emit(WSTopic.AI_ACTIONS, event_type, payload)
     except Exception:
         pass
 
@@ -239,7 +244,7 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
 
     server: dict = {}
     try:
-        srv = await db["servers"].find_one({"_id": ObjectId(server_id)})
+        srv = await db[Collections.SERVERS].find_one({"_id": ObjectId(server_id)})
         if srv:
             srv["_id"] = str(srv["_id"])
             server = srv
@@ -276,7 +281,7 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
     stream_buffer: list[str] = []
     buffer_size_at_turn_start = 0
 
-    _emit_ws(server_id, "ai_analysis_token", {
+    _emit_ws(server_id, WSEvent.AI_ANALYSIS_TOKEN, {
         "run_id": run_id, "source_type": "server", "source_id": server_id, "token": ""
     })
 
@@ -305,7 +310,7 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
                             token_text = ""
                 if token_text:
                     stream_buffer.append(token_text)
-                    _emit_ws(server_id, "ai_analysis_token", {
+                    _emit_ws(server_id, WSEvent.AI_ANALYSIS_TOKEN, {
                         "run_id": run_id,
                         "source_type": "server",
                         "source_id": server_id,
@@ -332,7 +337,7 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
                             except Exception:
                                 output_content = ""
                     if output_content:
-                        _emit_ws(server_id, "ai_analysis_token", {
+                        _emit_ws(server_id, WSEvent.AI_ANALYSIS_TOKEN, {
                             "run_id": run_id,
                             "source_type": "server",
                             "source_id": server_id,
@@ -342,7 +347,7 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
                 if stream_buffer and not stream_buffer[-1].endswith("\n\n"):
                     separator = "\n\n"
                     stream_buffer.append(separator)
-                    _emit_ws(server_id, "ai_analysis_token", {
+                    _emit_ws(server_id, WSEvent.AI_ANALYSIS_TOKEN, {
                         "run_id": run_id,
                         "source_type": "server",
                         "source_id": server_id,
@@ -371,13 +376,24 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
 
     # Hard-fail if the agent produced absolutely nothing
     if not final_messages and not stream_buffer:
-        _emit_ws(server_id, "ai_analysis_complete", {
+        _emit_ws(server_id, WSEvent.AI_ANALYSIS_COMPLETE, {
             "run_id": run_id,
             "source_type": "server",
             "source_id": server_id,
             "analysis_id": None,
             "error": "agent_produced_no_output",
         })
+        await notify(
+            type=NotificationType.AI_ANALYSIS_FAILED,
+            category=NotificationCategory.AI,
+            severity=NotificationSeverity.ERROR,
+            title="Server overview failed",
+            body="The AI agent produced no output. Please try running the analysis again.",
+            link=f"/servers/{server_id}",
+            server_id=server_id,
+            entity_type="server",
+            entity_id=server_id,
+        )
         raise RuntimeError(
             f"Server-overview agent produced no output for server {server_id} "
             f"(run {run_id}, elapsed {elapsed:.2f}s). Check the [server_overview] log lines above."
@@ -420,8 +436,8 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
 
     analysis_id = await save_analysis(
         run_id=run_id,
-        analysis_type="server_overview",
-        source_type="server",
+        analysis_type=AnalysisType.SERVER_OVERVIEW,
+        source_type=SourceType.SERVER,
         source_id=server_id,
         server_id=server_id,
         summary=summary,
@@ -449,13 +465,25 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
         except Exception as e:
             print(f"[server_overview] queue suggestions failed: {type(e).__name__}: {e}")
 
-    _emit_ws(server_id, "ai_analysis_complete", {
+    _emit_ws(server_id, WSEvent.AI_ANALYSIS_COMPLETE, {
         "run_id": run_id,
         "source_type": "server",
         "source_id": server_id,
         "analysis_id": analysis_id,
         "pending_action_ids": pending_action_ids,
     })
+
+    await notify(
+        type=NotificationType.AI_ANALYSIS_READY,
+        category=NotificationCategory.AI,
+        severity=NotificationSeverity.SUCCESS,
+        title="Server overview ready",
+        body=(summary or "Server overview complete.")[:160],
+        link=f"/servers/{server_id}",
+        server_id=server_id,
+        entity_type="server",
+        entity_id=server_id,
+    )
 
     return {
         "analysis_id": analysis_id,
@@ -567,16 +595,27 @@ async def _queue_overview_suggestions(
             "decided_at": None,
             "decided_by": None,
         }
-        result = await db["ai_actions"].insert_one(row)
+        result = await db[Collections.AI_ACTIONS].insert_one(row)
         inserted.append(str(result.inserted_id))
 
     if inserted:
         try:
-            event_bus.emit("ai_actions", "action.created", {
+            event_bus.emit(WSTopic.AI_ACTIONS, "action.created", {
                 "server_id": server_id,
                 "count": len(inserted),
                 "source": "server_overview",
             })
         except Exception:
             pass
+        await notify(
+            type=NotificationType.AI_SUGGESTIONS_QUEUED,
+            category=NotificationCategory.AI,
+            severity=NotificationSeverity.INFO,
+            title="AI suggestions ready for review",
+            body=f"{len(inserted)} suggested action(s) from the server overview await your approval.",
+            link="/ai-actions",
+            server_id=server_id,
+            entity_type="ai_actions",
+            entity_id=run_id,
+        )
     return inserted

@@ -1,6 +1,8 @@
+from app.core.constants import Collections
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from app.core.errors import http_error
 
 from app.modules.anomalies.schemas import LogObservationListResponse, LogObservationResponse
 from app.modules.anomalies.service import AnomaliesService
@@ -67,10 +69,10 @@ async def analyze_observation(observation_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    if not await db["log_observations"].find_one({"_id": oid}, {"_id": 1}):
+    if not await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid}, {"_id": 1}):
         raise HTTPException(status_code=404, detail="Observation not found")
 
-    await db["log_observations"].update_one(
+    await db[Collections.LOG_OBSERVATIONS].update_one(
         {"_id": oid},
         {"$set": {"ai_analysis_in_progress": True}},
     )
@@ -78,14 +80,14 @@ async def analyze_observation(observation_id: str):
     try:
         result = await run_anomaly_triage(observation_id)
     except Exception as exc:
-        await db["log_observations"].update_one(
+        await db[Collections.LOG_OBSERVATIONS].update_one(
             {"_id": oid},
             {"$set": {"ai_analysis_in_progress": False}},
         )
-        raise HTTPException(status_code=503, detail=f"AI triage failed: {exc}")
+        raise http_error(503, "AI triage failed — please try again.", exc, "anomaly triage")
 
     # Keep legacy fields for backward compat
-    await db["log_observations"].update_one(
+    await db[Collections.LOG_OBSERVATIONS].update_one(
         {"_id": oid},
         {"$set": {
             "ai_analysis": result["markdown"],

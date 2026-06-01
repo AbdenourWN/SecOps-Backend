@@ -15,6 +15,10 @@ drive the live typing cursor. The final markdown is persisted as an
 `ai_analysis` row of type `app_overview` so the dashboard can show the last
 result on revisit without re-running the LLM (generation is on-demand only).
 """
+from app.core.constants import (
+    Collections, WSEvent, AnalysisType,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import json
 import uuid
 from datetime import timezone
@@ -27,6 +31,7 @@ from app.core.datetime_utils import utc_now
 from app.core.events import event_bus
 from app.modules.ai.llm import get_chat_model
 from app.modules.ai.analysis_store import save_analysis, list_analyses_for_source
+from app.modules.notifications.feed import notify
 
 _TOPIC = "app.ai"
 _SOURCE_TYPE = "app"
@@ -172,7 +177,7 @@ async def gather_app_context() -> dict:
 
     # Servers that aren't fully healthy, with the reason where we have one.
     try:
-        degraded_docs = await db["servers"].find(
+        degraded_docs = await db[Collections.SERVERS].find(
             {"status": {"$ne": "online"}},
             {
                 "hostname": 1,
@@ -243,7 +248,7 @@ async def run_app_overview() -> dict:
 
     def emit_token(token: str) -> None:
         try:
-            event_bus.emit(_TOPIC, "ai_analysis_token", {
+            event_bus.emit(_TOPIC, WSEvent.AI_ANALYSIS_TOKEN, {
                 "run_id": run_id,
                 "source_type": _SOURCE_TYPE,
                 "source_id": _SOURCE_ID,
@@ -281,7 +286,7 @@ async def run_app_overview() -> dict:
 
         analysis_id = await save_analysis(
             run_id=run_id,
-            analysis_type="app_overview",
+            analysis_type=AnalysisType.APP_OVERVIEW,
             source_type=_SOURCE_TYPE,
             source_id=_SOURCE_ID,
             server_id="",
@@ -296,7 +301,7 @@ async def run_app_overview() -> dict:
         )
 
         try:
-            event_bus.emit(_TOPIC, "ai_analysis_complete", {
+            event_bus.emit(_TOPIC, WSEvent.AI_ANALYSIS_COMPLETE, {
                 "run_id": run_id,
                 "source_type": _SOURCE_TYPE,
                 "source_id": _SOURCE_ID,
@@ -305,26 +310,52 @@ async def run_app_overview() -> dict:
         except Exception:
             pass
 
+        await notify(
+            type=NotificationType.AI_ANALYSIS_READY,
+            category=NotificationCategory.AI,
+            severity=NotificationSeverity.SUCCESS,
+            title="Platform overview ready",
+            body=(summary or "Platform overview complete.")[:160],
+            link="/",
+            entity_type="app",
+            entity_id=_SOURCE_ID,
+        )
+
         return {"status": "ok", "run_id": run_id, "analysis_id": analysis_id}
 
     except Exception as exc:
-        msg = f"{type(exc).__name__}: {exc}"[:200]
+        # Log the raw cause server-side with a short ref, but surface only a
+        # clean, user-facing message on the stream — mirrors core/errors.http_error
+        # so the dashboard card shows plain English, not a Python exception.
+        ref = str(uuid.uuid4())[:8]
+        print(f"[app_overview] failed run={run_id} [{ref}]: {type(exc).__name__}: {exc}")
+        friendly = f"Couldn't generate the platform overview — please try again. (ref: {ref})"
         try:
-            event_bus.emit(_TOPIC, "ai_analysis_complete", {
+            event_bus.emit(_TOPIC, WSEvent.AI_ANALYSIS_COMPLETE, {
                 "run_id": run_id,
                 "source_type": _SOURCE_TYPE,
                 "source_id": _SOURCE_ID,
-                "error": msg,
+                "error": friendly,
             })
         except Exception:
             pass
-        print(f"[app_overview] failed run={run_id}: {msg}")
-        return {"status": "error", "run_id": run_id, "error": msg}
+
+        await notify(
+            type=NotificationType.AI_ANALYSIS_FAILED,
+            category=NotificationCategory.AI,
+            severity=NotificationSeverity.ERROR,
+            title="Platform overview failed",
+            body="Couldn't generate the platform overview. Please try again.",
+            link="/",
+            entity_type="app",
+            entity_id=_SOURCE_ID,
+        )
+        return {"status": "error", "run_id": run_id, "error": friendly}
 
 
 async def get_latest_app_overview() -> dict | None:
     """Return the most recent persisted app_overview analysis, or None."""
     rows = await list_analyses_for_source(
-        _SOURCE_TYPE, _SOURCE_ID, analysis_type="app_overview", limit=1
+        _SOURCE_TYPE, _SOURCE_ID, analysis_type=AnalysisType.APP_OVERVIEW, limit=1
     )
     return rows[0] if rows else None

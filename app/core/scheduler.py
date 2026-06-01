@@ -1,3 +1,7 @@
+from app.core.constants import (
+    Collections, WSTopic,
+    NotificationType, NotificationCategory, NotificationSeverity,
+)
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -14,6 +18,7 @@ from app.modules.logs.file_watcher import FileWatcherService
 from app.modules.logs.service import LogService
 from app.modules.metrics.service import MetricService
 from app.modules.servers.service import ServerService
+from app.modules.notifications.feed import notify
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +94,7 @@ async def _collect_telemetry_for_server(server: dict):
             skip_count = connection_pool.get_skip_count(server_id)
             logger.warning("[scheduler] skipped collection for %s (terminal busy, consecutive=%d)",
                            hostname, skip_count)
-            event_bus.emit("servers", "collection_skipped", {
+            event_bus.emit(WSTopic.SERVERS, "collection_skipped", {
                 "server_id": server_id,
                 "hostname": hostname,
                 "consecutive": skip_count,
@@ -98,7 +103,7 @@ async def _collect_telemetry_for_server(server: dict):
             if skip_count >= _STALL_THRESHOLD:
                 logger.warning("[scheduler] telemetry STALLED for %s (%d consecutive skips)",
                                hostname, skip_count)
-                event_bus.emit("servers", "collection_stalled", {
+                event_bus.emit(WSTopic.SERVERS, "collection_stalled", {
                     "server_id": server_id,
                     "hostname": hostname,
                     "consecutive": skip_count,
@@ -125,7 +130,7 @@ async def _collect_telemetry_for_server(server: dict):
         from app.core.database import get_database
         from bson import ObjectId
         db = get_database()
-        fresh_server = await db["servers"].find_one({"_id": ObjectId(server_id)})
+        fresh_server = await db[Collections.SERVERS].find_one({"_id": ObjectId(server_id)})
         if fresh_server is not None:
             spike = await _heuristic_service.check_volume_spike(fresh_server)
             if spike is not None:
@@ -144,7 +149,7 @@ async def _collect_telemetry_for_server(server: dict):
 async def job_collect_telemetry():
     try:
         db = get_database()
-        servers = await db["servers"].find().to_list(length=10000)
+        servers = await db[Collections.SERVERS].find().to_list(length=10000)
         if not servers:
             return
 
@@ -163,7 +168,7 @@ async def job_collect_telemetry():
         logger.info("[scheduler] telemetry complete in %.1fs", elapsed)
 
         # One event per tick so the frontend refreshes last_metrics on all server cards.
-        event_bus.emit("servers", "servers.metrics_updated", {"count": len(online)})
+        event_bus.emit(WSTopic.SERVERS, "servers.metrics_updated", {"count": len(online)})
 
     except Exception as e:
         logger.error("job_collect_telemetry failed: %s", e)
@@ -184,7 +189,7 @@ async def job_verify_remediation():
     try:
         db = get_database()
         now = datetime.now(timezone.utc)
-        cursor = db["incidents"].find({
+        cursor = db[Collections.INCIDENTS].find({
             "status": "verifying",
             "verification_until": {"$lt": now},
         })
@@ -193,7 +198,7 @@ async def job_verify_remediation():
             return
 
         for inc in to_resolve:
-            await db["incidents"].update_one(
+            await db[Collections.INCIDENTS].update_one(
                 {"_id": inc["_id"]},
                 {"$set": {
                     "status": "resolved",
@@ -204,12 +209,12 @@ async def job_verify_remediation():
             )
             _sid = inc.get("server_id")
             if _sid:
-                await db["servers"].update_one(
+                await db[Collections.SERVERS].update_one(
                     {"_id": ObjectId(_sid)},
                     {"$inc": {"open_incidents_count": -1}},
                 )
-                event_bus.emit("servers", "server.updated", {"server_id": _sid})
-            event_bus.emit("incidents", "incident.resolved", {
+                event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": _sid})
+            event_bus.emit(WSTopic.INCIDENTS, "incident.resolved", {
                 "incident_id": str(inc["_id"]),
                 "server_id": _sid,
                 "auto": True,
@@ -220,9 +225,20 @@ async def job_verify_remediation():
                     "server_id": _sid,
                     "auto": True,
                 })
-            event_bus.emit("dashboard.summary", "incident.resolved", {
+            event_bus.emit(WSTopic.DASHBOARD_SUMMARY, "incident.resolved", {
                 "incident_id": str(inc["_id"]),
             })
+            await notify(
+                type=NotificationType.INCIDENT_RESOLVED,
+                category=NotificationCategory.INCIDENT,
+                severity=NotificationSeverity.SUCCESS,
+                title="Incident auto-resolved",
+                body=(inc.get("description", "") or "The remediation held — incident resolved.").replace(" (Auto-Resolved)", "")[:160],
+                link=f"/incidents/{inc['_id']}",
+                server_id=_sid,
+                entity_type="incident",
+                entity_id=str(inc["_id"]),
+            )
 
         logger.info("[scheduler] auto-resolved %d verified incident(s)", len(to_resolve))
 
@@ -247,7 +263,7 @@ async def job_file_watcher():
         # hosts. Health check still flips servers back ONLINE on recovery.
         online_ids = {
             str(s["_id"])
-            for s in await db["servers"]
+            for s in await db[Collections.SERVERS]
             .find({"is_online": True}, {"_id": 1})
             .to_list(length=10000)
         }

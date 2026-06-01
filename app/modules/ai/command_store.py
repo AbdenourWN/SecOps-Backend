@@ -4,6 +4,8 @@ ai_command collection accessor.
 Each row tracks the full lifecycle of one AI-suggested command:
 suggestion → decision → execution → pre/post snapshots → impact analysis pointer.
 """
+from app.core.constants import Collections, CommandStatus, OSType, RiskLevel
+from app.core.db_utils import build_date_range_query, enrich_with_server_hostname
 from datetime import datetime, timezone
 from typing import List, Optional
 import uuid
@@ -38,12 +40,12 @@ async def create_commands(
             "source_id": source_id,
             "server_id": server_id,
             "command": s.get("command", ""),
-            "os_type": s.get("os_type", "linux"),
+            "os_type": s.get("os_type", OSType.LINUX),
             "purpose": s.get("purpose", ""),
-            "risk_level": s.get("risk_level", "medium"),
+            "risk_level": s.get("risk_level", RiskLevel.MEDIUM),
             "expected_outcome": s.get("expected_outcome", ""),
             "is_read_only": s.get("is_read_only", False),
-            "status": "pending",
+            "status": CommandStatus.PENDING,
             "decided_at": None,
             "decided_by": None,
             "stdout": None,
@@ -62,7 +64,7 @@ async def create_commands(
         })
     if not docs:
         return []
-    result = await db["ai_command"].insert_many(docs)
+    result = await db[Collections.AI_COMMAND].insert_many(docs)
     return [str(oid) for oid in result.inserted_ids]
 
 
@@ -75,9 +77,9 @@ async def approve_commands(command_ids: List[str], decided_by: str = "operator")
     now = utc_now()
     oids = [ObjectId(cid) for cid in command_ids if ObjectId.is_valid(cid)]
     if oids:
-        await db["ai_command"].update_many(
-            {"_id": {"$in": oids}, "status": "pending"},
-            {"$set": {"status": "approved", "batch_id": batch_id, "decided_at": now, "decided_by": decided_by}},
+        await db[Collections.AI_COMMAND].update_many(
+            {"_id": {"$in": oids}, "status": CommandStatus.PENDING},
+            {"$set": {"status": CommandStatus.APPROVED, "batch_id": batch_id, "decided_at": now, "decided_by": decided_by}},
         )
     return batch_id
 
@@ -87,16 +89,16 @@ async def reject_commands(command_ids: List[str], decided_by: str = "operator") 
     now = utc_now()
     oids = [ObjectId(cid) for cid in command_ids if ObjectId.is_valid(cid)]
     if oids:
-        await db["ai_command"].update_many(
-            {"_id": {"$in": oids}, "status": "pending"},
-            {"$set": {"status": "rejected", "decided_at": now, "decided_by": decided_by}},
+        await db[Collections.AI_COMMAND].update_many(
+            {"_id": {"$in": oids}, "status": CommandStatus.PENDING},
+            {"$set": {"status": CommandStatus.REJECTED, "decided_at": now, "decided_by": decided_by}},
         )
 
 
 async def get_command(command_id: str) -> Optional[dict]:
     db = get_database()
     try:
-        doc = await db["ai_command"].find_one({"_id": ObjectId(command_id)})
+        doc = await db[Collections.AI_COMMAND].find_one({"_id": ObjectId(command_id)})
     except Exception:
         return None
     if not doc:
@@ -107,7 +109,7 @@ async def get_command(command_id: str) -> Optional[dict]:
 
 async def get_commands_for_source(source_type: str, source_id: str) -> List[dict]:
     db = get_database()
-    cursor = db["ai_command"].find(
+    cursor = db[Collections.AI_COMMAND].find(
         {"source_type": source_type, "source_id": source_id}
     ).sort("created_at", 1)
     docs = await cursor.to_list(length=100)
@@ -118,7 +120,7 @@ async def get_commands_for_source(source_type: str, source_id: str) -> List[dict
 
 async def get_commands_by_batch(batch_id: str) -> List[dict]:
     db = get_database()
-    cursor = db["ai_command"].find({"batch_id": batch_id}).sort("created_at", 1)
+    cursor = db[Collections.AI_COMMAND].find({"batch_id": batch_id}).sort("created_at", 1)
     docs = await cursor.to_list(length=50)
     for d in docs:
         d["_id"] = str(d["_id"])
@@ -135,7 +137,6 @@ async def list_commands(
     page: int = 1,
     page_size: int = 25,
 ) -> dict:
-    from datetime import datetime
     db = get_database()
     query: dict = {}
     if status and status != "all":
@@ -146,51 +147,29 @@ async def list_commands(
         query["source_id"] = source_id
     if source_type and source_type != "all":
         query["source_type"] = source_type
-    date_range: dict = {}
-    if from_date:
-        try:
-            date_range["$gte"] = datetime.fromisoformat(from_date.replace("Z", "+00:00"))
-        except Exception:
-            pass
-    if to_date:
-        try:
-            date_range["$lte"] = datetime.fromisoformat(to_date.replace("Z", "+00:00"))
-        except Exception:
-            pass
+    date_range = build_date_range_query(from_date, to_date)
     if date_range:
         query["created_at"] = date_range
 
-    total = await db["ai_command"].count_documents(query)
+    total = await db[Collections.AI_COMMAND].count_documents(query)
     skip = (page - 1) * page_size
-    cursor = db["ai_command"].find(query).sort("created_at", -1).skip(skip).limit(page_size)
+    cursor = db[Collections.AI_COMMAND].find(query).sort("created_at", -1).skip(skip).limit(page_size)
     docs = await cursor.to_list(length=page_size)
     for d in docs:
         d["_id"] = str(d["_id"])
 
     # Batch-enrich with server hostname (one query for all unique server_ids on this page)
-    server_ids = list({d["server_id"] for d in docs if d.get("server_id")})
-    if server_ids:
-        try:
-            srv_cursor = db["servers"].find(
-                {"_id": {"$in": [ObjectId(sid) for sid in server_ids if ObjectId.is_valid(sid)]}},
-                {"hostname": 1},
-            )
-            srv_docs = await srv_cursor.to_list(length=len(server_ids))
-            hostname_map = {str(s["_id"]): s.get("hostname", "") for s in srv_docs}
-            for d in docs:
-                d["server_hostname"] = hostname_map.get(d.get("server_id", ""), "")
-        except Exception:
-            pass
+    await enrich_with_server_hostname(docs, db)
 
     return {"total": total, "page": page, "page_size": page_size, "results": docs}
 
 
 async def pending_count() -> int:
     db = get_database()
-    return await db["ai_command"].count_documents({"status": "pending"})
+    return await db[Collections.AI_COMMAND].count_documents({"status": CommandStatus.PENDING})
 
 
-_RETRYABLE_STATUSES = {"failed", "blocked"}
+_RETRYABLE_STATUSES = {CommandStatus.FAILED, CommandStatus.BLOCKED}
 
 
 async def retry_command(command_id: str) -> str:
@@ -200,7 +179,7 @@ async def retry_command(command_id: str) -> str:
     """
     db = get_database()
     try:
-        src = await db["ai_command"].find_one({"_id": ObjectId(command_id)})
+        src = await db[Collections.AI_COMMAND].find_one({"_id": ObjectId(command_id)})
     except Exception:
         raise ValueError("invalid command_id")
     if not src:
@@ -210,7 +189,7 @@ async def retry_command(command_id: str) -> str:
     exit_code = src.get("exit_code")
     is_retryable = (
         status in _RETRYABLE_STATUSES
-        or (status == "completed" and exit_code not in (0, None))
+        or (status == CommandStatus.COMPLETED and exit_code not in (0, None))
     )
     if not is_retryable:
         raise ValueError(f"command status '{status}' is not retryable")
@@ -218,7 +197,7 @@ async def retry_command(command_id: str) -> str:
     now = utc_now()
     new_doc = {k: v for k, v in src.items() if k != "_id"}
     new_doc.update({
-        "status": "pending",
+        "status": CommandStatus.PENDING,
         "batch_id": None,
         "decided_at": None,
         "decided_by": None,
@@ -237,5 +216,5 @@ async def retry_command(command_id: str) -> str:
         "retry_of": command_id,
         "created_at": now,
     })
-    result = await db["ai_command"].insert_one(new_doc)
+    result = await db[Collections.AI_COMMAND].insert_one(new_doc)
     return str(result.inserted_id)

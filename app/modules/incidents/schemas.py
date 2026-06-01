@@ -1,35 +1,13 @@
 from pydantic import BaseModel, Field, BeforeValidator
 from typing import Optional, Dict, Any, List, Annotated
 from datetime import datetime
-from enum import Enum
 from app.core.datetime_utils import utc_now
+# SeverityLevel / IncidentStatus / ActionLevel now live in app.core.constants;
+# re-exported here so existing `from ...incidents.schemas import X` keeps working.
+from app.core.constants import SeverityLevel, IncidentStatus, ActionLevel
 
 # --- Helpers ---
 PyObjectId = Annotated[str, BeforeValidator(str)]
-
-
-# --- Enums ---
-class SeverityLevel(str, Enum):
-    CRITICAL = "critical"
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-class IncidentStatus(str, Enum):
-    OPEN = "open"
-    VERIFYING = "verifying"   # remediation ran; waiting to see if rule re-fires
-    INVESTIGATING = "investigating"
-    RESOLVED = "resolved"
-    FALSE_POSITIVE = "false_positive"
-
-# Matches the PDF "Three Levels"
-class ActionLevel(int, Enum):
-    # Level 1: Machine fixes it alone. (Example: Block IP)
-    AUTOMATIC_REMEDIATION = 1
-    # Level 2: Machine fixes it AND notifies the team.
-    REMEDIATION_AND_ALERT = 2
-    # Level 3: Machine does NOTHING but notify.
-    ALERT_ONLY = 3
 
 
 # --- Models ---

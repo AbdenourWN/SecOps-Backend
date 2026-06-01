@@ -1,3 +1,4 @@
+from app.core.constants import Collections
 import logging
 import traceback
 import uuid
@@ -31,6 +32,7 @@ from app.modules.incidents.router import router as incidents_router
 from app.modules.dashboard.router import router as dashboard_router
 from app.modules.test.router import router as test_router
 from app.modules.notifications.router import router as notifications_router
+from app.modules.notifications.feed_router import router as notifications_feed_router
 from app.modules.anomalies.router import router as anomalies_router
 from app.modules.ws.router import router as ws_router
 from app.modules.ws.terminal_router import router as terminal_ws_router
@@ -52,48 +54,48 @@ async def _ensure_indexes():
 
     # ── log_observations (Tier 2 anomaly) ────────────────────────────────────
     # List page (newest first), pending queue
-    await db["log_observations"].create_index([("server_id", 1), ("detected_at", -1)])
-    await db["log_observations"].create_index([("status", 1), ("detected_at", -1)])
+    await db[Collections.LOG_OBSERVATIONS].create_index([("server_id", 1), ("detected_at", -1)])
+    await db[Collections.LOG_OBSERVATIONS].create_index([("status", 1), ("detected_at", -1)])
     # Dedup upsert lookup: (server_id, fingerprint, last_seen_at) — most critical new index
-    await db["log_observations"].create_index(
+    await db[Collections.LOG_OBSERVATIONS].create_index(
         [("server_id", 1), ("fingerprint", 1), ("last_seen_at", -1)],
         name="idx_obs_dedup_lookup",
     )
     # TTL on last_seen_at so actively-firing anomalies survive (don't use detected_at TTL)
-    await db["log_observations"].create_index(
+    await db[Collections.LOG_OBSERVATIONS].create_index(
         "last_seen_at",
         expireAfterSeconds=30 * 24 * 3600,
         name="idx_obs_ttl",
     )
 
     # ── dismissed_fingerprints (B1 learned suppression) ──────────────────────
-    await db["dismissed_fingerprints"].create_index(
+    await db[Collections.DISMISSED_FINGERPRINTS].create_index(
         [("server_id", 1), ("fingerprint", 1)],
         unique=True,
         name="idx_dismissed_fp_unique",
     )
     # TTL on expires_at — records vanish automatically after suppression window
-    await db["dismissed_fingerprints"].create_index(
+    await db[Collections.DISMISSED_FINGERPRINTS].create_index(
         "expires_at",
         expireAfterSeconds=0,
         name="idx_dismissed_fp_ttl",
     )
 
     # ── reason_stats (B3 dismissal-feedback score weighting) ─────────────────
-    await db["reason_stats"].create_index(
+    await db[Collections.REASON_STATS].create_index(
         [("reason", 1)],
         unique=True,
         name="idx_reason_stats_reason",
     )
 
     # ── server_log_patterns (Tier 2 novel-pattern dedup) ─────────────────────
-    await db["server_log_patterns"].create_index(
+    await db[Collections.SERVER_LOG_PATTERNS].create_index(
         [("server_id", 1), ("pattern_hash", 1)], unique=True
     )
-    await db["server_log_patterns"].create_index([("server_id", 1), ("first_seen_at", 1)])
+    await db[Collections.SERVER_LOG_PATTERNS].create_index([("server_id", 1), ("first_seen_at", 1)])
     # B4: TTL on last_seen_at — dormant patterns expire after 90 days so they
     # re-register as novel if they reappear after a long absence.
-    await db["server_log_patterns"].create_index(
+    await db[Collections.SERVER_LOG_PATTERNS].create_index(
         "last_seen_at",
         expireAfterSeconds=90 * 24 * 3600,
         name="idx_patterns_ttl",
@@ -102,52 +104,60 @@ async def _ensure_indexes():
     # ── incidents ─────────────────────────────────────────────────────────────
     # Dedup lookup: runs on every log line in analyze_logs() — most critical index.
     # Filter: server_id + rule_id + status $in [open, verifying] + detected_at range.
-    await db["incidents"].create_index(
+    await db[Collections.INCIDENTS].create_index(
         [("server_id", 1), ("rule_id", 1), ("status", 1), ("detected_at", -1)],
         name="idx_incidents_dedup",
     )
     # Verify-remediation sweep: runs every 60s in job_verify_remediation.
     # Filter: status == "verifying" AND verification_until < now.
-    await db["incidents"].create_index(
+    await db[Collections.INCIDENTS].create_index(
         [("status", 1), ("verification_until", 1)],
         name="idx_incidents_verify",
     )
 
     # ── rules ─────────────────────────────────────────────────────────────────
     # Rule cache refresh: loads all enabled rules every 5 min.
-    await db["rules"].create_index([("enabled", 1)], name="idx_rules_enabled")
+    await db[Collections.RULES].create_index([("enabled", 1)], name="idx_rules_enabled")
 
     # ── log_sources ───────────────────────────────────────────────────────────
     # Active-sources list: fetched every 60s by job_file_watcher.
-    await db["log_sources"].create_index([("is_active", 1)], name="idx_log_sources_active")
+    await db[Collections.LOG_SOURCES].create_index([("is_active", 1)], name="idx_log_sources_active")
     # Per-server lookup: used by get_sources_by_server.
-    await db["log_sources"].create_index([("server_id", 1)], name="idx_log_sources_server")
+    await db[Collections.LOG_SOURCES].create_index([("server_id", 1)], name="idx_log_sources_server")
 
     # ── ai_analysis (unified AI analysis collection — all types) ─────────────
-    await db["ai_analysis"].create_index([("source_type", 1), ("source_id", 1), ("created_at", -1)], name="idx_ai_analysis_source")
-    await db["ai_analysis"].create_index([("server_id", 1), ("analysis_type", 1), ("created_at", -1)], name="idx_ai_analysis_server")
-    await db["ai_analysis"].create_index([("run_id", 1)], name="idx_ai_analysis_run")
-    await db["ai_analysis"].create_index("created_at", expireAfterSeconds=90 * 24 * 3600, name="idx_ai_analysis_ttl")
+    await db[Collections.AI_ANALYSIS].create_index([("source_type", 1), ("source_id", 1), ("created_at", -1)], name="idx_ai_analysis_source")
+    await db[Collections.AI_ANALYSIS].create_index([("server_id", 1), ("analysis_type", 1), ("created_at", -1)], name="idx_ai_analysis_server")
+    await db[Collections.AI_ANALYSIS].create_index([("run_id", 1)], name="idx_ai_analysis_run")
+    await db[Collections.AI_ANALYSIS].create_index("created_at", expireAfterSeconds=90 * 24 * 3600, name="idx_ai_analysis_ttl")
 
     # ── ai_command (per-command execution lifecycle) ──────────────────────────
-    await db["ai_command"].create_index([("status", 1), ("created_at", -1)], name="idx_ai_cmd_status")
-    await db["ai_command"].create_index([("server_id", 1), ("created_at", -1)], name="idx_ai_cmd_server")
-    await db["ai_command"].create_index([("source_id", 1), ("created_at", -1)], name="idx_ai_cmd_source")
-    await db["ai_command"].create_index([("analysis_id", 1)], name="idx_ai_cmd_analysis")
-    await db["ai_command"].create_index([("batch_id", 1)], name="idx_ai_cmd_batch")
-    await db["ai_command"].create_index("created_at", expireAfterSeconds=90 * 24 * 3600, name="idx_ai_cmd_ttl")
+    await db[Collections.AI_COMMAND].create_index([("status", 1), ("created_at", -1)], name="idx_ai_cmd_status")
+    await db[Collections.AI_COMMAND].create_index([("server_id", 1), ("created_at", -1)], name="idx_ai_cmd_server")
+    await db[Collections.AI_COMMAND].create_index([("source_id", 1), ("created_at", -1)], name="idx_ai_cmd_source")
+    await db[Collections.AI_COMMAND].create_index([("analysis_id", 1)], name="idx_ai_cmd_analysis")
+    await db[Collections.AI_COMMAND].create_index([("batch_id", 1)], name="idx_ai_cmd_batch")
+    await db[Collections.AI_COMMAND].create_index("created_at", expireAfterSeconds=90 * 24 * 3600, name="idx_ai_cmd_ttl")
 
     # ── ai_actions (suggest-level queued mutations, operator-approved) ────────
-    await db["ai_actions"].create_index([("status", 1), ("created_at", -1)], name="idx_ai_actions_status")
+    await db[Collections.AI_ACTIONS].create_index([("status", 1), ("created_at", -1)], name="idx_ai_actions_status")
     # TTL: auto-delete terminal (approved/rejected) rows after 7 days
-    await db["ai_actions"].create_index(
+    await db[Collections.AI_ACTIONS].create_index(
         "created_at",
         expireAfterSeconds=7 * 24 * 3600,
         partialFilterExpression={"status": {"$in": ["approved", "rejected"]}},
         name="idx_ai_actions_ttl",
     )
 
-    print("✅ Indexes ensured (incidents, rules, log_sources, log_observations, server_log_patterns, dismissed_fingerprints, reason_stats, ai_actions, ai_analysis, ai_command)")
+    # ── notifications (in-app feed — bell + /notifications page) ──────────────
+    # Unread badge + list page (newest-first via _id, but created_at covers range/TTL)
+    await db[Collections.NOTIFICATIONS].create_index([("read", 1), ("created_at", -1)], name="idx_notifications_unread")
+    # Dedup-coalesce lookup (bump unread row with same key inside window)
+    await db[Collections.NOTIFICATIONS].create_index([("dedup_key", 1), ("read", 1)], name="idx_notifications_dedup")
+    # TTL: notifications self-expire after 30 days
+    await db[Collections.NOTIFICATIONS].create_index("created_at", expireAfterSeconds=30 * 24 * 3600, name="idx_notifications_ttl")
+
+    print("✅ Indexes ensured (incidents, rules, log_sources, log_observations, server_log_patterns, dismissed_fingerprints, reason_stats, ai_actions, ai_analysis, ai_command, notifications)")
 
 
 @asynccontextmanager
@@ -221,6 +231,7 @@ app.include_router(incidents_router, prefix="/api/incidents", tags=["Incidents"]
 app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"])
 app.include_router(test_router, prefix="/api/test", tags=["Test & Simulation"])
 app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
+app.include_router(notifications_feed_router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(anomalies_router, prefix="/api/anomalies", tags=["Anomalies"])
 app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
 app.include_router(ai_router, prefix="/api/ai-actions", tags=["AI Actions"])

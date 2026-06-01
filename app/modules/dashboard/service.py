@@ -1,3 +1,4 @@
+from app.core.constants import Collections
 from app.core.database import get_database
 from app.core.elasticsearch import get_elasticsearch
 from datetime import datetime, timezone, timedelta
@@ -49,12 +50,12 @@ class DashboardService:
         #   online    — TCP reachable AND credentials work (full health)
         #   reachable — TCP reachable BUT credentials/auth probe failed
         #   offline   — TCP/banner-grab failed
-        total_servers = await db["servers"].count_documents({})
-        online_servers = await db["servers"].count_documents({"status": "online"})
-        reachable_servers = await db["servers"].count_documents({"status": "reachable"})
-        offline_servers = await db["servers"].count_documents({"status": "offline"})
-        total_rules = await db["rules"].count_documents({"enabled": True})
-        total_scripts = await db["scripts"].count_documents({})
+        total_servers = await db[Collections.SERVERS].count_documents({})
+        online_servers = await db[Collections.SERVERS].count_documents({"status": "online"})
+        reachable_servers = await db[Collections.SERVERS].count_documents({"status": "reachable"})
+        offline_servers = await db[Collections.SERVERS].count_documents({"status": "offline"})
+        total_rules = await db[Collections.RULES].count_documents({"enabled": True})
+        total_scripts = await db[Collections.SCRIPTS].count_documents({})
 
         # --- Incident Stats (Aggregation) ---
         inc_pipeline = [
@@ -73,7 +74,7 @@ class DashboardService:
                 }
             }
         ]
-        inc_result = await db["incidents"].aggregate(inc_pipeline).to_list(length=1)
+        inc_result = await db[Collections.INCIDENTS].aggregate(inc_pipeline).to_list(length=1)
 
         if inc_result:
             r = inc_result[0]
@@ -125,7 +126,7 @@ class DashboardService:
         """
         db = get_database()
 
-        cursor = db["incidents"].find().sort("detected_at", -1).limit(limit)
+        cursor = db[Collections.INCIDENTS].find().sort("detected_at", -1).limit(limit)
         incidents = await cursor.to_list(length=limit)
 
         # OPT-6: Batch lookup — 1 query for all server hostnames instead of N
@@ -141,7 +142,7 @@ class DashboardService:
 
         servers = {}
         if oid_list:
-            server_docs = await db["servers"].find(
+            server_docs = await db[Collections.SERVERS].find(
                 {"_id": {"$in": oid_list}},
                 {"hostname": 1}
             ).to_list(length=100)
@@ -162,7 +163,7 @@ class DashboardService:
         """
         db = get_database()
 
-        servers = await db["servers"].find().to_list(length=100)
+        servers = await db[Collections.SERVERS].find().to_list(length=100)
         if not servers:
             return []
 
@@ -202,7 +203,7 @@ class DashboardService:
                 {"$match": {"status": {"$in": ["open", "investigating"]}}},
                 {"$group": {"_id": "$server_id", "count": {"$sum": 1}}}
             ]
-            counts = await db["incidents"].aggregate(pipeline).to_list(length=1000)
+            counts = await db[Collections.INCIDENTS].aggregate(pipeline).to_list(length=1000)
             incident_counts = {c["_id"]: c["count"] for c in counts}
         except Exception:
             pass

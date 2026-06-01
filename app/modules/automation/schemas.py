@@ -1,13 +1,10 @@
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
 from datetime import datetime
-from enum import Enum
 from app.core.datetime_utils import utc_now
-
-class ScriptLanguage(str, Enum):
-    BASH = "bash"
-    POWERSHELL = "powershell"
-    PYTHON = "python"
+# ScriptLanguage now lives in app.core.constants; re-exported here so existing
+# `from ...automation.schemas import ScriptLanguage` keeps working.
+from app.core.constants import ScriptLanguage
 
 class ScriptBase(BaseModel):
     name: str = Field(..., description="e.g., 'Restart Nginx'")
