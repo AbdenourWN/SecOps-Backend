@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     SMTP_USE_TLS: bool = True
     ALERT_FROM_EMAIL: str = ""
     ALERT_RECIPIENTS: str = ""  # Comma-separated: "a@x.com,b@x.com"
+    # Re-email the admin this often while a server stays offline. 0 disables the reminder.
+    SERVER_OFFLINE_REMINDER_HOURS: float = 6
 
     ALLOWED_ORIGINS: str = "*"  # Comma-separated: "https://security.ctt.tn,https://other.com"
 

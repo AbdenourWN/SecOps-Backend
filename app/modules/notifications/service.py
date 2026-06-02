@@ -57,9 +57,12 @@ class NotificationService:
 
         # 2. Dispatch to each config
         for config in configs:
-            # Check severity threshold
+            # Check severity threshold (skippable for must-deliver alerts)
             min_sev = config.get("min_severity", "medium")
-            if SEVERITY_RANK.get(payload.severity, 0) < SEVERITY_RANK.get(min_sev, 0):
+            if (
+                not payload.bypass_min_severity
+                and SEVERITY_RANK.get(payload.severity, 0) < SEVERITY_RANK.get(min_sev, 0)
+            ):
                 continue  # Severity too low for this config
 
             channel_type = config.get("channel", "email")

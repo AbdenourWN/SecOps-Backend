@@ -31,32 +31,78 @@ _HEALTH_NOTIF = {
 }
 
 
-async def _send_offline_alert_email(server: dict, previous_status: str) -> None:
+def _offline_reminder_due(last_alert: Optional[datetime], now: datetime) -> bool:
+    """True when a still-offline reminder email is due, per the configured
+    `SERVER_OFFLINE_REMINDER_HOURS` window (0 disables reminders entirely). A
+    missing timestamp counts as due (e.g. a server already offline before this
+    clock existed)."""
+    from app.core.config import settings
+    window_s = settings.SERVER_OFFLINE_REMINDER_HOURS * 3600
+    if window_s <= 0:
+        return False  # reminders disabled
+    if not last_alert:
+        return True
+    if last_alert.tzinfo is None:
+        last_alert = last_alert.replace(tzinfo=timezone.utc)
+    return (now - last_alert).total_seconds() >= window_s
+
+
+# Health email copy per event kind: (severity, rule_name, sentence). `severity`
+# MUST be one of SEVERITY_RANK in notifications/service.py (low/medium/high/
+# critical) — it is filtered against each config's `min_severity`, so values
+# outside that set (e.g. "info") rank as 0 and would be silently dropped.
+_HEALTH_EMAIL = {
+    "offline":   ("critical", "Server Offline",              "is offline and no longer reachable by the platform."),
+    "reminder":  ("critical", "Server Still Offline",        "is still offline and remains unreachable by the platform."),
+    "reachable": ("high",     "Server Authentication Failing", "is reachable but its credentials are being rejected — log/metric collection is failing."),
+    "recovery":  ("medium",   "Server Recovered",            "has recovered and is back online."),
+}
+
+
+async def _send_health_email(
+    server: dict,
+    previous_status: str,
+    kind: str,
+    reason: Optional[str] = None,
+    consecutive: Optional[int] = None,
+) -> None:
     """
-    Email the admin when a server transitions to offline. Reuses the existing
-    NotificationService email pipeline (recipients from the DB email config,
-    `.env` fallback). Best-effort — never raises into the health-check loop.
+    Email the admin on a server health event — `kind` is one of `_HEALTH_EMAIL`
+    (offline / still-offline reminder / auth-failing / recovery). Reuses the
+    existing NotificationService email pipeline (recipients from the DB email
+    config, `.env` fallback). Best-effort — never raises into the health loop.
     """
     try:
         from app.modules.notifications.service import NotificationService
         from app.modules.notifications.schemas import AlertPayload
 
+        severity, rule_name, tail = _HEALTH_EMAIL[kind]
         hostname = server.get("hostname") or server.get("ip_address") or str(server.get("_id"))
+        context = {"Previous status": previous_status or "unknown"}
+        if reason:
+            context["Reason"] = reason
+        if consecutive:
+            context["Consecutive offline checks"] = consecutive
+
         payload = AlertPayload(
             incident_id="",
             server_id=str(server.get("_id")),
             server_hostname=hostname,
             server_ip=server.get("ip_address", "unknown"),
-            rule_name="Server Offline",
-            severity="critical",                   # ensures it clears any configured min_severity
-            description=f"{hostname} is offline and no longer reachable by the platform.",
-            context={"Previous status": previous_status or "unknown"},
+            rule_name=rule_name,
+            severity=severity,
+            description=f"{hostname} {tail}",
+            context=context,
             detected_at=utc_now(),
             action_level=3,                        # alert-only
+            # A recovery is "good news" (medium) so a critical-only config would
+            # otherwise drop it — force it through so whoever got the down/still-
+            # down alert always learns the server came back.
+            bypass_min_severity=(kind == "recovery"),
         )
         await NotificationService().send_alert(payload)
     except Exception as e:
-        print(f"[health] offline alert email failed for {server.get('hostname')}: {e}")
+        print(f"[health] {kind} alert email failed for {server.get('hostname')}: {e}")
 
 
 DEFAULT_COMMAND_TIMEOUT_S = 60
@@ -190,13 +236,36 @@ class ServerService:
                             "auth_failure_reason": fail_reason,
                         }
 
+                new_status = update["status"]
+                is_transition = previous_status != new_status
+
+                # ── Decide the health email + maintain the still-offline clock ──
+                # The reminder clock (`last_offline_alert_at`) lives on the server
+                # doc so a still-offline email can fire on non-transition ticks;
+                # folding it into `update` keeps this to the single write below.
+                email_kind = None
+                email_consecutive = None
+                if new_status == "offline":
+                    if is_transition:
+                        email_kind = "offline"                  # just went down
+                        update["last_offline_alert_at"] = now
+                    elif _offline_reminder_due(server.get("last_offline_alert_at"), now):
+                        email_kind = "reminder"                 # still down, throttle elapsed
+                        email_consecutive = update.get("consecutive_offline_checks")
+                        update["last_offline_alert_at"] = now
+                elif is_transition:
+                    update["last_offline_alert_at"] = None      # recovered/changed → reset clock
+                    if new_status == "reachable":
+                        email_kind = "reachable"                # up but auth/collection failing
+                    elif new_status == "online" and previous_status in ("offline", "reachable"):
+                        email_kind = "recovery"                 # back to healthy
+
                 await db[Collections.SERVERS].update_one(
                     {"_id": server["_id"]},
                     {"$set": update},
                 )
 
-                new_status = update["status"]
-                if previous_status != new_status:
+                if is_transition:
                     event_bus.emit(WSTopic.SERVERS_STATUS, "server.status_changed", {
                         "server_id": server_id,
                         "status": new_status,
@@ -238,11 +307,15 @@ class ServerService:
                             dedup_window_s=3600,
                         )
 
-                    # Email the admin when a server goes offline. Fire-and-forget
-                    # so SMTP latency never blocks the health-check gather; only
-                    # fires on the transition INTO offline (not every tick).
-                    if new_status == "offline":
-                        asyncio.create_task(_send_offline_alert_email(server, previous_status))
+                # Email the admin (best-effort, fire-and-forget so SMTP latency
+                # never blocks the health-check gather). Covers: went offline,
+                # still-offline reminder (throttled), auth-failing, and recovery.
+                if email_kind:
+                    asyncio.create_task(_send_health_email(
+                        server, previous_status, email_kind,
+                        reason=update.get("auth_failure_reason"),
+                        consecutive=email_consecutive,
+                    ))
 
         await asyncio.gather(*[check_one(s) for s in servers], return_exceptions=True)
         print(f"✅ Health Check Complete. Scanned {len(servers)} servers.")
