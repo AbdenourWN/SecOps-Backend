@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue as _queue
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -22,6 +23,42 @@ _LIVENESS_SKIP_WINDOW_S = 10.0
 # Timeout constants used by run_command and all callers.
 DEFAULT_COMMAND_TIMEOUT_S = 60
 MAX_COMMAND_TIMEOUT_S = 300
+
+
+# ---------------------------------------------------------------------------
+# Permission-failure detection (Phase 20.6)
+# ---------------------------------------------------------------------------
+# stderr/output fingerprints that mean "the credential lacks the privilege to do
+# this" (SSH/Linux + WinRM/PowerShell), as opposed to a transient or logic error.
+# Used to flag remediation failures (→ incident banner) and terminal output so the
+# UI can give actionable guidance — re-credential with privileged access, or
+# disable the script for this server — instead of a generic "failed".
+_PERMISSION_ERROR_RE = re.compile(
+    r"permission denied"
+    r"|operation not permitted"
+    r"|not permitted"
+    r"|must be run as root"
+    r"|must be root"
+    r"|need to be root"
+    r"|are not allowed to (?:run|execute)"      # sudoers refusal
+    r"|sudo: a (?:password|terminal) is required"
+    r"|sudo: no tty present"
+    r"|requires? (?:elevation|administrator|admin privileges|elevated)"
+    r"|elevation (?:is )?required"
+    r"|requested operation requires elevation"   # Windows UAC
+    r"|access is denied"                          # Windows
+    r"|insufficient privilege"
+    r"|unauthorizedaccess",                       # PowerShell UnauthorizedAccessException
+    re.IGNORECASE,
+)
+
+
+def is_permission_error(text: str | None) -> bool:
+    """True if `text` (stderr/output) looks like a privilege/permission failure
+    rather than a transient or logic error. Conservative substring match."""
+    if not text:
+        return False
+    return bool(_PERMISSION_ERROR_RE.search(text))
 
 
 # ---------------------------------------------------------------------------

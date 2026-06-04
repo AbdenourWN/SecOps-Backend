@@ -1,5 +1,6 @@
 from app.core.constants import Collections, WSTopic
 import asyncio
+import logging
 import shlex
 import uuid
 from app.core.database import get_database
@@ -12,6 +13,8 @@ from bson import ObjectId
 from datetime import datetime, timezone
 from elasticsearch.helpers import async_bulk
 from app.modules.analysis.service import AnalysisService
+
+logger = logging.getLogger(__name__)
 
 
 def _get_log_index_name():
@@ -57,7 +60,7 @@ class FileWatcherService:
             "server_id": _sid,
         })
         if _sid:
-            event_bus.emit(f"servers.{_sid}.log_sources", "log_source.created", {  # deprecated: remove when RBAC lands
+            event_bus.emit(f"servers.{_sid}.log_sources", "log_source.created", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                 "source_id": str(result.inserted_id),
                 "server_id": _sid,
             })
@@ -115,7 +118,7 @@ class FileWatcherService:
             event_bus.emit(WSTopic.LOG_SOURCES, "log_source.updated", {"source_id": str(oid)})
             _sid = src.get("server_id") if src else None
             if _sid:
-                event_bus.emit(f"servers.{_sid}.log_sources", "log_source.updated", {  # deprecated: remove when RBAC lands
+                event_bus.emit(f"servers.{_sid}.log_sources", "log_source.updated", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                     "source_id": str(oid), "server_id": _sid,
                 })
         return result.matched_count > 0
@@ -133,7 +136,7 @@ class FileWatcherService:
             event_bus.emit(WSTopic.LOG_SOURCES, "log_source.deleted", {"source_id": str(oid)})
             _sid = src.get("server_id") if src else None
             if _sid:
-                event_bus.emit(f"servers.{_sid}.log_sources", "log_source.deleted", {  # deprecated: remove when RBAC lands
+                event_bus.emit(f"servers.{_sid}.log_sources", "log_source.deleted", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                     "source_id": str(oid), "server_id": _sid,
                 })
         return result.deleted_count > 0
@@ -325,17 +328,17 @@ class FileWatcherService:
 
         # Inode Change (File Replaced)
         if last_ino is not None and str(curr_ino) != str(last_ino):
-            print(f"🔄 Rotation (Inode) for {path}")
+            logger.info("Rotation (inode) for %s", path)
             is_rotated = True
 
         # Size Drop (Truncation)
         elif curr_size < last_off:
-            print(f"📉 Truncation (Size) for {path}")
+            logger.info("Truncation (size) for %s", path)
             is_rotated = True
 
         # Header Mismatch (Overwrite)
         elif last_head and curr_head and not str(curr_head).startswith(str(last_head)):
-            print(f"📝 Overwrite (Header) for {path}")
+            logger.info("Overwrite (header) for %s", path)
             is_rotated = True
 
         if is_rotated:
@@ -351,10 +354,10 @@ class FileWatcherService:
 
     async def _handle_file_error(self, source_id, error_count, path, db):
         new_count = error_count + 1
-        print(f"⚠️ File check failed ({new_count}/10) for {path}")
+        logger.warning("File check failed (%d/10) for %s", new_count, path)
         updates = {"error_count": new_count}
         if new_count >= 10:
-            print(f"💀 file_path {path} seems dead. Disabling.")
+            logger.warning("File path %s seems dead — disabling", path)
             updates["is_active"] = False
         await db[Collections.LOG_SOURCES].update_one({"_id": source_id}, {"$set": updates})
 
@@ -406,7 +409,7 @@ class FileWatcherService:
                 ]
                 await async_bulk(es, actions, raise_on_error=False)
             except Exception as e:
-                print(f"⚠️ ES bulk index error (file_watcher): {e}")
+                logger.warning("ES bulk index error (file_watcher): %s", e)
 
         await AnalysisService().analyze_logs(new_logs)
         event_bus.emit(f"servers.{server_id}.logs", "logs.ingested", {
@@ -414,4 +417,4 @@ class FileWatcherService:
             "source_id": str(source_doc.get("_id", "")),
             "count": len(new_logs),
         })
-        print(f"📥 Indexed {len(new_logs)} lines from {source_doc['file_path']} → ES")
+        logger.info("Indexed %d lines from %s -> ES", len(new_logs), source_doc['file_path'])

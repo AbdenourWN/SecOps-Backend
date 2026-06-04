@@ -1,5 +1,6 @@
 from app.core.constants import Collections
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import List
@@ -10,6 +11,8 @@ from app.core.executors import get_server_executor, DEFAULT_COMMAND_TIMEOUT_S
 from app.core.security import decrypt_password
 from app.core.datetime_utils import utc_now
 from bson import ObjectId
+
+logger = logging.getLogger(__name__)
 from app.modules.analysis.service import AnalysisService
 from app.modules.logs.schemas import LogLevel
 from elasticsearch.helpers import async_bulk
@@ -54,7 +57,7 @@ class LogService:
             await async_bulk(es, actions, raise_on_error=False)
             return True
         except Exception as e:
-            print(f"⚠️ ES bulk index error: {e}")
+            logger.warning("ES bulk index error: %s", e)
             return False
 
     # ========================================================================
@@ -320,5 +323,5 @@ class LogService:
 
             return logs
         except Exception as e:
-            print(f"⚠️ ES search error: {e}")
+            logger.warning("ES search error: %s", e)
             return []

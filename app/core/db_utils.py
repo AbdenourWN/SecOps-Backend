@@ -31,6 +31,26 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def apply_server_scope(query: dict, server_id: Optional[str], allowed_server_ids) -> dict:
+    """
+    Apply per-principal RBAC server-scoping to a Mongo query dict (Phase 20.1).
+
+    `allowed_server_ids is None` → admin / unscoped (only the explicit `server_id`
+    filter, if any, applies). A list restricts results to those servers,
+    intersected with an explicit `server_id` filter when one is given (an
+    out-of-scope explicit filter yields no rows). Mutates and returns `query`.
+    """
+    if allowed_server_ids is None:
+        if server_id:
+            query["server_id"] = server_id
+        return query
+    if server_id:
+        query["server_id"] = server_id if server_id in allowed_server_ids else "__no_access__"
+    else:
+        query["server_id"] = {"$in": list(allowed_server_ids)}
+    return query
+
+
 def build_date_range_query(from_date: Optional[str], to_date: Optional[str]) -> dict:
     """
     Build a Mongo range sub-document from ISO strings. Returns {} when neither

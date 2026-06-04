@@ -220,7 +220,7 @@ async def job_verify_remediation():
                 "auto": True,
             })
             if _sid:
-                event_bus.emit(f"servers.{_sid}.incidents", "incident.resolved", {  # deprecated: remove when RBAC lands
+                event_bus.emit(f"servers.{_sid}.incidents", "incident.resolved", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                     "incident_id": str(inc["_id"]),
                     "server_id": _sid,
                     "auto": True,
@@ -331,5 +331,7 @@ def start_scheduler():
         "scheduler started (max_concurrent=%d, coalesce=True, staggered offsets 0/15/30/45s)",
         _concurrent_limit,
     )
-    print(f"⏰ Scheduler started — health@+0s, telemetry@+15s, verify@+30s, file_watcher@+45s "
-          f"(max {_concurrent_limit} concurrent)")
+    logger.info(
+        "Scheduler started — health@+0s, telemetry@+15s, verify@+30s, file_watcher@+45s "
+        "(max %s concurrent)", _concurrent_limit,
+    )

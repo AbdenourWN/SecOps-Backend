@@ -1,9 +1,13 @@
+import logging
+
 import aiosmtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from app.modules.notifications.channels.base import BaseChannel
 from app.modules.notifications.schemas import AlertPayload
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # Severity → color mapping for HTML emails
@@ -127,7 +131,7 @@ class EmailChannel(BaseChannel):
         Returns True if sent successfully.
         """
         if not self.smtp_host or not recipients:
-            print("   Email alert skipped: SMTP not configured or no recipients")
+            logger.warning("Email alert skipped: SMTP not configured or no recipients")
             return False
 
         try:
@@ -164,9 +168,9 @@ class EmailChannel(BaseChannel):
                 start_tls=settings.SMTP_USE_TLS,
             )
 
-            print(f"   Email alert sent to {len(recipients)} recipients")
+            logger.info("Email alert sent to %d recipients", len(recipients))
             return True
 
-        except Exception as e:
-            print(f"   Email alert failed: {e}")
+        except Exception:
+            logger.exception("Email alert failed")
             return False

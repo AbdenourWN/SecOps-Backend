@@ -1,20 +1,23 @@
 from app.core.constants import (
-    Collections, WSTopic,
+    Collections, WSTopic, AutomationFailureReason,
     NotificationType, NotificationCategory, NotificationSeverity,
 )
 import asyncio
+import logging
 import re
 import shlex
 from app.core.database import get_database
 from app.modules.notifications.feed import notify
 from app.core.executors import DEFAULT_COMMAND_TIMEOUT_S
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB, AutomationLog
-from app.core.executors import get_server_executor
+from app.core.executors import get_server_executor, is_permission_error
 from app.core.security import decrypt_password
 from app.core.datetime_utils import utc_now
 from bson import ObjectId
 from datetime import datetime, timezone
 from app.core.events import event_bus
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -95,13 +98,14 @@ class AutomationService:
         script_id: str | None = None,
         from_date: str | None = None,
         to_date: str | None = None,
+        allowed_server_ids=None,
     ) -> dict:
         """Shared filter builder for history list + stats queries."""
+        from app.core.db_utils import apply_server_scope
         query: dict = {}
         if status in ("success", "failed"):
             query["status"] = status
-        if server_id:
-            query["server_id"] = server_id
+        apply_server_scope(query, server_id, allowed_server_ids)
         if script_id:
             query["script_id"] = script_id
         # Date range on `executed_at`. Bad input silently ignored.
@@ -172,16 +176,17 @@ class AutomationService:
         script_id: str | None = None,
         from_date: str | None = None,
         to_date: str | None = None,
+        allowed_server_ids=None,
     ):
         """
         Returns remediation runs (newest first), optionally filtered by status,
         server, or script. Enriched with server hostname and script name via batch
         lookups. Used by both the dashboard widget (limit only) and the dedicated
-        activity page (with filters + pagination).
+        activity page (with filters + pagination). Scoped to the principal's servers.
         """
         db = get_database()
 
-        query = self._build_history_filter(status, server_id, script_id, from_date, to_date)
+        query = self._build_history_filter(status, server_id, script_id, from_date, to_date, allowed_server_ids=allowed_server_ids)
 
         cursor = (
             db[Collections.AUTOMATION_LOGS]
@@ -243,6 +248,7 @@ class AutomationService:
         status: str | None = None,
         server_id: str | None = None,
         script_id: str | None = None,
+        allowed_server_ids=None,
     ):
         """
         Aggregate counts for the automation history page headline stats.
@@ -252,7 +258,7 @@ class AutomationService:
         from datetime import timedelta
 
         db = get_database()
-        query = self._build_history_filter(status, server_id, script_id)
+        query = self._build_history_filter(status, server_id, script_id, allowed_server_ids=allowed_server_ids)
 
         # Single aggregation: total + success + failed
         pipeline = [
@@ -347,7 +353,7 @@ class AutomationService:
         # 1. Fetch Data
         script_doc = await self.get_script(script_id)
         if not script_doc:
-            print(f"❌ Script {script_id} not found!")
+            logger.error("Script %s not found", script_id)
             return False
 
         server = await db[Collections.SERVERS].find_one({"_id": ObjectId(server_id)})
@@ -363,7 +369,7 @@ class AutomationService:
         executor = get_server_executor(server, plain_secret)
         executor.credential["username"] = cred["username"]
 
-        print(f"🤖 AUTO-FIX: Executing '{script_doc['name']}' on {server['hostname']}...")
+        logger.info("AUTO-FIX: executing '%s' on %s", script_doc['name'], server['hostname'])
 
         # Phase 28.4 — Capture pre-snapshot BEFORE the script runs, gated by the
         # per-server `script_review_enabled` toggle (default False). Done in a
@@ -376,7 +382,7 @@ class AutomationService:
                 pre_snapshot = await capture_snapshot(server_id, anchor=utc_now())
             except Exception as snap_exc:
                 # Snapshot failure → just disable review for this run; don't block remediation.
-                print(f"⚠️ Pre-snapshot capture failed ({snap_exc}); skipping AI review for this run.")
+                logger.warning("Pre-snapshot capture failed (%s); skipping AI review for this run", snap_exc)
                 pre_snapshot = None
 
         # 3. Variable Substitution (validated + OS-escaped)
@@ -385,7 +391,7 @@ class AutomationService:
         try:
             command = self._substitute_variables(command, variables or {}, language)
         except ValueError as exc:
-            print(f"🚫 Remediation aborted — unsafe placeholder value: {exc}")
+            logger.warning("Remediation aborted — unsafe placeholder value: %s", exc)
             await db[Collections.INCIDENTS].update_one(
                 {"_id": ObjectId(incident_id)},
                 {"$set": {
@@ -399,7 +405,7 @@ class AutomationService:
                 "server_id": server_id,
                 "reason": "unsafe_placeholder",
             })
-            event_bus.emit(f"servers.{server_id}.incidents", "incident.updated", {  # deprecated: remove when RBAC lands
+            event_bus.emit(f"servers.{server_id}.incidents", "incident.updated", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                 "incident_id": incident_id,
                 "server_id": server_id,
                 "reason": "unsafe_placeholder",
@@ -417,7 +423,7 @@ class AutomationService:
             )
             return False
 
-        print(f"📝 Resolved Command: {command}")
+        logger.debug("Resolved command: %s", command)
 
         # 4. Execute (timeout enforced inside executor — kills remote process)
         result = await executor.run_command(command, timeout_s=DEFAULT_REMEDIATION_TIMEOUT_S)
@@ -448,7 +454,7 @@ class AutomationService:
             "incident_id": incident_id,
             "status": status,
         })
-        event_bus.emit(f"servers.{server_id}.automation", "remediation.executed", {  # deprecated: remove when RBAC lands
+        event_bus.emit(f"servers.{server_id}.automation", "remediation.executed", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
             "log_id": str(log_result.inserted_id),
             "script_id": script_id,
             "server_id": server_id,
@@ -488,6 +494,44 @@ class AutomationService:
                 entity_id=str(log_result.inserted_id),
             )
 
+        # Phase 20.6 — privilege failures are NOT transient: re-running the same
+        # script with the same credential will fail identically. Flag the incident
+        # with an actionable reason and halt the retry loop (status OPEN + no
+        # verification window) so we don't burn attempts on a guaranteed failure.
+        if status == "failed" and is_permission_error(error or output or ""):
+            try:
+                await db[Collections.INCIDENTS].update_one(
+                    {"_id": ObjectId(incident_id)},
+                    {"$set": {
+                        "automation_failure_reason": AutomationFailureReason.PERMISSION_DENIED.value,
+                        "status": "open",
+                        "verification_until": None,
+                    }},
+                )
+            except Exception:
+                logger.exception("Failed to flag incident %s as permission_denied", incident_id)
+            for _topic in (WSTopic.INCIDENTS, f"servers.{server_id}.incidents"):
+                event_bus.emit(_topic, "incident.updated", {
+                    "incident_id": incident_id,
+                    "server_id": server_id,
+                    "reason": AutomationFailureReason.PERMISSION_DENIED.value,
+                })
+            await notify(
+                type=NotificationType.REMEDIATION_FAILED,
+                category=NotificationCategory.AUTOMATION,
+                severity=NotificationSeverity.ERROR,
+                title="Privileged access required",
+                body=(
+                    f"'{_script_name}' couldn't run on this server — the stored credential "
+                    f"lacks permission. Disable the script for this server, or re-credential "
+                    f"with privileged access."
+                ),
+                link=f"/incidents/{incident_id}",
+                server_id=server_id,
+                entity_type="incident",
+                entity_id=incident_id,
+            )
+
         # Phase 28.4 — Fire-and-forget AI review on the executed run. The script
         # has already completed and been audited; the review runs after a
         # settling window, takes a post-snapshot, calls the LLM, and writes
@@ -503,13 +547,13 @@ class AutomationService:
                     pre_snapshot=pre_snapshot,
                 ))
             except Exception as task_exc:
-                print(f"⚠️ Failed to schedule AI script review ({task_exc}); script run unaffected.")
+                logger.warning("Failed to schedule AI script review (%s); script run unaffected", task_exc)
 
         if result["status"] == "success":
-            print(f"✅ Remediation Successful: {result.get('output')}")
+            logger.info("Remediation successful: %s", result.get('output'))
             return True
         else:
-            print(f"❌ Remediation Failed: {result.get('error')}")
+            logger.error("Remediation failed: %s", result.get('error'))
             return False
 
     # seed_default_scripts removed — use `python seed.py` to populate defaults.

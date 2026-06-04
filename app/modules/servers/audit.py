@@ -6,9 +6,13 @@ persisted; previews are truncated to 4 KB per stream.
 
 from __future__ import annotations
 
+import logging
+
 from app.core.constants import Collections
 from datetime import datetime, timezone
 from typing import Dict, Literal, Optional
+
+logger = logging.getLogger(__name__)
 
 from pymongo import ASCENDING, DESCENDING
 
@@ -105,6 +109,6 @@ async def write_audit(
     }
     try:
         await get_database()[Collections.COMMAND_AUDIT].insert_one(doc)
-    except Exception as e:
+    except Exception:
         # Audit must never break the user-facing call. Log and move on.
-        print(f"⚠️  audit write failed: {e}")
+        logger.exception("audit write failed")

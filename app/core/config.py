@@ -21,6 +21,24 @@ class Settings(BaseSettings):
     SERVER_OFFLINE_REMINDER_HOURS: float = 6
 
     ALLOWED_ORIGINS: str = "*"  # Comma-separated: "https://security.ctt.tn,https://other.com"
+    # Cookie auth needs an explicit origin — browsers reject credentialed requests
+    # against a wildcard ACAO. Set this to the frontend origin in dev/prod.
+
+    # --- Auth / RBAC (Phase 20.1) ---
+    # Dedicated HS256 secret for JWT access tokens — kept SEPARATE from SECRET_KEY
+    # (the Fernet key for credential encryption). Use >=32 bytes (PyJWT warns below
+    # that). Empty means auth is unconfigured: token encode/decode raises and
+    # startup logs a loud warning. Set in .env.
+    JWT_SECRET_KEY: str = ""
+    ACCESS_TOKEN_TTL_MINUTES: int = 15
+    REFRESH_TOKEN_TTL_DAYS: int = 7
+    LOGIN_MAX_ATTEMPTS: int = 5            # consecutive failures before temporary lockout
+    LOGIN_LOCKOUT_MINUTES: int = 15
+    AUTH_COOKIE_SECURE: bool = False       # True in prod (HTTPS) → cookies get the Secure flag
+    AUTH_COOKIE_SAMESITE: str = "lax"      # "lax" works same-site (localhost); "none"+Secure for cross-site prod
+    # First-boot bootstrap of the permanent protected admin (also seedable via seed.py).
+    INITIAL_ADMIN_USERNAME: str = "admin"
+    INITIAL_ADMIN_PASSWORD: str = ""       # if empty, the admin is NOT auto-created (set in .env or seed)
 
     # LLM / AI
     LLM_PROVIDER: Literal["openrouter", "anthropic", "openai", "ollama"] = "openrouter"
@@ -43,6 +61,10 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[SecretStr] = None
     # Ollama (local; only required if LLM_PROVIDER=ollama)
     OLLAMA_URL: str = "http://localhost:11434"
+
+    # --- Logging (Phase 20.4) ---
+    LOG_LEVEL: str = "INFO"   # DEBUG | INFO | WARNING | ERROR
+    LOG_JSON: bool = True     # JSON lines (prod/ingestion); set False for human-readable dev logs
 
     # WebSocket
     WS_PING_INTERVAL: int = 20

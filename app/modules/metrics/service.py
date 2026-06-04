@@ -8,7 +8,10 @@ from app.core.security import decrypt_password
 from bson import ObjectId
 from datetime import datetime, timezone
 from app.core.datetime_utils import utc_now
+import logging
 import uuid
+
+logger = logging.getLogger(__name__)
 
 def _get_metric_index_name():
     return f"secops-metrics-{utc_now().strftime('%Y.%m')}"
@@ -46,7 +49,7 @@ class MetricService:
         result = await executor.run_command(cmd, timeout_s=DEFAULT_COMMAND_TIMEOUT_S)
 
         if result["status"] == "failed":
-            print(f"❌ Metrics failed for {server.get('hostname')}: {result.get('error')}")
+            logger.error("Metrics failed for %s: %s", server.get('hostname'), result.get('error'))
             return False
 
         try:
@@ -81,7 +84,7 @@ class MetricService:
                         document=metric_doc,
                     )
                 except Exception as e:
-                    print(f"⚠️ Failed to index metric to ES: {e}")
+                    logger.warning("Failed to index metric to ES: %s", e)
 
             # Cache the snapshot on the server document so the server list
             # can display current metrics without querying Elasticsearch.
@@ -105,7 +108,7 @@ class MetricService:
             })
             return True
         except Exception as e:
-            print(f"⚠️ Parsing Error for {server.get('hostname')}: {e}")
+            logger.warning("Parsing error for %s: %s", server.get('hostname'), e)
             return False
 
     async def collect_metrics(self, server_id: str):
@@ -172,5 +175,5 @@ class MetricService:
 
             return metrics
         except Exception as e:
-            print(f"⚠️ ES search error: {e}")
+            logger.warning("ES search error: %s", e)
             return []

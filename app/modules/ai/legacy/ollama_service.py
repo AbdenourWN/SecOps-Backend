@@ -12,6 +12,10 @@ Revival paths:
 """
 import httpx
 import json
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class AIService:
     def __init__(self):
@@ -63,7 +67,7 @@ class AIService:
             "stream": False # We want the whole answer at once, not word-by-word
         }
 
-        print(f"🧠 AI is thinking about: {incident_description}...")
+        logger.debug("AI thinking about: %s", incident_description)
 
         try:
             # We use a long timeout (120s) because Llama3 might take time to think
@@ -127,7 +131,7 @@ class AIService:
             "stream": False,
         }
 
-        print(f"Anomaly AI is thinking about observation {anomaly.get('_id', 'unknown')}...")
+        logger.debug("Anomaly AI thinking about observation %s", anomaly.get('_id', 'unknown'))
 
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:

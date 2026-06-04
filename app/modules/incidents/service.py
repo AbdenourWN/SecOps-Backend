@@ -24,12 +24,20 @@ class IncidentService:
         to_date: str = None,
         page: int = 1,
         page_size: int = 20,
+        allowed_server_ids=None,
     ):
         import re
         db = get_database()
 
         query = {}
-        if server_id:
+        # RBAC (Phase 20.1): None = admin (all); a list restricts to the
+        # principal's assigned servers (intersected with any explicit filter).
+        if allowed_server_ids is not None:
+            if server_id:
+                query["server_id"] = server_id if server_id in allowed_server_ids else "__no_access__"
+            else:
+                query["server_id"] = {"$in": list(allowed_server_ids)}
+        elif server_id:
             query["server_id"] = server_id
         if severity:
             query["severity"] = severity
@@ -178,11 +186,18 @@ class IncidentService:
         updated["_id"] = str(updated["_id"])
         return {"status": "success", "incident": updated}
 
-    async def get_stats(self):
+    async def get_stats(self, allowed_server_ids=None):
         db = get_database()
 
-        # Aggregation pipeline for dashboard stats
-        pipeline = [
+        # Aggregation pipeline for dashboard stats.
+        # RBAC (Phase 20.1): None = admin (all servers); a list restricts the
+        # aggregate to the principal's assigned servers so the headline counts
+        # match the scoped list/detail views (incidents store server_id as a str).
+        pipeline = []
+        if allowed_server_ids is not None:
+            pipeline.append({"$match": {"server_id": {"$in": list(allowed_server_ids)}}})
+
+        pipeline.append(
             {
                 "$group": {
                     "_id": None,
@@ -219,7 +234,7 @@ class IncidentService:
                     },
                 }
             }
-        ]
+        )
 
         result = await db[Collections.INCIDENTS].aggregate(pipeline).to_list(length=1)
 

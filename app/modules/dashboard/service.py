@@ -2,63 +2,81 @@ from app.core.constants import Collections
 from app.core.database import get_database
 from app.core.elasticsearch import get_elasticsearch
 from datetime import datetime, timezone, timedelta
+from bson import ObjectId
+
+
+def _server_oids(allowed_server_ids):
+    """Convert assigned server-id strings → ObjectIds for an `_id` filter."""
+    oids = []
+    for sid in allowed_server_ids or []:
+        try:
+            oids.append(ObjectId(sid))
+        except Exception:
+            pass
+    return oids
 
 
 class DashboardService:
 
-    async def _get_es_log_counts(self):
+    async def _get_es_log_counts(self, allowed_server_ids=None):
         """
         Gets log counts from Elasticsearch.
-        Returns (total_logs, logs_last_24h).
+        Returns (total_logs, logs_last_24h). Scoped to `allowed_server_ids` when given.
         """
         es = get_elasticsearch()
         if not es:
             return 0, 0
 
+        scope = None if allowed_server_ids is None else {"terms": {"server_id": list(allowed_server_ids)}}
+
+        def _count_body(extra_filters):
+            filters = ([scope] if scope is not None else []) + extra_filters
+            return {"query": {"bool": {"filter": filters}}} if filters else None
+
         try:
-            # Total logs = count all documents in secops-logs-* indices
-            total_result = await es.count(index="secops-logs-*")
+            total_body = _count_body([])
+            total_result = await (es.count(index="secops-logs-*", body=total_body) if total_body else es.count(index="secops-logs-*"))
             total_logs = total_result["count"]
 
             # Last 24h = count with date range filter
             last_24h = datetime.now(timezone.utc) - timedelta(hours=24)
-            recent_result = await es.count(
-                index="secops-logs-*",
-                body={
-                    "query": {
-                        "range": {
-                            "ingested_at": {"gte": last_24h.isoformat()}
-                        }
-                    }
-                }
-            )
+            range_clause = {"range": {"ingested_at": {"gte": last_24h.isoformat()}}}
+            recent_result = await es.count(index="secops-logs-*", body=_count_body([range_clause]))
             logs_last_24h = recent_result["count"]
 
             return total_logs, logs_last_24h
         except Exception:
             return 0, 0
 
-    async def get_summary(self):
+    async def get_summary(self, allowed_server_ids=None):
         """
         Single endpoint that returns the full dashboard overview.
         Pulls data from: servers, incidents, metrics, logs (ES), scripts, rules.
+        Scoped to `allowed_server_ids` (None = admin / all).
         """
         db = get_database()
+
+        # RBAC scope (Phase 20.1): None = admin/all; else restrict to assigned servers.
+        srv_filter: dict = {}
+        inc_match: dict = {}
+        if allowed_server_ids is not None:
+            srv_filter = {"_id": {"$in": _server_oids(allowed_server_ids)}}
+            inc_match = {"server_id": {"$in": list(allowed_server_ids)}}
 
         # --- Counts ---
         # Server status is tri-state since Phase 26:
         #   online    — TCP reachable AND credentials work (full health)
         #   reachable — TCP reachable BUT credentials/auth probe failed
         #   offline   — TCP/banner-grab failed
-        total_servers = await db[Collections.SERVERS].count_documents({})
-        online_servers = await db[Collections.SERVERS].count_documents({"status": "online"})
-        reachable_servers = await db[Collections.SERVERS].count_documents({"status": "reachable"})
-        offline_servers = await db[Collections.SERVERS].count_documents({"status": "offline"})
+        total_servers = await db[Collections.SERVERS].count_documents(srv_filter)
+        online_servers = await db[Collections.SERVERS].count_documents({**srv_filter, "status": "online"})
+        reachable_servers = await db[Collections.SERVERS].count_documents({**srv_filter, "status": "reachable"})
+        offline_servers = await db[Collections.SERVERS].count_documents({**srv_filter, "status": "offline"})
         total_rules = await db[Collections.RULES].count_documents({"enabled": True})
         total_scripts = await db[Collections.SCRIPTS].count_documents({})
 
         # --- Incident Stats (Aggregation) ---
-        inc_pipeline = [
+        inc_pipeline = ([{"$match": inc_match}] if inc_match else []) + [
             {
                 "$group": {
                     "_id": None,
@@ -101,7 +119,7 @@ class DashboardService:
             }
 
         # --- Log Stats from Elasticsearch ---
-        total_logs, logs_last_24h = await self._get_es_log_counts()
+        total_logs, logs_last_24h = await self._get_es_log_counts(allowed_server_ids)
 
         return {
             "servers": {
@@ -119,14 +137,17 @@ class DashboardService:
             "scripts": total_scripts,
         }
 
-    async def get_recent_incidents(self, limit: int = 10):
+    async def get_recent_incidents(self, limit: int = 10, allowed_server_ids=None):
         """
         Returns the most recent incidents for the dashboard feed.
-        Enriched with server hostname for display.
+        Enriched with server hostname for display. Scoped to `allowed_server_ids`.
         """
         db = get_database()
 
-        cursor = db[Collections.INCIDENTS].find().sort("detected_at", -1).limit(limit)
+        q: dict = {}
+        if allowed_server_ids is not None:
+            q["server_id"] = {"$in": list(allowed_server_ids)}
+        cursor = db[Collections.INCIDENTS].find(q).sort("detected_at", -1).limit(limit)
         incidents = await cursor.to_list(length=limit)
 
         # OPT-6: Batch lookup — 1 query for all server hostnames instead of N
@@ -156,14 +177,15 @@ class DashboardService:
 
         return result
 
-    async def get_server_health(self):
+    async def get_server_health(self, allowed_server_ids=None):
         """
         Returns all servers with their latest metric snapshot.
-        OPT-6: Batch queries instead of N+1.
+        OPT-6: Batch queries instead of N+1. Scoped to `allowed_server_ids`.
         """
         db = get_database()
 
-        servers = await db[Collections.SERVERS].find().to_list(length=100)
+        srv_filter = {} if allowed_server_ids is None else {"_id": {"$in": _server_oids(allowed_server_ids)}}
+        servers = await db[Collections.SERVERS].find(srv_filter).to_list(length=100)
         if not servers:
             return []
 

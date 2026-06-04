@@ -18,8 +18,12 @@ FIELD TYPES TO KNOW:
 - "date"    → Dates. ES can parse ISO format automatically.
 """
 
+import logging
+
 from elasticsearch import AsyncElasticsearch
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class ElasticClient:
@@ -95,7 +99,7 @@ async def connect_to_elasticsearch():
 
         # Verify connection (like MongoDB's ping)
         info = await es.client.info()
-        print(f"✅ Connected to Elasticsearch: {info['version']['number']}")
+        logger.info("Connected to Elasticsearch: %s", info["version"]["number"])
 
         # Create/update the log index template
         await es.client.indices.put_index_template(
@@ -108,11 +112,13 @@ async def connect_to_elasticsearch():
             name="secops-metrics-template",
             body=METRIC_INDEX_TEMPLATE,
         )
-        print("⚡ Elasticsearch Index Templates Created")
+        logger.info("Elasticsearch index templates created")
 
     except Exception as e:
-        print(f"⚠️ Elasticsearch not available: {e}")
-        print("   Logs and Metrics will not be stored in ES. Start ES with: docker-compose up -d")
+        logger.warning(
+            "Elasticsearch not available (%s) — logs/metrics will not be stored. "
+            "Start ES with: docker-compose up -d", e,
+        )
         es.client = None
 
 
@@ -120,7 +126,7 @@ async def close_elasticsearch():
     """Closes the ES connection when the API stops."""
     if es.client:
         await es.client.close()
-        print("🛑 Elasticsearch connection closed.")
+        logger.info("Elasticsearch connection closed")
 
 
 def get_elasticsearch():

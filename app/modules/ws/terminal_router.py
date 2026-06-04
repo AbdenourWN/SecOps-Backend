@@ -7,8 +7,10 @@ One connection per browser tab. One active command per connection.
 Guardrails (block list, confirm list, rate limit, hygiene, timeout) are
 enforced inside ServerService.stream_command — unchanged from the HTTP path.
 
-Auth is stubbed for local dev (principal = "local-dev"). When P4.1 JWT lands,
-replace the _resolve_principal() stub with a real token check.
+Auth (Phase 20.1): the connection is authenticated from the access-token cookie
+before the upgrade — it requires a valid session, an operator/admin role (viewers
+cannot run commands), and access to THIS server. The principal is the
+authenticated user id.
 """
 from __future__ import annotations
 
@@ -19,6 +21,8 @@ from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.core.auth import ACCESS_COOKIE, authenticate_access_token
+from app.core.constants import UserRole
 from app.modules.servers.service import ServerService
 
 logger = logging.getLogger(__name__)
@@ -26,20 +30,29 @@ router = APIRouter()
 _service = ServerService()
 
 
-def _resolve_principal(token: Optional[str]) -> str:
-    """Auth stub — accepts any token, returns a fixed principal for now."""
-    return "local-dev"
-
-
 @router.websocket("/ws/servers/{server_id}/terminal")
 async def terminal_ws(websocket: WebSocket, server_id: str):
+    # Authenticate + authorize before accepting (Phase 20.1). Terminal = command
+    # execution, so it requires a valid session, operator/admin role, and access
+    # to this specific server.
+    user = await authenticate_access_token(websocket.cookies.get(ACCESS_COOKIE))
+    if user is None:
+        await websocket.close(code=4401)  # unauthenticated
+        return
+    if not (user.is_admin or user.role == UserRole.OPERATOR.value):
+        await websocket.close(code=4403)  # viewers cannot run commands
+        return
+    if not user.can_access_server(server_id):
+        await websocket.close(code=4403)  # not authorized for this server
+        return
+
     await websocket.accept()
 
     # Per-connection state
     active_abort_event: Optional[asyncio.Event] = None
     active_stdin_queue: Optional[asyncio.Queue] = None
     active_task: Optional[asyncio.Task] = None
-    principal: str = "local-dev"
+    principal: str = user.id
 
     async def _send(payload: dict):
         try:
@@ -60,8 +73,9 @@ async def terminal_ws(websocket: WebSocket, server_id: str):
             await websocket.close(code=4001)
             return
 
-        principal = _resolve_principal(msg.get("token"))
-        await _send({"type": "auth_ok", "principal": principal})
+        # Principal is the cookie-authenticated user; the frame is kept for
+        # protocol compatibility (its token is no longer trusted).
+        await _send({"type": "auth_ok", "principal": principal, "username": user.username})
 
         # --- Message loop ---
         while True:

@@ -18,16 +18,17 @@ AI analysis history:
   GET  /api/ai-actions/analysis           list analyses (filter: source_type, source_id, server_id, analysis_type)
   GET  /api/ai-actions/analysis/{id}      single analysis detail
 """
-from app.core.constants import Collections, ActionType, ActionStatus
-from app.core.db_utils import build_date_range_query, enrich_with_server_hostname
+from app.core.constants import Collections, ActionType, ActionStatus, UserRole
+from app.core.db_utils import apply_server_scope, build_date_range_query, enrich_with_server_hostname
 import asyncio
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from app.core.auth import CurrentUser, ensure_server_access, get_current_user, require_role
 from app.core.database import get_database
 from app.core.datetime_utils import utc_now
 from app.modules.ai.tools_mutate import (
@@ -61,14 +62,16 @@ from app.modules.ai.analysis_store import (
 
 class ApproveCommandsBody(BaseModel):
     command_ids: List[str]
-    decided_by: str = "operator"
 
 
 class RejectCommandsBody(BaseModel):
     command_ids: List[str]
-    decided_by: str = "operator"
 
 router = APIRouter()
+
+# Approving / rejecting / executing AI actions + commands is operational → operator+admin.
+# `decided_by` is taken from the authenticated principal, never from the request body.
+_operator = require_role(UserRole.OPERATOR.value)
 
 
 def _fmt(doc: dict) -> dict:
@@ -86,16 +89,16 @@ async def list_ai_actions(
     to_date: Optional[str] = Query(None, description="ISO datetime — filter on created_at <= this time"),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
+    user: CurrentUser = Depends(get_current_user),
 ):
-    """List AI pending/completed actions, newest first. Enriched with server_hostname."""
+    """List AI pending/completed actions, newest first. Enriched with server_hostname. Scoped to the principal's servers."""
     db = get_database()
     query: dict = {}
     if status and status != "all":
         query["status"] = status
     else:
         query["status"] = {"$in": ["pending", "approved", "rejected"]}
-    if server_id:
-        query["server_id"] = server_id
+    apply_server_scope(query, server_id, None if user.is_admin else user.server_ids)
     if source_type and source_type != "all":
         query["source_type"] = source_type
     if source_id:
@@ -125,10 +128,12 @@ async def list_ai_actions(
 async def pending_action_count(
     source_type: Optional[str] = Query(None),
     source_id: Optional[str] = Query(None),
+    user: CurrentUser = Depends(get_current_user),
 ):
-    """Count of pending (unresolved) AI actions — used for sidebar badge and per-source counters."""
+    """Count of pending (unresolved) AI actions — used for sidebar badge and per-source counters. Scoped to the principal's servers."""
     db = get_database()
     query: dict = {"status": "pending"}
+    apply_server_scope(query, None, None if user.is_admin else user.server_ids)
     if source_type and source_type != "all":
         query["source_type"] = source_type
     if source_id:
@@ -143,7 +148,7 @@ async def pending_action_count(
 # matches "/commands/approve" as action_id="commands".
 
 @router.post("/commands/approve")
-async def approve_command_batch(body: ApproveCommandsBody):
+async def approve_command_batch(body: ApproveCommandsBody, user: CurrentUser = Depends(_operator)):
     """
     Approve a list of pending ai_command rows and kick off execution.
     All commands in the list share a batch_id and run sequentially.
@@ -151,7 +156,7 @@ async def approve_command_batch(body: ApproveCommandsBody):
     if not body.command_ids:
         raise HTTPException(status_code=400, detail="command_ids required")
 
-    batch_id = await approve_commands(body.command_ids, decided_by=body.decided_by)
+    batch_id = await approve_commands(body.command_ids, decided_by=user.id)
 
     # Dispatch execution in background (non-blocking for the HTTP response)
     from app.modules.ai.execution_graph import run_execution_batch
@@ -161,11 +166,11 @@ async def approve_command_batch(body: ApproveCommandsBody):
 
 
 @router.post("/commands/reject")
-async def reject_command_batch(body: RejectCommandsBody):
+async def reject_command_batch(body: RejectCommandsBody, user: CurrentUser = Depends(_operator)):
     """Reject a list of pending ai_command rows (no execution)."""
     if not body.command_ids:
         raise HTTPException(status_code=400, detail="command_ids required")
-    await reject_commands(body.command_ids, decided_by=body.decided_by)
+    await reject_commands(body.command_ids, decided_by=user.id)
     return {"status": "rejected", "count": len(body.command_ids)}
 
 
@@ -186,8 +191,9 @@ async def list_ai_commands(
     to_date: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
+    user: CurrentUser = Depends(get_current_user),
 ):
-    """List ai_command rows with optional filters. Date filter applies on `created_at`."""
+    """List ai_command rows with optional filters. Date filter applies on `created_at`. Scoped to the principal's servers."""
     return await list_commands(
         status=status,
         server_id=server_id,
@@ -197,20 +203,22 @@ async def list_ai_commands(
         to_date=to_date,
         page=page,
         page_size=page_size,
+        allowed_server_ids=None if user.is_admin else user.server_ids,
     )
 
 
 @router.get("/commands/{command_id}")
-async def get_ai_command(command_id: str):
+async def get_ai_command(command_id: str, user: CurrentUser = Depends(get_current_user)):
     """Get a single ai_command row with full lifecycle detail."""
     doc = await get_command(command_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Command not found")
+    ensure_server_access(user, str(doc.get("server_id")))
     return doc
 
 
 @router.post("/commands/{command_id}/retry")
-async def retry_ai_command(command_id: str, decided_by: str = "operator"):
+async def retry_ai_command(command_id: str, user: CurrentUser = Depends(_operator)):
     """
     Clone a failed/blocked command into a new pending row and immediately approve+dispatch it.
     Returns the new command_id and batch_id.
@@ -220,7 +228,7 @@ async def retry_ai_command(command_id: str, decided_by: str = "operator"):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    batch_id = await approve_commands([new_id], decided_by=decided_by)
+    batch_id = await approve_commands([new_id], decided_by=user.id)
 
     from app.modules.ai.execution_graph import run_execution_batch
     asyncio.create_task(run_execution_batch(batch_id, [new_id]))
@@ -241,6 +249,7 @@ async def list_ai_analyses(
     page: Optional[int] = Query(None, ge=1),
     page_size: Optional[int] = Query(None, ge=1, le=100),
     limit: int = Query(20, ge=1, le=100),
+    user: CurrentUser = Depends(get_current_user),
 ):
     """
     List ai_analysis rows.
@@ -255,14 +264,14 @@ async def list_ai_analyses(
     """
     db = get_database()
     paginated = page is not None
+    allowed = None if user.is_admin else user.server_ids
 
     query: dict = {}
     if source_type and source_type != "all":
         query["source_type"] = source_type
     if source_id:
         query["source_id"] = source_id
-    if server_id:
-        query["server_id"] = server_id
+    apply_server_scope(query, server_id, allowed)
     if analysis_type and analysis_type != "all":
         query["analysis_type"] = analysis_type
     date_range = build_date_range_query(from_date, to_date)
@@ -270,10 +279,12 @@ async def list_ai_analyses(
         query["created_at"] = date_range
 
     if not paginated:
-        # Legacy unpaginated shape — preserved for existing callers
+        # Legacy unpaginated shape — preserved for existing callers (source-detail
+        # panels, which are themselves access-gated at the incident/anomaly endpoint).
         if source_id and source_type:
             return await list_analyses_for_source(source_type, source_id, analysis_type, limit)
         if server_id:
+            ensure_server_access(user, server_id)
             return await list_server_analyses(server_id, analysis_type, limit)
         cursor = db[Collections.AI_ANALYSIS].find(query).sort("created_at", -1).limit(limit)
         docs = await cursor.to_list(length=limit)
@@ -293,18 +304,20 @@ async def list_ai_analyses(
 
 
 @router.get("/analysis/{analysis_id}")
-async def get_ai_analysis(analysis_id: str):
+async def get_ai_analysis(analysis_id: str, user: CurrentUser = Depends(get_current_user)):
     """Get a single ai_analysis row with full markdown + structured fields."""
     doc = await get_analysis_by_id(analysis_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Analysis not found")
+    # app_overview rows have server_id=None → admin-only; others scope to the server.
+    ensure_server_access(user, str(doc.get("server_id")))
     return doc
 
 
 # ── Mutation-action dynamic routes — MUST be LAST so static /commands/* paths above match first ──
 
 @router.post("/{action_id}/approve")
-async def approve_action(action_id: str, decided_by: str = "operator"):
+async def approve_action(action_id: str, user: CurrentUser = Depends(_operator)):
     """Execute a pending AI mutation action (dismiss/promote/mark-false-positive) and mark it approved."""
     db = get_database()
     try:
@@ -408,13 +421,13 @@ async def approve_action(action_id: str, decided_by: str = "operator"):
     now = utc_now()
     await db[Collections.AI_ACTIONS].update_one(
         {"_id": oid},
-        {"$set": {"status": ActionStatus.APPROVED, "decided_at": now, "decided_by": decided_by, "outcome": outcome}},
+        {"$set": {"status": ActionStatus.APPROVED, "decided_at": now, "decided_by": user.id, "outcome": outcome}},
     )
     return {"status": "approved", "action_id": action_id, "outcome": outcome}
 
 
 @router.post("/{action_id}/reject")
-async def reject_action(action_id: str, decided_by: str = "operator"):
+async def reject_action(action_id: str, user: CurrentUser = Depends(_operator)):
     """Reject a pending AI mutation action without executing it."""
     db = get_database()
     try:
@@ -424,7 +437,7 @@ async def reject_action(action_id: str, decided_by: str = "operator"):
 
     result = await db[Collections.AI_ACTIONS].update_one(
         {"_id": oid, "status": ActionStatus.PENDING},
-        {"$set": {"status": ActionStatus.REJECTED, "decided_at": utc_now(), "decided_by": decided_by}},
+        {"$set": {"status": ActionStatus.REJECTED, "decided_at": utc_now(), "decided_by": user.id}},
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Pending action not found or already decided")

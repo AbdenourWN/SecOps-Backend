@@ -4,7 +4,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.responses import JSONResponse
 import fastapi.encoders as _fe
 
@@ -38,10 +38,23 @@ from app.modules.ws.router import router as ws_router
 from app.modules.ws.terminal_router import router as terminal_ws_router
 from app.modules.settings.router import router as settings_router
 from app.modules.ai.router import router as ai_router
+from app.modules.auth.router import router as auth_router
+from app.modules.users.router import router as users_router
+from app.core.auth import get_current_user, require_role
+from app.core.constants import UserRole
+from app.modules.auth.service import ensure_initial_admin
+from app.modules.auth.csrf import csrf_protect
 from app.modules.settings.service import load_system_settings
 from app.core.connection_pool import connection_pool, terminal_pool
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.config import settings
+from app.core.logging_config import configure_logging
+
+# Structured logging (Phase 20.4) — install the JSON root handler before anything
+# else emits. Idempotent; honors LOG_LEVEL / LOG_JSON.
+configure_logging()
+logger = logging.getLogger(__name__)
 
 
 async def _ensure_indexes():
@@ -157,7 +170,16 @@ async def _ensure_indexes():
     # TTL: notifications self-expire after 30 days
     await db[Collections.NOTIFICATIONS].create_index("created_at", expireAfterSeconds=30 * 24 * 3600, name="idx_notifications_ttl")
 
-    print("✅ Indexes ensured (incidents, rules, log_sources, log_observations, server_log_patterns, dismissed_fingerprints, reason_stats, ai_actions, ai_analysis, ai_command, notifications)")
+    # ── users (auth accounts) ─────────────────────────────────────────────────
+    await db[Collections.USERS].create_index([("username", 1)], unique=True, name="idx_users_username")
+
+    # ── sessions (rotating refresh tokens) ────────────────────────────────────
+    await db[Collections.SESSIONS].create_index([("token_hash", 1)], name="idx_sessions_token")
+    await db[Collections.SESSIONS].create_index([("user_id", 1)], name="idx_sessions_user")
+    # TTL: expired refresh-token rows vanish automatically
+    await db[Collections.SESSIONS].create_index("expires_at", expireAfterSeconds=0, name="idx_sessions_ttl")
+
+    logger.info("Indexes ensured (incidents, rules, log_sources, log_observations, server_log_patterns, dismissed_fingerprints, reason_stats, ai_actions, ai_analysis, ai_command, notifications, users, sessions)")
 
 
 @asynccontextmanager
@@ -173,6 +195,9 @@ async def lifespan(app: FastAPI):
 
     # All MongoDB indexes (idempotent — safe to re-run on every boot)
     await _ensure_indexes()
+
+    # Bootstrap the permanent protected admin (Phase 20.1) if none exists
+    await ensure_initial_admin()
 
     # Apply any runtime overrides stored in DB (e.g. max_concurrent_servers)
     await load_system_settings()
@@ -222,27 +247,46 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 
-app.include_router(servers_router, prefix="/api/servers", tags=["Servers"])
-app.include_router(logs_router, prefix="/api/logs", tags=["Logs"])
-app.include_router(automation_router, prefix="/api/automation", tags=["Automation"])
-app.include_router(metrics_router, prefix="/api/metrics", tags=["Metrics"])
-app.include_router(analysis_router, prefix="/api/analysis", tags=["AI Analysis"])
-app.include_router(incidents_router, prefix="/api/incidents", tags=["Incidents"])
-app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"])
-app.include_router(test_router, prefix="/api/test", tags=["Test & Simulation"])
-app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
-app.include_router(notifications_feed_router, prefix="/api/notifications", tags=["Notifications"])
-app.include_router(anomalies_router, prefix="/api/anomalies", tags=["Anomalies"])
-app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
-app.include_router(ai_router, prefix="/api/ai-actions", tags=["AI Actions"])
+# Auth routes are public: login/refresh establish the session; me/logout self-guard.
+app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
+
+# Every other HTTP router requires an authenticated principal. Fine-grained role +
+# per-server checks live inside the endpoints/services (Phase 20.1.4). The WS
+# routers authenticate from the connection cookie inside their handlers (HTTP
+# request-dependencies don't apply to WebSockets), so they stay open here.
+_auth = [Depends(get_current_user)]
+_admin = [Depends(require_role(UserRole.ADMIN.value))]
+
+app.include_router(servers_router, prefix="/api/servers", tags=["Servers"], dependencies=_auth)
+app.include_router(logs_router, prefix="/api/logs", tags=["Logs"], dependencies=_auth)
+app.include_router(automation_router, prefix="/api/automation", tags=["Automation"], dependencies=_auth)
+app.include_router(metrics_router, prefix="/api/metrics", tags=["Metrics"], dependencies=_auth)
+app.include_router(analysis_router, prefix="/api/analysis", tags=["AI Analysis"], dependencies=_auth)
+app.include_router(incidents_router, prefix="/api/incidents", tags=["Incidents"], dependencies=_auth)
+app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"], dependencies=_auth)
+app.include_router(test_router, prefix="/api/test", tags=["Test & Simulation"], dependencies=_admin)
+app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"], dependencies=_admin)
+app.include_router(notifications_feed_router, prefix="/api/notifications", tags=["Notifications"], dependencies=_auth)
+app.include_router(anomalies_router, prefix="/api/anomalies", tags=["Anomalies"], dependencies=_auth)
+app.include_router(settings_router, prefix="/api/settings", tags=["Settings"], dependencies=_admin)
+app.include_router(users_router, prefix="/api/users", tags=["Users"], dependencies=_admin)
+app.include_router(ai_router, prefix="/api/ai-actions", tags=["AI Actions"], dependencies=_auth)
 app.include_router(ws_router, prefix="/api", tags=["WebSocket"])
 app.include_router(terminal_ws_router, prefix="/api", tags=["Terminal WebSocket"])
 
 
 
+# CSRF (double-submit) — registered BEFORE CORS so CORS remains the outermost
+# layer and its headers are present even on a 403 CSRF rejection.
+app.add_middleware(BaseHTTPMiddleware, dispatch=csrf_protect)
+
+# CORS — a credentialed request cannot use a wildcard ACAO, so when ALLOWED_ORIGINS
+# is "*" we reflect any origin via regex (dev convenience) rather than send "*".
+_wildcard_origins = settings.ALLOWED_ORIGINS == "*"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS.split(",") if settings.ALLOWED_ORIGINS != "*" else ["*"],
+    allow_origins=[] if _wildcard_origins else settings.ALLOWED_ORIGINS.split(","),
+    allow_origin_regex=".*" if _wildcard_origins else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

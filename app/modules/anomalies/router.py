@@ -1,23 +1,26 @@
-from app.core.constants import Collections
+from app.core.constants import Collections, UserRole
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from app.core.errors import http_error
+from app.core.auth import CurrentUser, ensure_server_access, get_current_user, require_role
 
 from app.modules.anomalies.schemas import LogObservationListResponse, LogObservationResponse
 from app.modules.anomalies.service import AnomaliesService
 
 router = APIRouter()
 service = AnomaliesService()
+_operator = require_role(UserRole.OPERATOR.value)
 
 
 @router.get("/stats")
-async def get_anomaly_stats():
+async def get_anomaly_stats(user: CurrentUser = Depends(get_current_user)):
     """
     Dashboard aggregate: total / pending / dismissed / promoted counts.
+    Scoped to the principal's servers (admins see all).
     Must be above /{observation_id}.
     """
-    return await service.stats()
+    return await service.stats(allowed_server_ids=None if user.is_admin else user.server_ids)
 
 
 @router.get("/", response_model=LogObservationListResponse)
@@ -30,8 +33,9 @@ async def list_observations(
     to_date: Optional[str] = Query(None, description="ISO datetime — filter on last_seen_at <= this time"),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=200),
+    user: CurrentUser = Depends(get_current_user),
 ):
-    """List anomaly observations, newest first. Date range applies on `last_seen_at`."""
+    """List anomaly observations, newest first. Date range applies on `last_seen_at`. Scoped to the principal's servers."""
     return await service.list(
         page=page,
         page_size=page_size,
@@ -41,20 +45,22 @@ async def list_observations(
         type_=type,
         from_date=from_date,
         to_date=to_date,
+        allowed_server_ids=None if user.is_admin else user.server_ids,
     )
 
 
 @router.get("/{observation_id}", response_model=LogObservationResponse)
-async def get_observation(observation_id: str):
+async def get_observation(observation_id: str, user: CurrentUser = Depends(get_current_user)):
     """Get one anomaly observation with detail-page enrichment."""
     observation = await service.get_by_id(observation_id)
     if not observation:
         raise HTTPException(status_code=404, detail="Observation not found")
+    ensure_server_access(user, str(observation.get("server_id")))
     return observation
 
 
 @router.post("/{observation_id}/analyze")
-async def analyze_observation(observation_id: str):
+async def analyze_observation(observation_id: str, user: CurrentUser = Depends(_operator)):
     """
     Run the LangGraph anomaly triage agent on a Tier 2 observation.
     Saves ai_analysis + promotion_recommendation to the observation document.
@@ -69,8 +75,10 @@ async def analyze_observation(observation_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    if not await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid}, {"_id": 1}):
+    obs = await db[Collections.LOG_OBSERVATIONS].find_one({"_id": oid}, {"server_id": 1})
+    if not obs:
         raise HTTPException(status_code=404, detail="Observation not found")
+    ensure_server_access(user, str(obs.get("server_id")))
 
     await db[Collections.LOG_OBSERVATIONS].update_one(
         {"_id": oid},
@@ -114,8 +122,12 @@ async def analyze_observation(observation_id: str):
 
 
 @router.patch("/{observation_id}/dismiss")
-async def dismiss_observation(observation_id: str):
+async def dismiss_observation(observation_id: str, user: CurrentUser = Depends(_operator)):
     """Mark a pending observation as dismissed (false positive / not interesting)."""
+    existing = await service.get_by_id(observation_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Observation not found")
+    ensure_server_access(user, str(existing.get("server_id")))
     ok = await service.dismiss(observation_id)
     if not ok:
         raise HTTPException(
@@ -126,12 +138,16 @@ async def dismiss_observation(observation_id: str):
 
 
 @router.post("/{observation_id}/promote")
-async def promote_observation(observation_id: str):
+async def promote_observation(observation_id: str, user: CurrentUser = Depends(_operator)):
     """
     Promote a pending observation to a real incident. The observation
     transitions to PROMOTED_TO_INCIDENT and a new incident is created with
     rule_id="anomaly:promoted".
     """
+    existing = await service.get_by_id(observation_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Observation not found")
+    ensure_server_access(user, str(existing.get("server_id")))
     incident_id = await service.promote_to_incident(observation_id)
     if not incident_id:
         raise HTTPException(
@@ -146,7 +162,7 @@ async def promote_observation(observation_id: str):
 
 
 @router.post("/{observation_id}/auto-promote")
-async def auto_promote_observation(observation_id: str):
+async def auto_promote_observation(observation_id: str, user: CurrentUser = Depends(_operator)):
     """
     Attempt auto-promotion: promotes only if severity==high, occurrence_count>=3,
     and the fingerprint is not in the dismissed suppression list.
@@ -157,6 +173,7 @@ async def auto_promote_observation(observation_id: str):
     obs = await service.get_by_id(observation_id)
     if not obs:
         raise HTTPException(status_code=404, detail="Observation not found")
+    ensure_server_access(user, str(obs.get("server_id")))
 
     promoted = await service.maybe_auto_promote(
         observation_id, obs.get("server_id", ""), force=True

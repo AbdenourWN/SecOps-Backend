@@ -136,13 +136,14 @@ async def list_commands(
     to_date: Optional[str] = None,
     page: int = 1,
     page_size: int = 25,
+    allowed_server_ids=None,
 ) -> dict:
+    from app.core.db_utils import apply_server_scope
     db = get_database()
     query: dict = {}
     if status and status != "all":
         query["status"] = status
-    if server_id:
-        query["server_id"] = server_id
+    apply_server_scope(query, server_id, allowed_server_ids)
     if source_id:
         query["source_id"] = source_id
     if source_type and source_type != "all":

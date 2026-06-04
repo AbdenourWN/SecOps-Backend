@@ -11,12 +11,12 @@ analysis finished, incident created, remediation outcome, …). It is
 **best-effort**: any failure is swallowed so a notification never breaks the
 emitting flow.
 
-RBAC: every row stores `server_id` + `user_id` (None = all admins). For v1 the
-WS ping goes to one global `notifications` topic and the REST feed returns
-everything (single admin). When auth lands, `_scope_query()` filters by
-principal and the WS topic splits per recipient — both additive, no schema
-change. See the plan / ARCHITECTURE Known Weaknesses (WS dual-emit).
+RBAC (Phase 20.1): every row stores `server_id` + `user_id` (None = all admins).
+`_scope_query(principal)` filters the REST feed to the principal's own + their
+servers' + app-wide rows, and `_emit` fans each notification out to per-recipient
+WS topics (`notifications.user.<id>`) resolved from the row's scope.
 """
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -25,11 +25,14 @@ from app.core.constants import (
     NotificationCategory,
     NotificationSeverity,
     NotificationType,
-    WSTopic,
+    UserRole,
+    user_notif_topic,
 )
 from app.core.database import get_database
 from app.core.db_utils import build_date_range_query, safe_object_id
 from app.core.events import event_bus
+
+logger = logging.getLogger(__name__)
 
 
 def _val(v) -> Optional[str]:
@@ -106,7 +109,8 @@ class NotificationFeedService:
                     "body": body,
                 }
                 out = _serialize(merged)
-                self._emit(out)
+                recipients = await self._resolve_recipients(merged.get("server_id"), merged.get("user_id"))
+                self._emit(out, recipients)
                 return out
 
         doc = {
@@ -130,31 +134,51 @@ class NotificationFeedService:
         result = await col.insert_one(doc)
         doc["_id"] = result.inserted_id
         out = _serialize(doc)
-        self._emit(out)
+        recipients = await self._resolve_recipients(server_id, user_id)
+        self._emit(out, recipients)
         return out
 
-    def _emit(self, out: dict) -> None:
-        """Fan the new/updated notification out on the global feed topic."""
-        try:
-            event_bus.emit(WSTopic.NOTIFICATIONS, "notification.created", out)
-        except Exception:
-            pass
+    async def _resolve_recipients(self, server_id: Optional[str], user_id: Optional[str]) -> list[str]:
+        """Which user ids receive this notification: a specific `user_id`; else
+        all users assigned to `server_id` plus all admins; else (app-wide) all
+        admins. Admins always see server-scoped + app-wide notifications."""
+        users = get_database()[Collections.USERS]
+        if user_id:
+            return [user_id]
+        admin_ids = [
+            str(u["_id"])
+            async for u in users.find({"role": UserRole.ADMIN.value, "is_active": True}, {"_id": 1})
+        ]
+        if server_id:
+            assigned = [
+                str(u["_id"])
+                async for u in users.find({"server_ids": server_id, "is_active": True}, {"_id": 1})
+            ]
+            return list({*admin_ids, *assigned})
+        return admin_ids
+
+    def _emit(self, out: dict, recipient_ids: list[str]) -> None:
+        """Fan the notification to each recipient's per-user topic (Phase 20.1)."""
+        for uid in recipient_ids:
+            try:
+                event_bus.emit(user_notif_topic(uid), "notification.created", out)
+            except Exception:
+                pass
 
     # ── read / mutate ────────────────────────────────────────────────────────
     def _scope_query(self, principal=None) -> dict:
-        """
-        The access-control boundary. Returns ``{}`` today (single admin sees
-        all). With auth this becomes::
-
-            {"$or": [
+        """Per-principal access filter (Phase 20.1). Admin — or no principal (an
+        internal caller) — sees everything; otherwise the principal sees their own
+        rows + rows scoped to an assigned server + app-wide rows."""
+        if principal is None or getattr(principal, "is_admin", False):
+            return {}
+        return {
+            "$or": [
                 {"user_id": principal.id},
                 {"user_id": None, "server_id": {"$in": principal.server_ids}},
                 {"user_id": None, "server_id": None},
-            ]}
-
-        so each principal only sees their own + their servers' + app-wide rows.
-        """
-        return {}
+            ]
+        }
 
     async def list_page(
         self,
@@ -198,12 +222,15 @@ class NotificationFeedService:
         query["read"] = False
         return await self._col.count_documents(query)
 
-    async def mark_read(self, notification_id: str) -> bool:
+    async def mark_read(self, notification_id: str, *, principal=None) -> bool:
         oid = safe_object_id(notification_id)
         if oid is None:
             return False
+        query = self._scope_query(principal)  # scope so a user can't touch others' rows
+        query["_id"] = oid
+        query["read"] = False
         res = await self._col.update_one(
-            {"_id": oid, "read": False},
+            query,
             {"$set": {"read": True, "read_at": datetime.now(timezone.utc)}},
         )
         return res.modified_count > 0
@@ -216,11 +243,13 @@ class NotificationFeedService:
         )
         return res.modified_count
 
-    async def dismiss(self, notification_id: str) -> bool:
+    async def dismiss(self, notification_id: str, *, principal=None) -> bool:
         oid = safe_object_id(notification_id)
         if oid is None:
             return False
-        res = await self._col.delete_one({"_id": oid})
+        query = self._scope_query(principal)  # scope so a user can't delete others' rows
+        query["_id"] = oid
+        res = await self._col.delete_one(query)
         return res.deleted_count > 0
 
 
@@ -258,9 +287,9 @@ async def notify(
             dedup_key=dedup_key,
             dedup_window_s=dedup_window_s,
         )
-    except Exception as exc:
+    except Exception:
         try:
-            print(f"[notify] failed type={_val(type)}: {exc.__class__.__name__}: {exc}")
+            logger.exception("notify failed type=%s", _val(type))
         except Exception:
             pass
         return None

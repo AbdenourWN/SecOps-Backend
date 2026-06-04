@@ -20,8 +20,11 @@ from app.core.constants import (
     NotificationType, NotificationCategory, NotificationSeverity,
 )
 import json
+import logging
 import uuid
 from datetime import timezone
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import HumanMessage
 
@@ -328,7 +331,7 @@ async def run_app_overview() -> dict:
         # clean, user-facing message on the stream — mirrors core/errors.http_error
         # so the dashboard card shows plain English, not a Python exception.
         ref = str(uuid.uuid4())[:8]
-        print(f"[app_overview] failed run={run_id} [{ref}]: {type(exc).__name__}: {exc}")
+        logger.error("[app_overview] failed run=%s [%s]: %s: %s", run_id, ref, type(exc).__name__, exc)
         friendly = f"Couldn't generate the platform overview — please try again. (ref: {ref})"
         try:
             event_bus.emit(_TOPIC, WSEvent.AI_ANALYSIS_COMPLETE, {

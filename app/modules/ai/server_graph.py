@@ -31,11 +31,14 @@ from app.core.constants import (
     NotificationType, NotificationCategory, NotificationSeverity,
 )
 import json
+import logging
 import re
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from bson import ObjectId
 from langchain_core.messages import HumanMessage
@@ -364,7 +367,7 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
 
     except Exception as e:
         import traceback
-        print(f"[server_overview] agent error for {server_id}: {type(e).__name__}: {e}")
+        logger.error("[server_overview] agent error for %s: %s: %s", server_id, type(e).__name__, e)
         traceback.print_exc()
 
     if not final_messages and stream_buffer:
@@ -372,7 +375,7 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
         final_messages = [AIMessage(content="".join(stream_buffer))]
 
     elapsed = time.monotonic() - t0
-    print(f"[ai_server_overview] server={server_id} run={run_id} elapsed={elapsed:.2f}s turns={turn_count}")
+    logger.info("[ai_server_overview] server=%s run=%s elapsed=%.2fs turns=%s", server_id, run_id, elapsed, turn_count)
 
     # Hard-fail if the agent produced absolutely nothing
     if not final_messages and not stream_buffer:
@@ -420,10 +423,9 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
     confidence = float(parsed.get("confidence", 0.0))
     suggestions = parsed.get("suggestions") or []
 
-    print(
-        f"[server_overview] {server_id}: json_found={bool(parsed)} "
-        f"manual={len(manual_commands)} msg_chars={len(raw_text_messages)} "
-        f"stream_chars={len(full_stream)}"
+    logger.debug(
+        "[server_overview] %s: json_found=%s manual=%d msg_chars=%d stream_chars=%d",
+        server_id, bool(parsed), len(manual_commands), len(raw_text_messages), len(full_stream),
     )
 
     structured = {
@@ -463,7 +465,7 @@ async def run_server_overview(server_id: str, hours: int = 24) -> dict:
                 server_id=server_id,
             )
         except Exception as e:
-            print(f"[server_overview] queue suggestions failed: {type(e).__name__}: {e}")
+            logger.warning("[server_overview] queue suggestions failed: %s: %s", type(e).__name__, e)
 
     _emit_ws(server_id, WSEvent.AI_ANALYSIS_COMPLETE, {
         "run_id": run_id,

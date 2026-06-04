@@ -1,7 +1,11 @@
+import logging
+
 from app.core.database import get_database
 from app.core.config import settings
 from app.modules.notifications.schemas import AlertPayload, NotificationChannel
 from app.modules.notifications.channels.email import EmailChannel
+
+logger = logging.getLogger(__name__)
 
 
 # Severity ranking for min_severity filtering
@@ -191,4 +195,4 @@ async def load_llm_settings() -> None:
     if doc and doc.get("provider") and doc.get("model"):
         from app.modules.ai.llm import apply_llm_override
         apply_llm_override(doc["provider"], doc["model"])
-        print(f"⚙️  LLM settings loaded — provider={doc['provider']} model={doc['model']}")
+        logger.info("LLM settings loaded — provider=%s model=%s", doc['provider'], doc['model'])

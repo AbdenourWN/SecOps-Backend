@@ -2,6 +2,7 @@ from app.core.constants import (
     Collections, WSTopic, DetectionDefaults, AutomationSkippedReason, AutomationFailureReason,
     NotificationType, NotificationCategory, NotificationSeverity,
 )
+import logging
 import re
 import time
 from datetime import datetime, timezone, timedelta
@@ -12,6 +13,8 @@ from app.modules.logs.schemas import LogEntryInDB
 from bson import ObjectId
 from app.modules.automation.service import AutomationService
 from app.modules.notifications.service import NotificationService
+
+logger = logging.getLogger(__name__)
 from app.modules.notifications.schemas import AlertPayload
 from app.modules.heuristics.service import HeuristicService
 from app.modules.anomalies.service import AnomaliesService
@@ -89,11 +92,11 @@ async def _get_cached_rules():
                     "compiled_pattern": re.compile(r["pattern"], re.IGNORECASE)
                 })
             except re.error:
-                print(f"❌ Invalid Regex in Rule {r['name']}")
+                logger.warning("Invalid regex in rule %s", r["name"])
         
         _rule_cache["rules"] = compiled
         _rule_cache["loaded_at"] = now
-        print(f"🔄 Rule cache refreshed: {len(compiled)} rules compiled")
+        logger.info("Rule cache refreshed: %d rules compiled", len(compiled))
     
     return _rule_cache["rules"]
 
@@ -300,8 +303,13 @@ class AnalysisService:
                     if existing is not None:
                         existing_id = existing["_id"]
 
-                        # Already escalated: don't retry, don't alert again. Waits for manual resolve.
-                        if existing.get("automation_failure_reason") == AutomationFailureReason.REMEDIATION_EXHAUSTED.value:
+                        # Already terminal — don't retry, don't alert again. Waits for manual
+                        # resolve. Covers exhausted retries AND permission failures (Phase 20.6:
+                        # re-running with the same credential can't succeed).
+                        if existing.get("automation_failure_reason") in (
+                            AutomationFailureReason.REMEDIATION_EXHAUSTED.value,
+                            AutomationFailureReason.PERMISSION_DENIED.value,
+                        ):
                             continue
 
                         verification_until = to_utc(existing.get("verification_until"))
@@ -315,7 +323,7 @@ class AnalysisService:
                             # Re-trigger inside the verification window → previous remediation FAILED.
                             attempts = existing.get("remediation_attempts", 0) + 1
                             max_attempts = _cfg(server).get("max_remediation_attempts") or MAX_REMEDIATION_ATTEMPTS
-                            print(f"🔁 Rule '{rule['name']}' re-fired during verification — attempt {attempts}/{max_attempts}")
+                            logger.info("Rule '%s' re-fired during verification — attempt %d/%d", rule['name'], attempts, max_attempts)
 
                             if attempts >= max_attempts:
                                 # Give up — mark exhausted, escalate, do NOT re-run.
@@ -334,7 +342,7 @@ class AnalysisService:
                                     "server_id": server_id_str,
                                     "reason": AutomationFailureReason.REMEDIATION_EXHAUSTED.value,
                                 })
-                                event_bus.emit(f"servers.{server_id_str}.incidents", "incident.updated", {  # deprecated: remove when RBAC lands
+                                event_bus.emit(f"servers.{server_id_str}.incidents", "incident.updated", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                                     "incident_id": str(existing_id),
                                     "server_id": server_id_str,
                                     "reason": AutomationFailureReason.REMEDIATION_EXHAUSTED.value,
@@ -384,7 +392,7 @@ class AnalysisService:
                                 "reason": "remediation_retry",
                                 "attempt": attempts,
                             })
-                            event_bus.emit(f"servers.{server_id_str}.incidents", "incident.updated", {  # deprecated: remove when RBAC lands
+                            event_bus.emit(f"servers.{server_id_str}.incidents", "incident.updated", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                                 "incident_id": str(existing_id),
                                 "server_id": server_id_str,
                                 "reason": "remediation_retry",
@@ -406,7 +414,7 @@ class AnalysisService:
                     # ========================================================
                     # No prior recent incident — fresh detection.
                     # ========================================================
-                    print(f"🚨 Incident: {rule['name']} | Ctx: {extracted_context}")
+                    logger.info("Incident: %s | ctx=%s", rule['name'], extracted_context)
 
                     incident = IncidentInDB(
                         server_id=server_id_str,
@@ -459,7 +467,7 @@ class AnalysisService:
 
                         if recurrence_streak >= recurrence_threshold:
                             skipped_reason = AutomationSkippedReason.RECURRENCE_DETECTED.value
-                            print(f"🔄 Recurrence streak {recurrence_streak}/{recurrence_threshold} for '{rule['name']}' on {server.get('hostname')} — pausing automation")
+                            logger.warning("Recurrence streak %d/%d for '%s' on %s — pausing automation", recurrence_streak, recurrence_threshold, rule['name'], server.get('hostname'))
 
                     alert_payload = AlertPayload(
                         incident_id="",
@@ -479,7 +487,7 @@ class AnalysisService:
                         # If the rule re-fires within VERIFICATION_WINDOW_MINUTES, the
                         # background job_verify_remediation will not auto-resolve and the
                         # next analyze_logs() call will retry/escalate via the branch above.
-                        print(f"⚙️ Triggering Automation for Rule: {rule['name']}")
+                        logger.info("Triggering automation for rule: %s", rule['name'])
 
                         incident_data = incident.model_dump()
                         incident_data["status"] = IncidentStatus.VERIFYING.value
@@ -502,7 +510,7 @@ class AnalysisService:
                             "rule_name": rule["name"],
                             "action_level": action_level,
                         })
-                        event_bus.emit(f"servers.{server_id_str}.incidents", "incident.created", {  # deprecated: remove when RBAC lands
+                        event_bus.emit(f"servers.{server_id_str}.incidents", "incident.created", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                             "incident_id": incident_id,
                             "server_id": server_id_str,
                             "severity": rule["severity"],
@@ -524,8 +532,12 @@ class AnalysisService:
                         # VERIFYING here would permanently block retries (Bug 2).
                         # Annotate the failure reason for operator visibility.
                         if not success:
+                            # Don't clobber a more specific terminal reason that
+                            # execute_remediation may have already set (Phase 20.6:
+                            # permission_denied) — only annotate the generic case.
                             await db[Collections.INCIDENTS].update_one(
-                                {"_id": inc_result.inserted_id},
+                                {"_id": inc_result.inserted_id,
+                                 "automation_failure_reason": {"$ne": AutomationFailureReason.PERMISSION_DENIED.value}},
                                 {"$set": {"automation_failure_reason": AutomationFailureReason.EXECUTION_FAILED.value}},
                             )
 
@@ -546,7 +558,7 @@ class AnalysisService:
                             {"$inc": {"open_incidents_count": 1}},
                         )
                         event_bus.emit(WSTopic.SERVERS, "server.updated", {"server_id": server_id_str})
-                        print(f"⚠️ Automation skipped ({skipped_reason}) for rule: {rule['name']}")
+                        logger.warning("Automation skipped (%s) for rule: %s", skipped_reason, rule['name'])
                         event_bus.emit(WSTopic.INCIDENTS, "incident.created", {
                             "incident_id": incident_id,
                             "server_id": server_id_str,
@@ -554,7 +566,7 @@ class AnalysisService:
                             "rule_name": rule["name"],
                             "action_level": 3,
                         })
-                        event_bus.emit(f"servers.{server_id_str}.incidents", "incident.created", {  # deprecated: remove when RBAC lands
+                        event_bus.emit(f"servers.{server_id_str}.incidents", "incident.created", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                             "incident_id": incident_id,
                             "server_id": server_id_str,
                             "severity": rule["severity"],
@@ -586,14 +598,14 @@ class AnalysisService:
                         await self.anomalies_service.record_log_observation(
                             log=log, server=server, flags=flags
                         )
-                except Exception as e:
+                except Exception:
                     # Heuristics must never break detection — log and move on
-                    print(f"⚠️ Heuristic evaluation failed: {e}")
+                    logger.exception("Heuristic evaluation failed")
 
         # 4. Bulk Save (for incidents that didn't run automation)
         if new_incidents:
             inc_results = await db[Collections.INCIDENTS].insert_many(new_incidents)
-            print(f"💾 Saved {len(new_incidents)} new incidents.")
+            logger.info("Saved %d new incidents", len(new_incidents))
 
             # Increment open_incidents_count per server (one $inc per distinct server_id)
             _sid_counts: dict[str, int] = {}
@@ -615,7 +627,7 @@ class AnalysisService:
                     "rule_name": inc_data["description"].replace("Detected: ", ""),
                     "action_level": 3,
                 })
-                event_bus.emit(f"servers.{_sid}.incidents", "incident.created", {  # deprecated: remove when RBAC lands
+                event_bus.emit(f"servers.{_sid}.incidents", "incident.created", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                     "incident_id": str(inc_results.inserted_ids[i]),
                     "server_id": _sid,
                     "severity": inc_data.get("severity"),
@@ -828,6 +840,6 @@ class AnalysisService:
         if missing:
             await db[Collections.RULES].insert_many(missing)
             linked_count = sum(1 for r in missing if r.get("remediation_script_id"))
-            print(f"🌱 Seeded {len(missing)} missing rule(s) ({linked_count} linked to scripts)")
+            logger.info("Seeded %d missing rule(s) (%d linked to scripts)", len(missing), linked_count)
         else:
-            print(f"✅ Rules up-to-date ({len(existing_names)} rules in DB)")
+            logger.info("Rules up-to-date (%d rules in DB)", len(existing_names))

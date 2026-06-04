@@ -296,11 +296,12 @@ class AnomaliesService:
         type_: Optional[str] = None,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        allowed_server_ids=None,
     ) -> dict:
         from datetime import datetime
+        from app.core.db_utils import apply_server_scope
         q: dict = {}
-        if server_id:
-            q["server_id"] = server_id
+        apply_server_scope(q, server_id, allowed_server_ids)
         if status and status != "all":
             q["status"] = status
         if severity and severity != "all":
@@ -334,9 +335,10 @@ class AnomaliesService:
         type_: Optional[str] = None,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        allowed_server_ids=None,
     ):
         db = get_database()
-        q = self._build_filter(server_id, status, severity, type_, from_date, to_date)
+        q = self._build_filter(server_id, status, severity, type_, from_date, to_date, allowed_server_ids=allowed_server_ids)
 
         total = await db[Collections.LOG_OBSERVATIONS].count_documents(q)
         skip = (page - 1) * page_size
@@ -405,9 +407,15 @@ class AnomaliesService:
 
         return obs
 
-    async def stats(self) -> dict:
+    async def stats(self, allowed_server_ids=None) -> dict:
         db = get_database()
-        pipeline = [
+        # RBAC (Phase 20.1): None = admin (all servers); a list restricts the
+        # aggregate to the principal's assigned servers so headline counts match
+        # the scoped list view (observations store server_id as a str).
+        pipeline = []
+        if allowed_server_ids is not None:
+            pipeline.append({"$match": {"server_id": {"$in": list(allowed_server_ids)}}})
+        pipeline.append(
             {
                 "$group": {
                     "_id": None,
@@ -438,7 +446,7 @@ class AnomaliesService:
                     },
                 }
             }
-        ]
+        )
         agg = await db[Collections.LOG_OBSERVATIONS].aggregate(pipeline).to_list(length=1)
         if not agg:
             return {"total": 0, "pending": 0, "dismissed": 0, "promoted": 0}

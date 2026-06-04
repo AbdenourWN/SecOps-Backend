@@ -1,7 +1,10 @@
+import logging
 from app.core.constants import Collections
 from motor.motor_asyncio import AsyncIOMotorClient
-from app.core.config import settings 
+from app.core.config import settings
 from pymongo import ASCENDING, DESCENDING
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -24,7 +27,7 @@ async def connect_to_mongo():
         db.client = AsyncIOMotorClient(MONGO_URI, tz_aware=True)
         # Send a ping to confirm connection
         await db.client.admin.command('ping')
-        print(f"✅ Connected to MongoDB: {DB_NAME}")
+        logger.info("Connected to MongoDB: %s", DB_NAME)
 
          # --- PERFORMANCE OPTIMIZATION: CREATE INDEXES ---
         database = db.client[DB_NAME]
@@ -49,11 +52,11 @@ async def connect_to_mongo():
         from app.modules.servers.audit import ensure_audit_indexes
         await ensure_audit_indexes()
 
-        print("⚡ Database Indexes Created")
+        logger.info("Database indexes created")
 
-    except Exception as e:
-        print(f"❌ Could not connect to MongoDB: {e}")
-        raise e
+    except Exception:
+        logger.exception("Could not connect to MongoDB")
+        raise
 
 async def close_mongo_connection():
     """
@@ -61,7 +64,7 @@ async def close_mongo_connection():
     """
     if db.client:
         db.client.close()
-        print("🛑 MongoDB connection closed.")
+        logger.info("MongoDB connection closed")
 
 def get_database():
     """

@@ -15,11 +15,14 @@ from app.core.constants import (
     NotificationType, NotificationCategory, NotificationSeverity,
 )
 import json
+import logging
 import re
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from bson import ObjectId
 from langchain_core.messages import HumanMessage
@@ -282,9 +285,9 @@ async def run_anomaly_triage(observation_id: str) -> dict:
     try:
         deleted = await clear_pending_actions_for_source("anomaly", observation_id)
         if deleted:
-            print(f"[anomaly_triage] cleared {deleted} stale pending ai_actions row(s) for observation {observation_id}")
+            logger.info("[anomaly_triage] cleared %d stale pending ai_actions row(s) for observation %s", deleted, observation_id)
     except Exception as e:
-        print(f"[anomaly_triage] clear_pending_actions failed for observation {observation_id}: {e}")
+        logger.warning("[anomaly_triage] clear_pending_actions failed for observation %s: %s", observation_id, e)
 
     tools = bind_tools_for_server(server, run_id, source_type=SourceType.ANOMALY, source_id=observation_id)
     model = get_chat_model()
@@ -413,7 +416,7 @@ async def run_anomaly_triage(observation_id: str) -> dict:
 
     except Exception as e:
         import traceback
-        print(f"[anomaly_triage] agent error for {observation_id}: {type(e).__name__}: {e}")
+        logger.error("[anomaly_triage] agent error for %s: %s: %s", observation_id, type(e).__name__, e)
         traceback.print_exc()
 
     # Fallback: if on_chain_end never delivered messages, reconstruct from the stream buffer
@@ -421,10 +424,10 @@ async def run_anomaly_triage(observation_id: str) -> dict:
         from langchain_core.messages import AIMessage
         final_messages = [AIMessage(content="".join(stream_buffer))]
 
-    print(f"[anomaly_triage] {observation_id} captured: final_messages={len(final_messages)} stream_buffer_chars={sum(len(s) for s in stream_buffer)}")
+    logger.debug("[anomaly_triage] %s captured: final_messages=%d stream_buffer_chars=%d", observation_id, len(final_messages), sum(len(s) for s in stream_buffer))
 
     elapsed = time.monotonic() - t0
-    print(f"[ai_anomaly] observation={observation_id} run={run_id} elapsed={elapsed:.2f}s turns={turn_count}")
+    logger.info("[ai_anomaly] observation=%s run=%s elapsed=%.2fs turns=%s", observation_id, run_id, elapsed, turn_count)
 
     # If the agent produced nothing at all — no messages AND no streamed tokens
     # — surface the failure to the caller so the router returns 503 instead of
@@ -499,10 +502,10 @@ async def run_anomaly_triage(observation_id: str) -> dict:
     # server-scoped rules from the anomaly pattern.
     library_suggestions = parsed.get("suggestions") or []
 
-    print(
-        f"[anomaly_triage] {observation_id}: json_found={bool(parsed)} "
-        f"suggestions={len(suggestions)} manual={len(manual_commands)} "
-        f"msg_chars={len(raw_text_messages)} stream_chars={len(full_stream)}"
+    logger.debug(
+        "[anomaly_triage] %s: json_found=%s suggestions=%d manual=%d msg_chars=%d stream_chars=%d",
+        observation_id, bool(parsed), len(suggestions), len(manual_commands),
+        len(raw_text_messages), len(full_stream),
     )
     structured = {
         "severity_assessment": parsed.get("severity_assessment", ""),
@@ -561,7 +564,7 @@ async def run_anomaly_triage(observation_id: str) -> dict:
                 server_id=str(server_id),
             )
         except Exception as e:
-            print(f"[anomaly_triage] queue library suggestions failed: {type(e).__name__}: {e}")
+            logger.warning("[anomaly_triage] queue library suggestions failed: %s: %s", type(e).__name__, e)
 
     # Emit completion signal
     _emit_ws(server_id, WSEvent.AI_ANALYSIS_COMPLETE, {

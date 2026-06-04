@@ -1,5 +1,9 @@
+import logging
+
 from app.core.database import get_database
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 _COLLECTION = "system_settings"
 _DOC_ID = "global"
@@ -43,4 +47,4 @@ async def load_system_settings() -> None:
     doc = await db[_COLLECTION].find_one({"_id": _DOC_ID})
     if doc and doc.get("max_concurrent_servers") is not None:
         set_concurrent_limit(doc["max_concurrent_servers"])
-        print(f"⚙️  System settings loaded — max_concurrent_servers={doc['max_concurrent_servers']}")
+        logger.info("System settings loaded — max_concurrent_servers=%s", doc['max_concurrent_servers'])

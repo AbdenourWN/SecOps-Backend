@@ -1,12 +1,13 @@
-from app.core.constants import Collections, WSTopic
+from app.core.constants import Collections, WSTopic, UserRole
 import asyncio
 import re as re_mod
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from app.core.errors import http_error
 from typing import Optional
 from app.modules.automation.schemas import ScriptCreate, ScriptInDB
 from app.modules.automation.service import AutomationService
+from app.core.auth import CurrentUser, ensure_server_access, get_current_user, require_role
 from app.core.database import get_database
 from app.core.datetime_utils import utc_now
 from app.core.events import event_bus
@@ -15,6 +16,8 @@ from datetime import datetime, timezone
 
 router = APIRouter()
 service = AutomationService()
+_operator = require_role(UserRole.OPERATOR.value)
+_admin = require_role(UserRole.ADMIN.value)
 
 
 @router.get("/history")
@@ -26,12 +29,13 @@ async def get_automation_history(
     script_id: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None, description="ISO datetime — filter on executed_at >= this time"),
     to_date: Optional[str] = Query(None, description="ISO datetime — filter on executed_at <= this time"),
+    user: CurrentUser = Depends(get_current_user),
 ):
     """
     Remediation runs (newest first), enriched with server hostname + script name.
     Supports pagination, status/server/script filters, and an executed_at range.
     Used by both the dashboard activity widget and the dedicated automation history page.
-    NOTE: Must be declared above /{script_id}-style routes.
+    Scoped to the principal's servers. NOTE: Must be declared above /{script_id}-style routes.
     """
     return await service.get_history(
         limit=limit,
@@ -41,11 +45,12 @@ async def get_automation_history(
         script_id=script_id,
         from_date=from_date,
         to_date=to_date,
+        allowed_server_ids=None if user.is_admin else user.server_ids,
     )
 
 
 @router.get("/history/{automation_log_id}")
-async def get_remediation_run(automation_log_id: str):
+async def get_remediation_run(automation_log_id: str, user: CurrentUser = Depends(get_current_user)):
     """
     Phase 28.5 — single-run fetch for the remediation detail page. Returns the
     same shape as `/history` list entries (enriched with server_hostname +
@@ -54,11 +59,12 @@ async def get_remediation_run(automation_log_id: str):
     run = await service.get_run(automation_log_id)
     if not run:
         raise HTTPException(status_code=404, detail="Automation log not found")
+    ensure_server_access(user, str(run.get("server_id")))
     return run
 
 
 @router.post("/history/{automation_log_id}/analyze")
-async def manually_analyze_remediation(automation_log_id: str):
+async def manually_analyze_remediation(automation_log_id: str, user: CurrentUser = Depends(_operator)):
     """
     Phase 28.4 — On-demand AI review for a single remediation run.
 
@@ -82,6 +88,7 @@ async def manually_analyze_remediation(automation_log_id: str):
     log = await db[Collections.AUTOMATION_LOGS].find_one({"_id": oid})
     if not log:
         raise HTTPException(status_code=404, detail="Automation log not found")
+    ensure_server_access(user, str(log.get("server_id")))
 
     # Idempotency-ish: refuse if a review is already in flight (the marker
     # field is set inline by the background task on completion or failure).
@@ -142,23 +149,23 @@ async def get_automation_history_stats(
     script_id: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None),
     to_date: Optional[str] = Query(None),
+    user: CurrentUser = Depends(get_current_user),
 ):
     """
     Headline stats for the automation history page: total, success, failed,
     last_24h count, and success rate. Honors the same filters as /history
-    so numbers stay in sync with the table.
+    so numbers stay in sync with the table. Scoped to the principal's servers.
     """
     return await service.get_history_stats(
         status=status,
         server_id=server_id,
         script_id=script_id,
-        from_date=from_date,
-        to_date=to_date,
+        allowed_server_ids=None if user.is_admin else user.server_ids,
     )
 
 
 @router.post("/", response_model=dict)
-async def create_new_script(script: ScriptCreate):
+async def create_new_script(script: ScriptCreate, user: CurrentUser = Depends(_admin)):
     # Phase 28.5 — ownership validation
     db = get_database()
     if script.owner_type == "server":
@@ -184,7 +191,7 @@ async def create_new_script(script: ScriptCreate):
 
 
 @router.post("/servers/{server_id}/scripts", response_model=dict)
-async def create_script_for_server(server_id: str, script: ScriptCreate):
+async def create_script_for_server(server_id: str, script: ScriptCreate, user: CurrentUser = Depends(_admin)):
     """
     Phase 28.5 convenience endpoint — creates a script pre-scoped to a server.
     The path parameter is authoritative: body owner_* is overridden so a buggy
@@ -204,20 +211,33 @@ async def list_scripts(
     owner_id: Optional[str] = Query(None, description="Phase 28.5: filter server-scoped scripts to a specific server"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
+    user: CurrentUser = Depends(get_current_user),
 ):
     db = get_database()
-    query = {}
+    # Build with $and so the RBAC scope clause never clobbers the search $or.
+    and_clauses: list[dict] = []
     if language:
-        query["language"] = language
+        and_clauses.append({"language": language})
     if target_os:
-        query["target_os"] = target_os
+        and_clauses.append({"target_os": target_os})
     if owner_type in ("global", "server"):
-        query["owner_type"] = owner_type
+        and_clauses.append({"owner_type": owner_type})
     if owner_id:
-        query["owner_id"] = owner_id
+        and_clauses.append({"owner_id": owner_id})
     if search:
         pattern = re_mod.compile(re_mod.escape(search), re_mod.IGNORECASE)
-        query["$or"] = [{"name": pattern}, {"description": pattern}]
+        and_clauses.append({"$or": [{"name": pattern}, {"description": pattern}]})
+
+    # RBAC scope (Phase 20.1): non-admins see global/library scripts plus
+    # server-scoped scripts ONLY for servers they're assigned to. A script owned
+    # by an unassigned server must never appear in the list.
+    if not user.is_admin:
+        and_clauses.append({"$or": [
+            {"owner_type": {"$ne": "server"}},        # global / legacy (no owner) → shared
+            {"owner_id": {"$in": user.server_ids}},   # server-scoped → assigned only
+        ]})
+
+    query: dict = {"$and": and_clauses} if and_clauses else {}
 
     total = await db[Collections.SCRIPTS].count_documents(query)
     skip = (page - 1) * page_size
@@ -227,7 +247,7 @@ async def list_scripts(
     return {"total": total, "page": page, "page_size": page_size, "results": scripts}
 
 @router.get("/scripts/{script_id}")
-async def get_script(script_id: str):
+async def get_script(script_id: str, user: CurrentUser = Depends(get_current_user)):
     db = get_database()
     try:
         script = await db[Collections.SCRIPTS].find_one({"_id": ObjectId(script_id)})
@@ -235,11 +255,15 @@ async def get_script(script_id: str):
         raise HTTPException(status_code=400, detail="Invalid ID")
     if not script:
         raise HTTPException(status_code=404, detail="Script not found")
+    # RBAC: a server-scoped script is only visible to admins or users assigned to
+    # that server (no IDOR). Global/library scripts are visible to any authed user.
+    if not user.is_admin and script.get("owner_type") == "server":
+        ensure_server_access(user, str(script.get("owner_id")))
     script["_id"] = str(script["_id"])
     return script
 
 @router.put("/scripts/{script_id}")
-async def update_script(script_id: str, updates: dict):
+async def update_script(script_id: str, updates: dict, user: CurrentUser = Depends(_admin)):
     db = get_database()
     try:
         oid = ObjectId(script_id)
@@ -268,7 +292,7 @@ async def update_script(script_id: str, updates: dict):
 
 
 @router.patch("/scripts/{script_id}/toggle")
-async def toggle_script_enabled(script_id: str):
+async def toggle_script_enabled(script_id: str, user: CurrentUser = Depends(_admin)):
     """Toggle a script's enabled state. Disabled scripts degrade linked rules to alert-only."""
     db = get_database()
     try:
@@ -289,7 +313,7 @@ async def toggle_script_enabled(script_id: str):
     return {"status": "success", "enabled": new_state}
 
 @router.delete("/scripts/{script_id}")
-async def delete_script(script_id: str):
+async def delete_script(script_id: str, user: CurrentUser = Depends(_admin)):
     db = get_database()
     try:
         oid = ObjectId(script_id)

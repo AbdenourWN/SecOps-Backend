@@ -1,15 +1,18 @@
-from app.core.constants import Collections, WSTopic
+from app.core.constants import Collections, WSTopic, UserRole
 import re as re_mod
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from app.core.errors import http_error
 from typing import Optional
 from app.modules.analysis.schemas import DetectionRule
+from app.core.auth import CurrentUser, ensure_server_access, get_current_user, require_role
 from app.core.database import get_database
 from app.core.events import event_bus
 from bson import ObjectId
 
 router = APIRouter()
+_operator = require_role(UserRole.OPERATOR.value)
+_admin = require_role(UserRole.ADMIN.value)
 
 
 def _bust_rule_cache() -> None:
@@ -70,7 +73,7 @@ async def get_rule(rule_id: str):
     return rule
 
 @router.post("/rules")
-async def create_rule(rule: DetectionRule):
+async def create_rule(rule: DetectionRule, user: CurrentUser = Depends(_admin)):
     from datetime import datetime, timezone
     db = get_database()
     rule_data = rule.model_dump()
@@ -103,7 +106,7 @@ async def create_rule(rule: DetectionRule):
 
 
 @router.post("/servers/{server_id}/rules")
-async def create_rule_for_server(server_id: str, rule: DetectionRule):
+async def create_rule_for_server(server_id: str, rule: DetectionRule, user: CurrentUser = Depends(_admin)):
     """
     Phase 28.5 convenience endpoint — creates a rule pre-scoped to a server.
     The path parameter is authoritative: any owner_type / owner_id in the
@@ -116,7 +119,7 @@ async def create_rule_for_server(server_id: str, rule: DetectionRule):
 
 
 @router.put("/rules/{rule_id}")
-async def update_rule(rule_id: str, updates: dict):
+async def update_rule(rule_id: str, updates: dict, user: CurrentUser = Depends(_admin)):
     db = get_database()
     try:
         oid = ObjectId(rule_id)
@@ -151,7 +154,7 @@ async def update_rule(rule_id: str, updates: dict):
     return {"status": "success", "message": "Rule updated"}
 
 @router.delete("/rules/{rule_id}")
-async def delete_rule(rule_id: str):
+async def delete_rule(rule_id: str, user: CurrentUser = Depends(_admin)):
     db = get_database()
     try:
         oid = ObjectId(rule_id)
@@ -178,7 +181,7 @@ async def delete_rule(rule_id: str):
 # ── AI Analysis ──
 
 @router.post("/server-overview/{server_id}")
-async def analyze_server_overview(server_id: str, hours: int = Query(24, ge=1, le=72)):
+async def analyze_server_overview(server_id: str, hours: int = Query(24, ge=1, le=72), user: CurrentUser = Depends(_operator)):
     """
     Run the server-overview AI agent: a whole-server diagnostic + risk analysis
     over the last `hours` hours (1–72). Manual diagnostic commands only — no
@@ -189,6 +192,7 @@ async def analyze_server_overview(server_id: str, hours: int = Query(24, ge=1, l
     """
     from app.modules.ai.server_graph import run_server_overview
 
+    ensure_server_access(user, server_id)
     db = get_database()
     try:
         srv_oid = ObjectId(server_id)
@@ -233,7 +237,7 @@ async def analyze_server_overview(server_id: str, hours: int = Query(24, ge=1, l
 
 
 @router.post("/{incident_id}/analyze")
-async def analyze_incident_with_ai(incident_id: str):
+async def analyze_incident_with_ai(incident_id: str, user: CurrentUser = Depends(_operator)):
     """
     Run the LangGraph triage agent on an incident. Fetches its own evidence
     via tools, produces a structured analysis, and saves ai_analysis to DB.
@@ -246,8 +250,10 @@ async def analyze_incident_with_ai(incident_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID")
 
-    if not await db[Collections.INCIDENTS].find_one({"_id": inc_oid}, {"_id": 1}):
+    inc = await db[Collections.INCIDENTS].find_one({"_id": inc_oid}, {"server_id": 1})
+    if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
+    ensure_server_access(user, str(inc.get("server_id")))
 
     # Mark analysis as in-progress so any page showing this incident
     # can immediately reflect the loading state (persisted across navigation).

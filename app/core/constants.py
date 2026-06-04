@@ -58,6 +58,15 @@ class OSType(str, Enum):
     WINDOWS = "windows"
 
 
+class UserRole(str, Enum):
+    """Auth/RBAC role (Phase 20.1). `admin` = all servers + all actions + user
+    management; `operator` = read + operational actions on assigned servers;
+    `viewer` = read-only on assigned servers."""
+    ADMIN = "admin"
+    OPERATOR = "operator"
+    VIEWER = "viewer"
+
+
 class RuleOSType(str, Enum):
     LINUX = "linux"
     WINDOWS = "windows"
@@ -265,6 +274,8 @@ class Collections:
     AI_ACTIONS = "ai_actions"
     SETTINGS = "settings"                           # SMTP channels + {_id:"llm"} override doc
     NOTIFICATIONS = "notifications"                 # in-app notification feed (bell + /notifications)
+    USERS = "users"                                 # auth accounts (Phase 20.1)
+    SESSIONS = "sessions"                            # refresh-token sessions, rotating (Phase 20.1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +309,13 @@ class WSEvent:
 def server_topic(server_id: str, channel: str) -> str:
     """Build a per-server topic string, e.g. ``servers.<id>.ai``."""
     return f"servers.{server_id}.{channel}"
+
+
+def user_notif_topic(user_id: str) -> str:
+    """Per-recipient in-app notification topic, e.g. ``notifications.user.<id>``
+    (Phase 20.1). Replaces the global ``notifications`` topic so each client only
+    receives the notifications scoped to it."""
+    return f"notifications.user.{user_id}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

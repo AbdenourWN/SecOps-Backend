@@ -3,6 +3,7 @@ from app.core.constants import (
     NotificationType, NotificationCategory, NotificationSeverity,
 )
 import asyncio
+import logging
 import uuid
 from typing import AsyncIterator, Optional, Union
 
@@ -12,8 +13,10 @@ from app.core.security import encrypt_password, decrypt_password
 from bson import ObjectId
 from datetime import datetime, timedelta, timezone
 from app.core.datetime_utils import utc_now
-from app.core.executors import get_server_executor, Chunk, ChunkDone
+from app.core.executors import get_server_executor, Chunk, ChunkDone, is_permission_error
 # get_server_executor kept for health-check path (direct TCP, no pool)
+
+logger = logging.getLogger(__name__)
 from app.core.rate_limit import check_rate_limit
 from app.modules.servers.guardrails import check_command
 from app.modules.servers.audit import write_audit
@@ -102,7 +105,7 @@ async def _send_health_email(
         )
         await NotificationService().send_alert(payload)
     except Exception as e:
-        print(f"[health] {kind} alert email failed for {server.get('hostname')}: {e}")
+        logger.warning("[health] %s alert email failed for %s: %s", kind, server.get('hostname'), e)
 
 
 DEFAULT_COMMAND_TIMEOUT_S = 60
@@ -146,7 +149,7 @@ class ServerService:
 
         db = get_database()
         servers = await db[Collections.SERVERS].find().to_list(length=10000)
-        print(f"🕵️  Starting Health Check Cycle ({len(servers)} servers)...")
+        logger.info("Starting health check cycle (%d servers)", len(servers))
 
         sem = asyncio.Semaphore(settings.MAX_CONCURRENT_SERVERS)
 
@@ -272,7 +275,7 @@ class ServerService:
                         "previous_status": previous_status,
                         "hostname": server.get("hostname"),
                     })
-                    event_bus.emit(f"servers.{server_id}.status", "server.status_changed", {  # deprecated: remove when RBAC lands
+                    event_bus.emit(f"servers.{server_id}.status", "server.status_changed", {  # per-server topic for detail pages (flat topic above is server-filtered at the WS bridge)
                         "server_id": server_id,
                         "status": new_status,
                         "previous_status": previous_status,
@@ -318,7 +321,7 @@ class ServerService:
                     ))
 
         await asyncio.gather(*[check_one(s) for s in servers], return_exceptions=True)
-        print(f"✅ Health Check Complete. Scanned {len(servers)} servers.")
+        logger.info("Health check complete — scanned %d servers", len(servers))
     """ 
     🚀
     CRUD Operations 
@@ -421,9 +424,19 @@ class ServerService:
             "credential_id": str(new_cred_id)
         }
     
-    async def get_all_servers(self, status=None, os_type=None, search=None, page: int = 1, page_size: int = 9):
+    async def get_all_servers(self, status=None, os_type=None, search=None, page: int = 1, page_size: int = 9, allowed_server_ids=None):
         db = get_database()
         query = {}
+        # RBAC (Phase 20.1): None = admin (all servers); a list = restrict to the
+        # principal's assigned servers (empty list → no results, as intended).
+        if allowed_server_ids is not None:
+            oids = []
+            for sid in allowed_server_ids:
+                try:
+                    oids.append(ObjectId(sid))
+                except Exception:
+                    pass
+            query["_id"] = {"$in": oids}
         if status is not None:
             query["status"] = status
         if os_type is not None:
@@ -900,6 +913,13 @@ class ServerService:
                         "exit_code": item.exit_code,
                         "duration_ms": duration_ms,
                         "status": item.status,
+                        # Phase 20.6 — hint the UI when the failure looks like a
+                        # privilege problem (credential lacks permission), so the
+                        # operator knows to re-credential / elevate rather than
+                        # treating it as a generic error.
+                        "permission_error": is_permission_error(
+                            "".join(stderr_preview_buf) or "".join(stdout_preview_buf)
+                        ),
                     }
         finally:
             finished_at = datetime.now(timezone.utc)

@@ -806,6 +806,49 @@ async def seed_rules(db, script_lookup: dict):
 
 
 # =============================================================================
+# USERS  (Phase 20.1 — auth)
+# =============================================================================
+
+async def seed_users(db):
+    """Idempotently create the permanent protected admin from INITIAL_ADMIN_*.
+    Skips if any admin already exists; refuses to create one without a password."""
+    _header("Users")
+    from app.core.security import hash_password
+
+    existing = await db["users"].find_one({"role": "admin"})
+    if existing:
+        print(f"  Admin user already exists ('{existing.get('username')}') — skipping.")
+        return
+
+    username = os.getenv("INITIAL_ADMIN_USERNAME", "admin")
+    password = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+    if not password:
+        print("  ⚠️  INITIAL_ADMIN_PASSWORD is not set — no admin created.")
+        print("      Set INITIAL_ADMIN_USERNAME / INITIAL_ADMIN_PASSWORD in .env, then re-run.")
+        return
+
+    await db["users"].create_index([("username", 1)], unique=True, name="idx_users_username")
+    now = datetime.now(timezone.utc)
+    await db["users"].insert_one({
+        "username": username,
+        "email": None,
+        "password_hash": hash_password(password),
+        "role": "admin",
+        "server_ids": [],
+        "is_active": True,
+        "is_protected": True,
+        "failed_login_count": 0,
+        "locked_until": None,
+        "last_login_at": None,
+        "password_changed_at": now,
+        "created_by": None,
+        "created_at": now,
+        "updated_at": now,
+    })
+    print(f"  ✅ Created protected admin user '{username}'.")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -829,6 +872,7 @@ async def main():
     # Scripts must be seeded first — rules reference script IDs by name
     script_lookup = await seed_scripts(db)
     await seed_rules(db, script_lookup)
+    await seed_users(db)
 
     _header("Summary")
     scripts_total = await db["scripts"].count_documents({})
