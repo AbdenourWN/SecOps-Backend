@@ -40,8 +40,10 @@ _RESERVED = {
 }
 
 # Third-party loggers that are chatty at INFO; pin to WARNING so our own INFO
-# records stay readable.
-_NOISY = ("pymongo", "elastic_transport", "elasticsearch", "httpx", "httpcore", "asyncio")
+# records stay readable. `apscheduler` is included to drop its per-run
+# "Running job … / executed successfully" chatter (~8 lines/min); our own
+# `app.core.scheduler` logger still reports startup + per-cycle summaries.
+_NOISY = ("pymongo", "elastic_transport", "elasticsearch", "httpx", "httpcore", "asyncio", "apscheduler")
 
 
 class JsonFormatter(logging.Formatter):
