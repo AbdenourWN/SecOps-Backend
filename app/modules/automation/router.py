@@ -49,6 +49,30 @@ async def get_automation_history(
     )
 
 
+@router.get("/history/stats")
+async def get_automation_history_stats(
+    status: Optional[str] = Query(None),
+    server_id: Optional[str] = Query(None),
+    script_id: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Headline stats for the automation history page: total, success, failed,
+    last_24h count, and success rate. Honors the same filters as /history
+    so numbers stay in sync with the table. Scoped to the principal's servers.
+    NOTE: MUST be declared above /history/{automation_log_id} — otherwise the
+    dynamic route captures the literal "stats" as an id and this 404s.
+    """
+    return await service.get_history_stats(
+        status=status,
+        server_id=server_id,
+        script_id=script_id,
+        allowed_server_ids=None if user.is_admin else user.server_ids,
+    )
+
+
 @router.get("/history/{automation_log_id}")
 async def get_remediation_run(automation_log_id: str, user: CurrentUser = Depends(get_current_user)):
     """
@@ -140,28 +164,6 @@ async def manually_analyze_remediation(automation_log_id: str, user: CurrentUser
 
     asyncio.create_task(_run_manual())
     return {"status": "queued", "automation_log_id": automation_log_id}
-
-
-@router.get("/history/stats")
-async def get_automation_history_stats(
-    status: Optional[str] = Query(None),
-    server_id: Optional[str] = Query(None),
-    script_id: Optional[str] = Query(None),
-    from_date: Optional[str] = Query(None),
-    to_date: Optional[str] = Query(None),
-    user: CurrentUser = Depends(get_current_user),
-):
-    """
-    Headline stats for the automation history page: total, success, failed,
-    last_24h count, and success rate. Honors the same filters as /history
-    so numbers stay in sync with the table. Scoped to the principal's servers.
-    """
-    return await service.get_history_stats(
-        status=status,
-        server_id=server_id,
-        script_id=script_id,
-        allowed_server_ids=None if user.is_admin else user.server_ids,
-    )
 
 
 @router.post("/", response_model=dict)

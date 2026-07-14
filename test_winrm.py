@@ -1,6 +1,6 @@
 import winrm
 
-TARGET_IP = "192.168.0.193" # Check if your VM IP changed!
+TARGET_IP = "192.168.0.195" # Check if your VM IP changed!
 USERNAME = "SecOps"
 PASSWORD = "PfeProject2026!"
 
