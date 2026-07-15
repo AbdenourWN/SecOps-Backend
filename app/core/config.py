@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     LOGIN_LOCKOUT_MINUTES: int = 15
     AUTH_COOKIE_SECURE: bool = False       # True in prod (HTTPS) → cookies get the Secure flag
     AUTH_COOKIE_SAMESITE: str = "lax"      # "lax" works same-site (localhost); "none"+Secure for cross-site prod
+    # Empty = host-only cookie (works when frontend+backend share one hostname, e.g.
+    # localhost:3000 + localhost:8900). Set to ".example.com" when frontend and backend
+    # live on different subdomains (e.g. security.example.com / api.example.com) so the
+    # browser attaches the cookie to both — otherwise the frontend's optimistic auth-gate
+    # middleware never sees it and redirects to /login even after a successful login.
+    AUTH_COOKIE_DOMAIN: str = ""
     # First-boot bootstrap of the permanent protected admin (also seedable via seed.py).
     INITIAL_ADMIN_USERNAME: str = "admin"
     INITIAL_ADMIN_PASSWORD: str = ""       # if empty, the admin is NOT auto-created (set in .env or seed)

@@ -15,6 +15,7 @@ from app.core.config import settings
 def set_auth_cookies(response: Response, tokens: dict) -> None:
     secure = settings.AUTH_COOKIE_SECURE
     samesite = settings.AUTH_COOKIE_SAMESITE
+    domain = settings.AUTH_COOKIE_DOMAIN or None
     access_max = settings.ACCESS_TOKEN_TTL_MINUTES * 60
     refresh_max = settings.REFRESH_TOKEN_TTL_DAYS * 24 * 3600
 
@@ -22,20 +23,21 @@ def set_auth_cookies(response: Response, tokens: dict) -> None:
     # navigations on the cookie's presence; the backend reads it for /api/* too.
     response.set_cookie(
         ACCESS_COOKIE, tokens["access_token"],
-        max_age=access_max, httponly=True, secure=secure, samesite=samesite, path="/",
+        max_age=access_max, httponly=True, secure=secure, samesite=samesite, path="/", domain=domain,
     )
     response.set_cookie(
         REFRESH_COOKIE, tokens["refresh_token"],
-        max_age=refresh_max, httponly=True, secure=secure, samesite=samesite, path="/api/auth",
+        max_age=refresh_max, httponly=True, secure=secure, samesite=samesite, path="/api/auth", domain=domain,
     )
     # Readable by JS so the SPA can echo it back in the X-CSRF-Token header.
     response.set_cookie(
         CSRF_COOKIE, tokens["csrf_token"],
-        max_age=refresh_max, httponly=False, secure=secure, samesite=samesite, path="/",
+        max_age=refresh_max, httponly=False, secure=secure, samesite=samesite, path="/", domain=domain,
     )
 
 
 def clear_auth_cookies(response: Response) -> None:
-    response.delete_cookie(ACCESS_COOKIE, path="/")
-    response.delete_cookie(REFRESH_COOKIE, path="/api/auth")
-    response.delete_cookie(CSRF_COOKIE, path="/")
+    domain = settings.AUTH_COOKIE_DOMAIN or None
+    response.delete_cookie(ACCESS_COOKIE, path="/", domain=domain)
+    response.delete_cookie(REFRESH_COOKIE, path="/api/auth", domain=domain)
+    response.delete_cookie(CSRF_COOKIE, path="/", domain=domain)
