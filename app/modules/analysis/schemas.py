@@ -33,4 +33,19 @@ class DetectionRule(BaseModel):
     updated_at: Optional[datetime] = None
 
 class DetectionRuleInDB(DetectionRule):
-    id: str = Field(alias="_id")
+    id: str = Field(alias="_id")
+
+
+# --- Bulk enable/disable request ---
+# Scope filters mirror `list_rules` so a bulk toggle operates on exactly the
+# set the operator is viewing. Omit every filter to toggle the whole library.
+class RuleBulkToggle(BaseModel):
+    enabled: bool = Field(..., description="Target enabled state to apply")
+    severity: Optional[str] = None
+    os_type: Optional[str] = None
+    owner_type: Optional[str] = None
+    owner_id: Optional[str] = None
+    search: Optional[str] = None
+    filter_enabled: Optional[bool] = Field(
+        None, description="Optional filter on the rule's current enabled state"
+    )

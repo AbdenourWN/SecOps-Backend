@@ -5,7 +5,7 @@ import re as re_mod
 from fastapi import APIRouter, HTTPException, Query, Depends
 from app.core.errors import http_error
 from typing import Optional
-from app.modules.automation.schemas import ScriptCreate, ScriptInDB
+from app.modules.automation.schemas import ScriptCreate, ScriptInDB, ScriptBulkToggle
 from app.modules.automation.service import AutomationService
 from app.core.auth import CurrentUser, ensure_server_access, get_current_user, require_role
 from app.core.database import get_database
@@ -247,6 +247,60 @@ async def list_scripts(
     for s in scripts:
         s["_id"] = str(s["_id"])
     return {"total": total, "page": page, "page_size": page_size, "results": scripts}
+
+
+@router.post("/scripts/bulk-toggle")
+async def bulk_toggle_scripts(body: ScriptBulkToggle, user: CurrentUser = Depends(_admin)):
+    """
+    Enable or disable every script matching the given scope filters in a single
+    update_many. Filters mirror `list_scripts` (language / target_os / owner_type
+    / owner_id / search); omit all filters to toggle the entire library. The write
+    is narrowed to only scripts actually needing a flip so `changed` reflects real
+    transitions and untouched scripts keep their timestamp.
+
+    Static path — declared before the dynamic `/scripts/{script_id}` routes so
+    `bulk-toggle` is never captured as a script id. Disabling a script degrades
+    any rule pointing at it to alert-only.
+    """
+    db = get_database()
+    and_clauses: list[dict] = []
+    if body.language:
+        and_clauses.append({"language": body.language})
+    if body.target_os:
+        and_clauses.append({"target_os": body.target_os})
+    if body.owner_type in ("global", "server"):
+        and_clauses.append({"owner_type": body.owner_type})
+    if body.owner_id:
+        and_clauses.append({"owner_id": body.owner_id})
+    if body.search:
+        pattern = re_mod.compile(re_mod.escape(body.search), re_mod.IGNORECASE)
+        and_clauses.append({"$or": [{"name": pattern}, {"description": pattern}]})
+
+    query: dict = {"$and": and_clauses} if and_clauses else {}
+    matched = await db[Collections.SCRIPTS].count_documents(query)
+
+    # Narrow to only scripts whose state actually differs from the target.
+    change_query: dict = {"$and": and_clauses + [{"enabled": {"$ne": body.enabled}}]}
+    result = await db[Collections.SCRIPTS].update_many(
+        change_query,
+        {"$set": {"enabled": body.enabled, "updated_at": datetime.now(timezone.utc)}},
+    )
+    changed = result.modified_count
+
+    if changed:
+        event_bus.emit(
+            WSTopic.SCRIPTS,
+            "scripts.bulk_toggled",
+            {"enabled": body.enabled, "changed": changed},
+        )
+
+    return {
+        "status": "success",
+        "enabled": body.enabled,
+        "matched": matched,
+        "changed": changed,
+    }
+
 
 @router.get("/scripts/{script_id}")
 async def get_script(script_id: str, user: CurrentUser = Depends(get_current_user)):

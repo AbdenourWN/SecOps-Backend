@@ -22,6 +22,18 @@ class ScriptBase(BaseModel):
 class ScriptCreate(ScriptBase):
     pass
 
+
+# --- Bulk enable/disable request ---
+# Scope filters mirror `list_scripts` so a bulk toggle operates on exactly the
+# set the operator is viewing. Omit every filter to toggle the whole library.
+class ScriptBulkToggle(BaseModel):
+    enabled: bool = Field(..., description="Target enabled state to apply")
+    language: Optional[str] = None
+    target_os: Optional[str] = None
+    owner_type: Optional[str] = None
+    owner_id: Optional[str] = None
+    search: Optional[str] = None
+
 class ScriptInDB(ScriptBase):
     id: str = Field(alias="_id")
     created_at: datetime = Field(default_factory=utc_now)

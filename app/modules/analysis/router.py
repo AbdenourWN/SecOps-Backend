@@ -4,7 +4,7 @@ import re as re_mod
 from fastapi import APIRouter, HTTPException, Query, Depends
 from app.core.errors import http_error
 from typing import Optional
-from app.modules.analysis.schemas import DetectionRule
+from app.modules.analysis.schemas import DetectionRule, RuleBulkToggle
 from app.core.auth import CurrentUser, ensure_server_access, get_current_user, require_role
 from app.core.database import get_database
 from app.core.events import event_bus
@@ -116,6 +116,67 @@ async def create_rule_for_server(server_id: str, rule: DetectionRule, user: Curr
     rule.owner_type = "server"
     rule.owner_id = server_id
     return await create_rule(rule)
+
+
+@router.post("/rules/bulk-toggle")
+async def bulk_toggle_rules(body: RuleBulkToggle, user: CurrentUser = Depends(_admin)):
+    """
+    Enable or disable every rule matching the given scope filters in a single
+    update_many. Filters mirror `list_rules` (severity / os_type / owner_type /
+    owner_id / search / filter_enabled) so the action operates on exactly the
+    set the operator is viewing; omit all filters to toggle the entire library.
+    One DB write, one cache bust, one WS event.
+
+    Fully-static path — registered before the dynamic `/rules/{rule_id}` routes
+    so the `bulk-toggle` segment is never captured as a rule id.
+    """
+    from datetime import datetime, timezone
+    db = get_database()
+
+    query: dict = {}
+    if body.severity:
+        query["severity"] = body.severity
+    if body.os_type:
+        query["os_type"] = body.os_type
+    if body.owner_type in ("global", "server"):
+        query["owner_type"] = body.owner_type
+    if body.owner_id:
+        query["owner_id"] = body.owner_id
+    if body.filter_enabled is not None:
+        query["enabled"] = body.filter_enabled
+    if body.search:
+        pattern = re_mod.compile(re_mod.escape(body.search), re_mod.IGNORECASE)
+        query["$or"] = [{"name": pattern}, {"pattern": pattern}]
+
+    # Total rules in scope, then narrow the write to only those actually needing
+    # a flip so `changed` reflects real state transitions (not just updated_at
+    # rewrites) and untouched rules keep their timestamp.
+    matched = await db[Collections.RULES].count_documents(query)
+    change_query = (
+        {"$and": [query, {"enabled": {"$ne": body.enabled}}]}
+        if query
+        else {"enabled": {"$ne": body.enabled}}
+    )
+    result = await db[Collections.RULES].update_many(
+        change_query,
+        {"$set": {"enabled": body.enabled, "updated_at": datetime.now(timezone.utc)}},
+    )
+    changed = result.modified_count
+
+    if changed:
+        _bust_rule_cache()
+        event_bus.emit(
+            WSTopic.RULES,
+            "rules.bulk_toggled",
+            {"enabled": body.enabled, "changed": changed},
+        )
+
+    return {
+        "status": "success",
+        "enabled": body.enabled,
+        "matched": matched,
+        "changed": changed,
+    }
 
 
 @router.put("/rules/{rule_id}")

@@ -18,6 +18,7 @@ FIELD TYPES TO KNOW:
 - "date"    → Dates. ES can parse ISO format automatically.
 """
 
+import asyncio
 import logging
 
 from elasticsearch import AsyncElasticsearch
@@ -86,40 +87,87 @@ METRIC_INDEX_TEMPLATE = {
 }
 
 
+async def _verify_and_setup() -> bool:
+    """
+    Ping ES and (re)apply the index templates. Returns True on success.
+
+    Kept separate from connect_to_elasticsearch() so a background task can retry
+    it after a startup race without reconstructing the client.
+    """
+    if es.client is None:
+        return False
+    try:
+        info = await es.client.info()
+        await es.client.indices.put_index_template(
+            name="secops-logs-template",
+            body=LOG_INDEX_TEMPLATE,
+        )
+        await es.client.indices.put_index_template(
+            name="secops-metrics-template",
+            body=METRIC_INDEX_TEMPLATE,
+        )
+        logger.info(
+            "Connected to Elasticsearch %s — index templates applied",
+            info["version"]["number"],
+        )
+        return True
+    except Exception as e:
+        logger.warning("Elasticsearch not ready yet (%s)", e)
+        return False
+
+
+async def _background_reconnect(max_attempts: int = 60, delay_s: float = 5.0) -> None:
+    """
+    Retry the ES health check + template setup in the background.
+
+    WHY: AsyncElasticsearch connects lazily per-request, so the client object is
+    always kept. But the eager startup ping fails if ES isn't ready yet — the
+    common case when ES and the backend are restarted together (ES needs
+    ~30-60s to accept connections). Rather than permanently disabling logs/
+    metrics (the old behaviour, which set es.client = None), we retry here so the
+    pipeline self-heals once ES is reachable — no backend restart required.
+    """
+    for _ in range(max_attempts):
+        await asyncio.sleep(delay_s)
+        if await _verify_and_setup():
+            return
+    logger.warning(
+        "Elasticsearch still unverified after %d attempts (~%.0fs) — client kept; "
+        "reads/writes will keep retrying lazily on each request.",
+        max_attempts, max_attempts * delay_s,
+    )
+
+
 async def connect_to_elasticsearch():
     """
-    Connects to Elasticsearch when the API starts.
-    Also creates the index templates.
+    Initialise the Elasticsearch client when the API starts and apply the index
+    templates.
+
+    IMPORTANT: the client is created and KEPT even if the startup health check
+    fails. AsyncElasticsearch dials lazily on the first request and manages its
+    own reconnection, so keeping it lets logs/metrics recover automatically once
+    ES becomes reachable. If the initial verification fails we kick off a
+    background retry (templates + ping) instead of nulling the client — this is
+    what makes the pipeline resilient to an ES/backend co-restart race.
     """
     try:
         es.client = AsyncElasticsearch(
             hosts=[settings.ELASTICSEARCH_URL],
             # No auth needed — we disabled xpack.security in Docker
         )
-
-        # Verify connection (like MongoDB's ping)
-        info = await es.client.info()
-        logger.info("Connected to Elasticsearch: %s", info["version"]["number"])
-
-        # Create/update the log index template
-        await es.client.indices.put_index_template(
-            name="secops-logs-template",
-            body=LOG_INDEX_TEMPLATE,
-        )
-        
-        # Create/update the metric index template
-        await es.client.indices.put_index_template(
-            name="secops-metrics-template",
-            body=METRIC_INDEX_TEMPLATE,
-        )
-        logger.info("Elasticsearch index templates created")
-
     except Exception as e:
-        logger.warning(
-            "Elasticsearch not available (%s) — logs/metrics will not be stored. "
-            "Start ES with: docker-compose up -d", e,
-        )
+        # Only a malformed URL / config error reaches here (construction is
+        # otherwise lazy). Nothing to keep in that case.
+        logger.warning("Could not construct Elasticsearch client (%s) — logs/metrics disabled.", e)
         es.client = None
+        return
+
+    if not await _verify_and_setup():
+        logger.warning(
+            "Elasticsearch not verified at startup — client kept; retrying in the "
+            "background so logs/metrics self-heal once ES is reachable.",
+        )
+        asyncio.create_task(_background_reconnect())
 
 
 async def close_elasticsearch():
